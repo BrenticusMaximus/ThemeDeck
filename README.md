@@ -9,6 +9,10 @@ ThemeDeck is a Decky Loader plugin that associates locally stored music files wi
 
 
 <img width="1280" height="800" alt="20251116-043511-UTC" src="https://github.com/user-attachments/assets/a95e3ecc-dd57-4082-b822-e191356e55cb" />
+<br><br>
+
+
+<a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
 
 
 ## Installation
@@ -81,3 +85,7 @@ ThemeDeck is a Decky Loader plugin that associates locally stored music files wi
 2. Choose **Settings → Choose ThemeDeck music…**
 3. Browse to the desired local audio file and select it. ThemeDeck stores the association and immediately refreshes the Decky panel.
 4. Return to the game's detail page. If auto-play is enabled (default), the music starts instantly. Use the Decky panel to adjust per-game volume, preview, pause, or remove the track at any time.
+
+<a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
+
