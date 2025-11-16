@@ -18,7 +18,7 @@ ThemeDeck is a Decky Loader plugin that associates locally stored music files wi
 ## Installation
 
 1. Download the latest ZIP release.
-2. Transfer ZIP to your Steam Deck, either its internal or external storage.
+2. Transfer ZIP to your Steam Deck.
 3. Go to Decky settings, Developer, Install Plugin from ZIP file.
 
 ## Supported File Types
