@@ -2,6 +2,12 @@
 
 ThemeDeck is a Decky Loader plugin that associates locally stored music files with specific Steam games. When you open a game's detail page in Gaming Mode, the plugin automatically locates the matching track, streams it into a shared looping `HTMLAudioElement`, and fades playback out as soon as you leave the page. All selections are stored on the Deck under the plugin's settings directory so they survive reboots and Decky updates.
 
+## Installation
+
+1. Download the latest ZIP release.
+2. Transfer ZIP to your Steam Deck, eiither its internal or external storage.
+3. Go to Decky settings, Developer, Install Plugin from ZIP file.
+
 ## Supported File Types
 
 - `mp3`, `aac`, `flac`, `ogg`, `wav`, `m4a`
