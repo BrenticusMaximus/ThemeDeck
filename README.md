@@ -81,7 +81,7 @@ ThemeDeck is a Decky Loader plugin that associates locally stored music files wi
 
 ## Typical Workflow
 
-1. Navigate to a game's detail page and open the Decky menu.
+1. Navigate to a game's detail page.
 2. Choose **Settings → Choose ThemeDeck music…**
 3. Browse to the desired local audio file and select it. ThemeDeck stores the association and immediately refreshes the Decky panel.
 4. Return to the game's detail page. If auto-play is enabled (default), the music starts instantly. Use the Decky panel to adjust per-game volume, preview, pause, or remove the track at any time.
