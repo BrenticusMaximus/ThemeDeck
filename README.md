@@ -26,6 +26,13 @@ ThemeDeck is a Decky Loader plugin that associates locally stored music files wi
 - `mp3`, `aac`, `flac`, `ogg`, `wav`, `m4a`
 - The frontend file browser only shows those extensions, and the backend advertises the surrounding MIME types when it returns the encoded audio payload. Unsupported files are ignored.
 
+## Instructions
+
+1. Navigate to a game's detail page.
+2. Choose **Settings → Choose ThemeDeck music…**
+3. Browse to the desired local audio file and select it. ThemeDeck stores the association and immediately refreshes the Decky panel.
+4. Return to the game's detail page. If auto-play is enabled (default), the music starts instantly. Use the Decky panel to adjust per-game volume, preview, pause, or remove the track at any time.
+
 ## Data Flow
 
 1. **Track discovery**
@@ -79,12 +86,6 @@ ThemeDeck is a Decky Loader plugin that associates locally stored music files wi
 - Playback failures (e.g., deleted files) are handled by reporting the error, clearing the audio element, and stopping playback to avoid hung audio threads.
 - Directory enumeration gracefully skips entries that raise `PermissionError`, keeping the browser responsive even when encountering protected paths.
 
-## Typical Workflow
-
-1. Navigate to a game's detail page.
-2. Choose **Settings → Choose ThemeDeck music…**
-3. Browse to the desired local audio file and select it. ThemeDeck stores the association and immediately refreshes the Decky panel.
-4. Return to the game's detail page. If auto-play is enabled (default), the music starts instantly. Use the Decky panel to adjust per-game volume, preview, pause, or remove the track at any time.
 
 <a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
 
