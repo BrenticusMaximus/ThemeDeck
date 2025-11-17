@@ -1,63 +1,72 @@
-# ThemeDeck
+# ThemeDeck Documentation
 
-ThemeDeck lets you attach local audio files (MP3/AAC/FLAC/OGG) to specific titles in your Steam library and plays them automatically whenever you open that game's details page in Gaming Mode.
+## Overview
 
-## Highlights
+ThemeDeck is a Decky Loader plugin that associates locally stored music files with specific Steam games. When you open a game's detail page in Gaming Mode, the plugin automatically locates the matching track, streams it into a shared looping `HTMLAudioElement`, and fades playback out as soon as you leave the page. All selections are stored on the Deck under the plugin's settings directory so they survive reboots and Decky updates.
 
-- Uses Decky's file picker so you can browse your microSD or internal storage without leaving Gaming Mode.
-- Stores per-game associations in Decky's settings directory and survives reboots.
-- Plays music instantly when you land on a game's details page and fades it out when you navigate away.
-- Quick controls inside the Decky tab to preview, pause, or swap a game's track.
+## Supported File Types
 
-## Usage
+- `mp3`, `aac`, `flac`, `ogg`, `wav`, `m4a`
+- The frontend file browser only shows those extensions, and the backend advertises the surrounding MIME types when it returns the encoded audio payload. Unsupported files are ignored.
 
-1. Open a game's details page in Gaming Mode (the one with the big **Play** button).  
-   • If automatic detection fails, pick the game manually in the ThemeDeck panel's fallback dropdown.  
-2. Open the Decky tab and launch ThemeDeck.
-3. Press **Select music file**, browse to your MP3/AAC/FLAC/OGG file, and confirm. ThemeDeck links it to the auto-detected (or manually selected) game.
-4. Revisit the game's page at any time—the music starts automatically.
-5. Use the ThemeDeck panel to pause, resume, adjust per-game volume, or remove the association.
+## Data Flow
 
-## Development
+1. **Track discovery**
+   - The frontend exposes a file browser via `/themedeck/:appid`, reachable from the Decky tab or the Library context menu entry "Choose ThemeDeck music…".
+   - Browsing is powered by the backend `list_directory` call, which enumerates folders/files under `/home/deck` (or any manually entered path) while skipping unreadable entries.
 
-Requirements:
+2. **Selection**
+   - Picking a file invokes `set_track(app_id, path, filename)`, which verifies the file exists, is readable, and then writes a JSON record to `tracks.json`. Each record stores `{app_id, path, filename, volume}`.
+   - The frontend emits a `themedeck:tracks-updated` event so every view refreshes its cached track map.
 
-- Node.js 18+
-- `pnpm` 9 (`npm i -g pnpm@9`)
-- Decky Loader 3.0+
+3. **Playback**
+   - When a game detail page is opened, a hidden `GameFocusBridge` component looks up the matching `GameTrack` from the React state tied to `get_tracks()`.
+   - `playTrack` resolves the audio by calling `load_track_audio(path)`; that backend method reads the file, base64-encodes it, and returns metadata used to create an object URL. Object URLs are cached per path and invalidated whenever a track changes or is removed.
+   - The shared audio element loops the file, applies the saved per-game volume, and reports play/pause status to any UI preview buttons.
 
-Install dependencies and build:
+4. **Stopping**
+   - Leaving the page or manually pausing fades the audio out (8 steps over ~320 ms) before rewinding and freeing the source URL. This prevents overlapping playback during rapid navigation.
 
-```bash
-pnpm install
-pnpm run build
-```
+## Frontend Details
 
-For iterative work, keep rollup in watch mode:
+- **Main panel**
+  - Shows build info, quick instructions, and the auto-play toggle. Auto-play is stored in `localStorage` (`themedeck:autoPlay`) so it mirrors Gaming Mode’s behavior even before Decky finishes loading.
+  - Lists every assigned track with:
+    - Preview / pause buttons (manual playback keeps `reason="manual"` so in-page auto-play logic will not override it).
+    - Remove buttons with confirmation prompts.
+    - A per-game volume slider (0–100%). Adjusting the slider immediately applies gain to the actively playing track and persists via the backend `set_volume`.
 
-```bash
-pnpm run watch
-```
+- **Change Theme page**
+  - Displays the currently linked file (name and absolute path) together with remove and done buttons.
+  - Provides directory controls (Go Up, manual path entry, folder/file lists). Files are filtered by the supported extensions; picking one immediately saves and toasts feedback.
 
-Deploy to your Deck with the Decky CLI:
+## Focus & Auto-Play Detection
 
-```bash
-decky plugin build --skip-backend
-decky plugin install --copy=dist --name=themedeck
-```
+- A polling watcher (`startLocationWatcher`) reads the focused Steam UI window's pathname every 750 ms to capture route changes that do not fire SteamClient events.
+- Parallel `SteamClient.Apps` subscriptions (`startSteamAppWatchers`) listen for app overview/detail updates; whenever a game ID is detected, `notifyFocus` broadcasts it.
+- Library app routes (`/library/app/:appid`, `/library/details/:appid`, and collection variants) are patched to inject `GameFocusBridge`, which:
+  - Watches `autoPlay` and the active track list.
+  - Starts playback when a matching track exists and auto-play is enabled.
+  - Stops playback (with fade-out) when navigating away, when no track exists, or when auto-play is disabled.
+- The same focus signal is used by the patched Library context menu to preselect the correct app before opening the `/themedeck/:appid` route.
 
-## Packaging
+## Storage & State
 
-When publishing, include:
+- **tracks.json** – lives under `decky.DECKY_PLUGIN_SETTINGS_DIR`, contains every `{app_id, path, filename, volume}` record. It is loaded on startup and persisted after any change.
+- **Audio cache** – in-memory `Map<path, {objectUrl, mtime}>` so multiple navigations do not require re-reading files. Cache entries are revoked via `URL.revokeObjectURL` when the track list changes or an individual entry is removed.
+- **Preferences** – only auto-play is stored client-side; all other settings live in `tracks.json`.
 
-```
-ThemeDeck/
-├─ dist/
-├─ package.json
-├─ plugin.json
-├─ main.py
-├─ README.md
-└─ LICENSE
-```
+## Error Handling
 
-Submit a pull request to the [Decky Plugin Database](https://github.com/SteamDeckHomebrew/decky-plugin-database) or host the zip yourself for manual installs.
+- File selection validates existence and permissions before saving. Permission or missing-file errors are surfaced through Decky toasts so users know why a track failed to attach.
+- Playback failures (e.g., deleted files) are handled by reporting the error, clearing the audio element, and stopping playback to avoid hung audio threads.
+- Directory enumeration gracefully skips entries that raise `PermissionError`, keeping the browser responsive even when encountering protected paths.
+
+## Typical Workflow
+
+1. Navigate to a game's detail page and open the Decky menu.
+2. Choose **ThemeDeck → Settings → Choose ThemeDeck music…** (or press the context menu item with the same name).
+3. Browse to the desired local audio file and select it. ThemeDeck stores the association and immediately refreshes the Decky panel.
+4. Return to the game's detail page. If auto-play is enabled (default), the music starts instantly. Use the Decky panel to adjust per-game volume, preview, pause, or remove the track at any time.
+
+This document should give you the full picture of how ThemeDeck wires together Decky APIs, the Steam UI, and local storage to play per-game music themes.
