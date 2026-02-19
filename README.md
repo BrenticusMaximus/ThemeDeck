@@ -1,101 +1,71 @@
-# Decky Plugin Template [![Chat](https://img.shields.io/badge/chat-on%20discord-7289da.svg)](https://deckbrew.xyz/discord)
+# ThemeDeck Documentation
 
-Reference example for using [decky-frontend-lib](https://github.com/SteamDeckHomebrew/decky-frontend-lib) (@decky/ui) in a [decky-loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin.
+## Overview
 
-### **Please also refer to the [wiki](https://wiki.deckbrew.xyz/en/user-guide/home#plugin-development) for important information on plugin development and submissions/updates. currently documentation is split between this README and the wiki which is something we are hoping to rectify in the future.**  
+ThemeDeck is a Decky Loader plugin that associates locally stored music files with specific Steam games. When you open a game's detail page in Gaming Mode, the plugin automatically locates the matching track, streams it into a shared looping `HTMLAudioElement`, and fades playback out as soon as you leave the page. All selections are stored on the Deck under the plugin's settings directory so they survive reboots and Decky updates.
 
-## Developers
+## Supported File Types
 
-### Dependencies
+- `mp3`, `aac`, `flac`, `ogg`, `wav`, `m4a`
+- The frontend file browser only shows those extensions, and the backend advertises the surrounding MIME types when it returns the encoded audio payload. Unsupported files are ignored.
 
-This template relies on the user having Node.js v16.14+ and `pnpm` (v9) installed on their system.  
-Please make sure to install pnpm v9 to prevent issues with CI during plugin submission.  
-`pnpm` can be downloaded from `npm` itself which is recommended.
+## Data Flow
 
-#### Linux
+1. **Track discovery**
+   - The frontend exposes a file browser via `/themedeck/:appid`, reachable from the Decky tab or the Library context menu entry "Choose ThemeDeck music…".
+   - Browsing is powered by the backend `list_directory` call, which enumerates folders/files under `/home/deck` (or any manually entered path) while skipping unreadable entries.
 
-```bash
-sudo npm i -g pnpm@9
-```
+2. **Selection**
+   - Picking a file invokes `set_track(app_id, path, filename)`, which verifies the file exists, is readable, and then writes a JSON record to `tracks.json`. Each record stores `{app_id, path, filename, volume}`.
+   - The frontend emits a `themedeck:tracks-updated` event so every view refreshes its cached track map.
 
-If you would like to build plugins that have their own custom backends, Docker is required as it is used by the Decky CLI tool.
+3. **Playback**
+   - When a game detail page is opened, a hidden `GameFocusBridge` component looks up the matching `GameTrack` from the React state tied to `get_tracks()`.
+   - `playTrack` resolves the audio by calling `load_track_audio(path)`; that backend method reads the file, base64-encodes it, and returns metadata used to create an object URL. Object URLs are cached per path and invalidated whenever a track changes or is removed.
+   - The shared audio element loops the file, applies the saved per-game volume, and reports play/pause status to any UI preview buttons.
 
-### Making your own plugin
+4. **Stopping**
+   - Leaving the page or manually pausing fades the audio out (8 steps over ~320 ms) before rewinding and freeing the source URL. This prevents overlapping playback during rapid navigation.
 
-1. You can fork this repo or utilize the "Use this template" button on Github.
-2. In your local fork/own plugin-repository run these commands:
-   1. ``pnpm i``
-   2. ``pnpm run build``
-   - These setup pnpm and build the frontend code for testing.
-3. Consult the [decky-frontend-lib](https://github.com/SteamDeckHomebrew/decky-frontend-lib) repository for ways to accomplish your tasks.
-   - Documentation and examples are still rough, 
-   - Decky loader primarily targets Steam Deck hardware so keep this in mind when developing your plugin.
-4. If using VSCodium/VSCode, run the `setup` and `build` and `deploy` tasks. If not using VSCodium etc. you can derive your own makefile or just manually utilize the scripts for these commands as you see fit.
+## Frontend Details
 
-If you use VSCode or it's derivatives (we suggest [VSCodium](https://vscodium.com/)!) just run the `setup` and `build` tasks. It's really that simple.
+- **Main panel**
+  - Shows build info, quick instructions, and the auto-play toggle. Auto-play is stored in `localStorage` (`themedeck:autoPlay`) so it mirrors Gaming Mode’s behavior even before Decky finishes loading.
+  - Lists every assigned track with:
+    - Preview / pause buttons (manual playback keeps `reason="manual"` so in-page auto-play logic will not override it).
+    - Remove buttons with confirmation prompts.
+    - A per-game volume slider (0–100%). Adjusting the slider immediately applies gain to the actively playing track and persists via the backend `set_volume`.
 
-#### Other important information
+- **Change Theme page**
+  - Displays the currently linked file (name and absolute path) together with remove and done buttons.
+  - Provides directory controls (Go Up, manual path entry, folder/file lists). Files are filtered by the supported extensions; picking one immediately saves and toasts feedback.
 
-Everytime you change the frontend code (`index.tsx` etc) you will need to rebuild using the commands from step 2 above or the build task if you're using vscode or a derivative.
+## Focus & Auto-Play Detection
 
-Note: If you are receiving build errors due to an out of date library, you should run this command inside of your repository:
+- A polling watcher (`startLocationWatcher`) reads the focused Steam UI window's pathname every 750 ms to capture route changes that do not fire SteamClient events.
+- Parallel `SteamClient.Apps` subscriptions (`startSteamAppWatchers`) listen for app overview/detail updates; whenever a game ID is detected, `notifyFocus` broadcasts it.
+- Library app routes (`/library/app/:appid`, `/library/details/:appid`, and collection variants) are patched to inject `GameFocusBridge`, which:
+  - Watches `autoPlay` and the active track list.
+  - Starts playback when a matching track exists and auto-play is enabled.
+  - Stops playback (with fade-out) when navigating away, when no track exists, or when auto-play is disabled.
+- The same focus signal is used by the patched Library context menu to preselect the correct app before opening the `/themedeck/:appid` route.
 
-```bash
-pnpm update @decky/ui --latest
-```
+## Storage & State
 
-### Backend support
+- **tracks.json** – lives under `decky.DECKY_PLUGIN_SETTINGS_DIR`, contains every `{app_id, path, filename, volume}` record. It is loaded on startup and persisted after any change.
+- **Audio cache** – in-memory `Map<path, {objectUrl, mtime}>` so multiple navigations do not require re-reading files. Cache entries are revoked via `URL.revokeObjectURL` when the track list changes or an individual entry is removed.
+- **Preferences** – only auto-play is stored client-side; all other settings live in `tracks.json`.
 
-If you are developing with a backend for a plugin and would like to submit it to the [decky-plugin-database](https://github.com/SteamDeckHomebrew/decky-plugin-database) you will need to have all backend code located in ``backend/src``, with backend being located in the root of your git repository.
-When building your plugin, the source code will be built and any finished binary or binaries will be output to ``backend/out`` (which is created during CI.)
-If your buildscript, makefile or any other build method does not place the binary files in the ``backend/out`` directory they will not be properly picked up during CI and your plugin will not have the required binaries included for distribution.
+## Error Handling
 
-Example:  
-In our makefile used to demonstrate the CI process of building and distributing a plugin backend, note that the makefile explicitly creates the `out` folder (``backend/out``) and then compiles the binary into that folder. Here's the relevant snippet.
+- File selection validates existence and permissions before saving. Permission or missing-file errors are surfaced through Decky toasts so users know why a track failed to attach.
+- Playback failures (e.g., deleted files) are handled by reporting the error, clearing the audio element, and stopping playback to avoid hung audio threads.
+- Directory enumeration gracefully skips entries that raise `PermissionError`, keeping the browser responsive even when encountering protected paths.
 
-```make
-hello:
-	mkdir -p ./out
-	gcc -o ./out/hello ./src/main.c
-```
+## Typical Workflow
 
-The CI does create the `out` folder itself but we recommend creating it yourself if possible during your build process to ensure the build process goes smoothly.
+1. Navigate to a game's detail page and open the Decky menu.
+2. Choose **Settings → Choose ThemeDeck music…** 
+3. Browse to the desired local audio file and select it. ThemeDeck stores the association and immediately refreshes the Decky panel.
+4. Return to the game's detail page. If auto-play is enabled (default), the music starts instantly. Use the Decky panel to adjust per-game volume, preview, pause, or remove the track at any time.
 
-Note: When locally building your plugin it will be placed into a folder called 'out' this is different from the concept described above.
-
-The out folder is not sent to the final plugin, but is then put into a ``bin`` folder which is found at the root of the plugin's directory.  
-More information on the bin folder can be found below in the distribution section below.
-
-### Distribution
-
-We recommend following the instructions found in the [decky-plugin-database](https://github.com/SteamDeckHomebrew/decky-plugin-database) on how to get your plugin up on the plugin store. This is the best way to get your plugin in front of users.
-You can also choose to do distribution via a zip file containing the needed files, if that zip file is uploaded to a URL it can then be downloaded and installed via decky-loader.
-
-**NOTE: We do not currently have a method to install from a downloaded zip file in "game-mode" due to lack of a usable file-picking dialog.**
-
-Layout of a plugin zip ready for distribution:
-```
-pluginname-v1.0.0.zip (version number is optional but recommended for users sake)
-   |
-   pluginname/ <directory>
-   |  |  |
-   |  |  bin/ <directory> (optional)
-   |  |     |
-   |  |     binary (optional)
-   |  |
-   |  dist/ <directory> [required]
-   |      |
-   |      index.js [required]
-   | 
-   package.json [required]
-   plugin.json [required]
-   main.py {required if you are using the python backend of decky-loader: serverAPI}
-   README.md (optional but recommended)
-   LICENSE(.md) [required, filename should be roughly similar, suffix not needed]
-```
-
-Note regarding licenses: Including a license is required for the plugin store if your chosen license requires the license to be included alongside usage of source-code/binaries!
-
-Standard procedure for licenses is to have your chosen license at the top of the file, and to leave the original license for the plugin-template at the bottom. If this is not the case on submission to the plugin database, you will be asked to fix this discrepancy.
-
-We cannot and will not distribute your plugin on the Plugin Store if it's license requires it's inclusion but you have not included a license to be re-distributed with your plugin in the root of your git repository.

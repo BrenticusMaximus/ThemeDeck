@@ -1,11 +1,11 @@
 {
-  "name": "Example Plugin",
-  "author": "John Doe",
-  "flags": ["debug", "_root"],
+  "name": "ThemeDeck",
+  "author": "Your Name",
+  "flags": [],
   "api_version": 1,
   "publish": {
-    "tags": ["template", "root"],
-    "description": "Decky example plugin.",
+    "tags": ["music", "theme", "library"],
+    "description": "ThemeDeck assigns local music to each game and plays it when you open the game's details page.",
     "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
   }
 }
