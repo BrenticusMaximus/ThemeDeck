@@ -6,6 +6,8 @@ This update adds **YouTube search/download support powered by `yt-dlp`** so user
 
 ![ThemeDeck February 19 2026 update thumbnail](https://images.steamusercontent.com/ugc/10217922894651388729/0056712F90842A587703E222C9AD211D53B2344E/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
+<a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
 ## Overview
 
 ThemeDeck is a Decky Loader plugin that associates locally stored music files with specific Steam games. When you open a game's detail page in Gaming Mode, the plugin automatically locates the matching track, streams it into a shared looping `HTMLAudioElement`, and fades playback out as soon as you leave the page. All selections are stored on the Deck under the plugin's settings directory so they survive reboots and Decky updates.
@@ -74,3 +76,5 @@ ThemeDeck is a Decky Loader plugin that associates locally stored music files wi
 2. Choose **Settings → Choose ThemeDeck music…** 
 3. Browse to the desired local audio file and select it. ThemeDeck stores the association and immediately refreshes the Decky panel.
 4. Return to the game's detail page. If auto-play is enabled (default), the music starts instantly. Use the Decky panel to adjust per-game volume, preview, pause, or remove the track at any time.
+
+<a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
