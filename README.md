@@ -2,7 +2,7 @@
 
 ## February 19, 2026 Update
 
-This update adds **YouTube search/download support powered by `yt-dlp`** so users can search game music, preview tracks, download locally, and assign directly from ThemeDeck.
+This update adds **YouTube search/download support powered by `yt-dlp`** so users can search game music, preview tracks, download locally, and assign directly from ThemeDeck. You still have the option to manually assign local music tracks.
 
 ![ThemeDeck February 19 2026 update thumbnail](https://images.steamusercontent.com/ugc/10217922894651388729/0056712F90842A587703E222C9AD211D53B2344E/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
