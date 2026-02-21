@@ -48,6 +48,7 @@ type BackendTrack = {
   path: string;
   filename?: string;
   volume?: number;
+  start_offset?: number;
 };
 
 type RawTrackMap = Record<string, BackendTrack>;
@@ -57,6 +58,7 @@ type GameTrack = {
   path: string;
   filename: string;
   volume: number;
+  startOffset: number;
 };
 
 type TrackMap = Record<number, GameTrack>;
@@ -137,6 +139,10 @@ const deleteTrack = callable<[appId: number], RawTrackMap>("remove_track");
 const updateTrackVolume = callable<[appId: number, volume: number], RawTrackMap>(
   "set_volume"
 );
+const updateTrackStartOffset = callable<
+  [appId: number, startOffset: number],
+  RawTrackMap
+>("set_start_offset");
 const listDirectory = callable<[path?: string], DirectoryListing>("list_directory");
 const loadTrackAudio = callable<[path: string], AudioPayload>("load_track_audio");
 const searchYouTube = callable<
@@ -352,6 +358,44 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     }
 
     audio.volume = clamp(track.volume ?? 1);
+    const offset = clamp(track.startOffset ?? 0, 0, 30);
+    if (offset > 0) {
+      if (audio.readyState >= 1) {
+        try {
+          audio.currentTime = offset;
+        } catch (_ignored) {
+          // no-op
+        }
+      } else {
+        await new Promise<void>((resolve) => {
+          const applyOffset = () => {
+            try {
+              audio.currentTime = offset;
+            } catch (_ignored) {
+              // no-op
+            }
+            resolve();
+          };
+          const timeoutId = window.setTimeout(resolve, 400);
+          const onLoaded = () => {
+            window.clearTimeout(timeoutId);
+            applyOffset();
+          };
+          const onError = () => {
+            window.clearTimeout(timeoutId);
+            resolve();
+          };
+          audio.addEventListener("loadedmetadata", onLoaded, { once: true });
+          audio.addEventListener("error", onError, { once: true });
+        });
+      }
+    } else if (!sameTrack) {
+      try {
+        audio.currentTime = 0;
+      } catch (_ignored) {
+        // no-op
+      }
+    }
     await audio.play();
     notifyPlayback({ appId: track.appId, reason, status: "playing" });
   } catch (error) {
@@ -379,6 +423,20 @@ const applyVolumeToActiveTrack = (appId: number, volume: number) => {
     return;
   }
   sharedAudio.volume = clamp(volume);
+};
+
+const applyStartOffsetToActiveTrack = (appId: number, startOffset: number) => {
+  if (!sharedAudio) {
+    return;
+  }
+  if (playbackState.appId !== appId || playbackState.status !== "playing") {
+    return;
+  }
+  try {
+    sharedAudio.currentTime = clamp(startOffset, 0, 30);
+  } catch (_ignored) {
+    // no-op
+  }
 };
 
 const notifyFocus = (appId: number | null) => {
@@ -971,6 +1029,10 @@ const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
         `Track ${appId}`,
       volume:
         typeof track.volume === "number" ? clamp(track.volume) : 1,
+      startOffset:
+        typeof track.start_offset === "number"
+          ? clamp(track.start_offset, 0, 30)
+          : 0,
     };
   }
 
@@ -1082,6 +1144,7 @@ const useAutoPlaySetting = (): [boolean, (value: boolean) => void] =>
     AUTO_PLAY_EVENT
   );
 
+
 const useAutoPlayValue = () => {
   const [value, setValue] = useState<boolean>(() => readAutoPlaySetting());
 
@@ -1100,6 +1163,7 @@ const useAutoPlayValue = () => {
 
   return value;
 };
+
 
 const Content = () => {
   const { tracks, setTracks, loadingTracks } = useTrackState();
@@ -1282,6 +1346,30 @@ const Content = () => {
       toaster.toast({
         title: "ThemeDeck",
         body: "Couldn't save volume",
+      });
+    }
+  };
+
+  const handleStartOffsetChange = async (appId: number, value: number) => {
+    const normalizedOffset = clamp(value, 0, 30);
+    setTracks((prev) => ({
+      ...prev,
+      [appId]: {
+        ...prev[appId],
+        startOffset: normalizedOffset,
+      },
+    }));
+    applyStartOffsetToActiveTrack(appId, normalizedOffset);
+
+    try {
+      const updated = await updateTrackStartOffset(appId, normalizedOffset);
+      setTracks(normalizeTracks(updated));
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+    } catch (error) {
+      console.error("[ThemeDeck] start offset update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save song start truncation",
       });
     }
   };
@@ -1484,6 +1572,20 @@ const Content = () => {
                     }
                   />
                 </div>
+                <div style={{ marginTop: "0.35rem", paddingRight: "1.25rem" }}>
+                  <SliderField
+                    value={Math.round(track.startOffset)}
+                    label="Truncate beginning of song"
+                    min={0}
+                    max={30}
+                    step={1}
+                    valueSuffix="s"
+                    showValue
+                    onChange={(value) =>
+                      handleStartOffsetChange(track.appId, value)
+                    }
+                  />
+                </div>
               </Focusable>
             </PanelSectionRow>
           ))
@@ -1519,6 +1621,8 @@ const ChangeTheme = () => {
   const [routePathname, setRoutePathname] = useState<string>(
     window.location.pathname || ""
   );
+  const [selectedYouTubeId, setSelectedYouTubeId] = useState<string | null>(null);
+  const topFocusRef = useRef<HTMLDivElement | null>(null);
   const assignedVideoId = useMemo(() => {
     if (!track?.filename) return "";
     const match = track.filename.match(/\[([A-Za-z0-9_-]{6,})\]\.[A-Za-z0-9]+$/);
@@ -1577,6 +1681,17 @@ const ChangeTheme = () => {
     };
   }, [appId, routePathname]);
 
+  useEffect(() => {
+    if (!youtubeResults.length) {
+      setSelectedYouTubeId(null);
+      return;
+    }
+    const currentlySelected = youtubeResults.find((item) => item.id === selectedYouTubeId);
+    if (!currentlySelected) {
+      setSelectedYouTubeId(youtubeResults[0].id);
+    }
+  }, [youtubeResults, selectedYouTubeId]);
+
   const refreshYtDlpStatus = useCallback(
     async (silent = false) => {
       try {
@@ -1620,6 +1735,10 @@ const ChangeTheme = () => {
   useEffect(() => {
     refreshDirectory("/home/deck");
   }, []);
+
+  useEffect(() => {
+    topFocusRef.current?.focus();
+  }, [appId]);
 
   useEffect(
     () => () => {
@@ -1778,6 +1897,11 @@ const ChangeTheme = () => {
     }
   };
 
+  const selectedYouTubeResult = useMemo(
+    () => youtubeResults.find((item) => item.id === selectedYouTubeId) ?? null,
+    [youtubeResults, selectedYouTubeId]
+  );
+
   const joinPath = (base: string, child: string) =>
     base === "/" ? `/${child}` : `${base.replace(/\/$/, "")}/${child}`;
 
@@ -1839,6 +1963,11 @@ const ChangeTheme = () => {
           boxSizing: "border-box",
         }}
       >
+      <div
+        ref={topFocusRef}
+        tabIndex={-1}
+        style={{ position: "absolute", width: 0, height: 0, outline: "none" }}
+      />
       <PanelSection title={`ThemeDeck for ${getDisplayName(appId)}`}>
         <PanelSectionRow>
           {loading ? (
@@ -1990,11 +2119,61 @@ const ChangeTheme = () => {
             <div
               style={{
                 width: "100%",
-                display: "grid",
+                display: "flex",
+                flexDirection: "column",
                 gap: "0.5rem",
-                gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
               }}
             >
+              {!!selectedYouTubeResult && youtubeResults.length > 1 ? (
+                <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap" }}>
+                  <button
+                    className="DialogButton"
+                    onClick={() => {
+                      const index = youtubeResults.findIndex((item) => item.id === selectedYouTubeResult.id);
+                      const next = index <= 0 ? youtubeResults[youtubeResults.length - 1] : youtubeResults[index - 1];
+                      setSelectedYouTubeId(next.id);
+                    }}
+                    style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
+                  >
+                    Prev
+                  </button>
+                  <button
+                    className="DialogButton"
+                    onClick={() => {
+                      const index = youtubeResults.findIndex((item) => item.id === selectedYouTubeResult.id);
+                      const next = index >= youtubeResults.length - 1 ? youtubeResults[0] : youtubeResults[index + 1];
+                      setSelectedYouTubeId(next.id);
+                    }}
+                    style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
+                  >
+                    Next
+                  </button>
+                  <button
+                    className="DialogButton"
+                    onClick={() => handleYouTubePreview(selectedYouTubeResult)}
+                    disabled={previewLoadingVideoId !== null || downloadingVideoId !== null}
+                    style={{ minWidth: "8rem", whiteSpace: "nowrap" }}
+                  >
+                    {previewingVideoId === selectedYouTubeResult.id ? "Stop Preview" : "Play Preview"}
+                  </button>
+                  <button
+                    className="DialogButton"
+                    onClick={() => handleYouTubeDownload(selectedYouTubeResult)}
+                    disabled={downloadingVideoId !== null}
+                    style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
+                  >
+                    {downloadingVideoId === selectedYouTubeResult.id ? "Downloading..." : "Download & Assign"}
+                  </button>
+                </div>
+              ) : null}
+              <div
+                style={{
+                  width: "100%",
+                  display: "grid",
+                  gap: "0.5rem",
+                  gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                }}
+              >
               {youtubeResults.map((result) => {
                 const duration = formatDuration(result.duration);
                 const thumbnailUrl = `https://i.ytimg.com/vi/${encodeURIComponent(
@@ -2002,9 +2181,11 @@ const ChangeTheme = () => {
                 )}/hqdefault.jpg`;
                 const isCurrentlyAssigned =
                   !!assignedVideoId && assignedVideoId === result.id;
+                const isSelected = selectedYouTubeId === result.id;
                 return (
-                  <div
+                  <Focusable
                     key={result.id}
+                    onActivate={() => setSelectedYouTubeId(result.id)}
                     style={{
                       borderRadius: "0.4rem",
                       padding: "0.6rem",
@@ -2013,23 +2194,33 @@ const ChangeTheme = () => {
                         : "rgba(255,255,255,0.05)",
                       border: isCurrentlyAssigned
                         ? "1px solid rgba(120, 230, 130, 0.75)"
+                        : isSelected
+                        ? "1px solid rgba(120, 180, 255, 0.85)"
                         : "1px solid transparent",
                       display: "flex",
                       flexDirection: "column",
                       gap: "0.35rem",
                     }}
                   >
-                    <img
-                      src={thumbnailUrl}
-                      alt={result.title}
-                      style={{
-                        width: "100%",
-                        aspectRatio: "16 / 9",
-                        objectFit: "cover",
-                        borderRadius: "0.35rem",
-                        background: "rgba(0,0,0,0.25)",
-                      }}
-                    />
+                    {isSelected ? (
+                      <div style={{ fontSize: "0.72rem", opacity: 0.9 }}>Selected</div>
+                    ) : null}
+                    <div
+                      onClick={() => setSelectedYouTubeId(result.id)}
+                      style={{ cursor: "pointer" }}
+                    >
+                      <img
+                        src={thumbnailUrl}
+                        alt={result.title}
+                        style={{
+                          width: "100%",
+                          aspectRatio: "16 / 9",
+                          objectFit: "cover",
+                          borderRadius: "0.35rem",
+                          background: "rgba(0,0,0,0.25)",
+                        }}
+                      />
+                    </div>
                     {isCurrentlyAssigned ? (
                       <div
                         style={{
@@ -2054,7 +2245,10 @@ const ChangeTheme = () => {
                     <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
                       <button
                         className="DialogButton"
-                        onClick={() => handleYouTubePreview(result)}
+                        onClick={() => {
+                          setSelectedYouTubeId(result.id);
+                          handleYouTubePreview(result);
+                        }}
                         disabled={
                           previewLoadingVideoId !== null || downloadingVideoId !== null
                         }
@@ -2068,7 +2262,10 @@ const ChangeTheme = () => {
                       </button>
                       <button
                         className="DialogButton"
-                        onClick={() => handleYouTubeDownload(result)}
+                        onClick={() => {
+                          setSelectedYouTubeId(result.id);
+                          handleYouTubeDownload(result);
+                        }}
                         disabled={downloadingVideoId !== null}
                         style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
                       >
@@ -2077,7 +2274,7 @@ const ChangeTheme = () => {
                           : "Download & Assign"}
                       </button>
                     </div>
-                  </div>
+                  </Focusable>
                 );
               })}
               {!youtubeResults.length && (
@@ -2085,6 +2282,7 @@ const ChangeTheme = () => {
                   No results yet. Search for a game soundtrack above.
                 </div>
               )}
+              </div>
             </div>
           )}
         </PanelSectionRow>

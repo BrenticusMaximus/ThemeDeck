@@ -28,6 +28,10 @@ def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
     return max(minimum, min(maximum, value))
 
 
+def clamp_seconds(value: float, minimum: float = 0.0, maximum: float = 30.0) -> float:
+    return max(minimum, min(maximum, value))
+
+
 class Plugin:
     def __init__(self) -> None:
         self._tracks: dict[str, dict[str, Any]] = {}
@@ -77,6 +81,7 @@ class Plugin:
                 "path": str(resolved),
                 "filename": filename,
                 "volume": self._tracks.get(key, {}).get("volume", 1.0),
+                "start_offset": self._tracks.get(key, {}).get("start_offset", 0.0),
             }
             self._save_tracks()
             decky.logger.info(f"set_track stored app={app_id} path={resolved}")
@@ -122,6 +127,16 @@ class Plugin:
         if key not in self._tracks:
             raise ValueError(f"No track found for app {app_id}")
         self._tracks[key]["volume"] = clamp(volume)
+        self._save_tracks()
+        return self._tracks
+
+    async def set_start_offset(
+        self, app_id: int, start_offset: float
+    ) -> dict[str, dict[str, Any]]:
+        key = str(app_id)
+        if key not in self._tracks:
+            raise ValueError(f"No track found for app {app_id}")
+        self._tracks[key]["start_offset"] = clamp_seconds(start_offset)
         self._save_tracks()
         return self._tracks
 
