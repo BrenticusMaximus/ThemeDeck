@@ -719,6 +719,21 @@ const isGameContextMenu = (items: any[]): boolean => {
   );
 };
 
+const isLibraryAppContextMenu = (items: any[]): boolean => {
+  if (!items?.length) return false;
+  return !!findInReactTree(items, (node: any) => {
+    if (typeof node?.props?.onSelected !== "function") return false;
+    const source = node.props.onSelected.toString();
+    return (
+      source.includes("launchSource") ||
+      source.includes("AppProperties") ||
+      source.includes("ShowAppProperties") ||
+      source.includes("InstallApp") ||
+      source.includes("Download")
+    );
+  });
+};
+
 const deriveAppIdFromMenuItems = (
   items: any[] | null,
   fallback: number | null
@@ -777,7 +792,9 @@ const patchMenuItems = (
 ): number | null => {
   const entries = coerceMenuChildren(menuItems);
   if (!Array.isArray(entries) || !entries.length) return null;
-  if (!isGameContextMenu(entries)) return null;
+  if (!isGameContextMenu(entries) && !isLibraryAppContextMenu(entries)) {
+    return null;
+  }
   const derivedAppId = deriveAppIdFromMenuItems(entries, fallbackAppId);
   if (!derivedAppId) return null;
   insertThemeDeckMenu(entries, derivedAppId);

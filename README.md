@@ -1,5 +1,9 @@
 # ThemeDeck Documentation
 
+## February 21, 2026 Update (v2.2.0)
+
+This update allows users to attach ThemeDeck music for games that are not installed yet. If a game has a Steam game page, users can now assign music and have it play there.
+
 ## February 21, 2026 Update (v2.1.0)
 
 This update adds a per-game **Truncate beginning of song** setting (0-30 seconds) in ThemeDeck settings. This lets users skip silent intros by starting each assigned track at a custom offset.
@@ -14,7 +18,7 @@ This update adds **YouTube search/download support powered by `yt-dlp`** so user
 
 ## Overview
 
-ThemeDeck is a Decky Loader plugin that associates locally stored music files with specific Steam games. When you open a game's detail page in Gaming Mode, the plugin automatically locates the matching track, streams it into a shared looping `HTMLAudioElement`, and fades playback out as soon as you leave the page. All selections are stored on the Deck under the plugin's settings directory so they survive reboots and Decky updates.
+ThemeDeck is a Decky Loader plugin that associates locally stored music files with specific Steam games, including games that are not installed yet. When you open a game's detail page in Gaming Mode, the plugin automatically locates the matching track, streams it into a shared looping `HTMLAudioElement`, and fades playback out as soon as you leave the page. All selections are stored on the Deck under the plugin's settings directory so they survive reboots and Decky updates.
 
 ## Supported File Types
 
