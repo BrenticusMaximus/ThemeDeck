@@ -1,5 +1,9 @@
 # ThemeDeck Documentation
 
+## February 21, 2026 Update (v2.1.0)
+
+This update adds a per-game **Truncate beginning of song** setting (0-30 seconds) in ThemeDeck settings. This lets users skip silent intros by starting each assigned track at a custom offset.
+
 ## February 19, 2026 Update
 
 This update adds **YouTube search/download support powered by `yt-dlp`** so users can search game music, preview tracks, download locally, and assign directly from ThemeDeck. You still have the option to manually assign local music tracks.
