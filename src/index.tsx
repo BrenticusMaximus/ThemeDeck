@@ -204,6 +204,10 @@ const AMBIENT_DISABLE_STORE_STORAGE_KEY = "themedeck:ambientDisableStore";
 const AMBIENT_DISABLE_STORE_EVENT = "themedeck:ambient-disable-store-changed";
 const GLOBAL_AMBIENT_APP_ID = -1;
 const STORE_TRACK_APP_ID = -2;
+const UI_MODE_GAMEPAD = 4;
+const UI_MODE_DESKTOP = 7;
+const UI_MODE_POLL_MS = 2000;
+const UI_MODE_CACHE_MS = 1000;
 const SP_TAB_CANDIDATES = [
   "SP",
   "sp",
@@ -245,6 +249,11 @@ let autoPlaybackStoreProbeInFlight = false;
 let storeContextActive = false;
 let playInvocationCounter = 0;
 let playInFlightSignature: string | null = null;
+let desktopModeActive = false;
+let desktopModeLastCheck = 0;
+let desktopModeRefreshInFlight: Promise<boolean> | null = null;
+let uiModePollInterval: number | null = null;
+let stopUIModeSubscription: (() => void) | null = null;
 
 const readPreference = (key: string, fallback = true): boolean => {
   try {
@@ -442,6 +451,11 @@ const isIgnorablePlaybackError = (error: unknown): boolean => {
 };
 
 const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
+  const inDesktopMode = await refreshDesktopModeState();
+  if (inDesktopMode) {
+    return;
+  }
+
   const signature = getPlaySignature(track, reason);
   if (playInFlightSignature === signature) {
     return;
@@ -667,6 +681,158 @@ const wrapUnsubscribe = (token: any): (() => void) | null => {
     return () => token.Unregister();
   }
   return null;
+};
+
+const parseUIMode = (value: unknown): number | null => {
+  if (typeof value === "number" && !Number.isNaN(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "desktop") {
+      return UI_MODE_DESKTOP;
+    }
+    if (normalized === "gamepad") {
+      return UI_MODE_GAMEPAD;
+    }
+    const parsed = Number.parseInt(normalized, 10);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+    return null;
+  }
+  if (value && typeof value === "object") {
+    const candidate =
+      (value as any).m_eUIMode ??
+      (value as any).eUIMode ??
+      (value as any).uiMode ??
+      (value as any).mode;
+    return parseUIMode(candidate);
+  }
+  return null;
+};
+
+const setDesktopModeState = (next: boolean) => {
+  if (next === desktopModeActive) {
+    return;
+  }
+  desktopModeActive = next;
+  if (desktopModeActive && playbackState.status === "playing") {
+    stopPlayback(true);
+  }
+  scheduleAutoPlaybackFromContext();
+};
+
+const readDesktopModeFromWindows = async (): Promise<boolean | null> => {
+  try {
+    const ui = (window as any)?.SteamClient?.UI;
+    const getDesired = ui?.GetDesiredSteamUIWindows;
+    if (typeof getDesired !== "function") {
+      return null;
+    }
+    const windows = await getDesired.call(ui);
+    if (!Array.isArray(windows) || !windows.length) {
+      return null;
+    }
+    const hasGamepadWindow = windows.some((entry) => {
+      const type = Number((entry as any)?.windowType);
+      return type === 0 || type === 1;
+    });
+    const hasDesktopWindow = windows.some((entry) => {
+      const type = Number((entry as any)?.windowType);
+      return type === 5 || type === 6 || type === 7;
+    });
+    if (hasGamepadWindow) {
+      return false;
+    }
+    if (hasDesktopWindow) {
+      return true;
+    }
+  } catch (error) {
+    console.error("[ThemeDeck] ui window probe failed", error);
+  }
+  return null;
+};
+
+const refreshDesktopModeState = async (force = false): Promise<boolean> => {
+  const now = Date.now();
+  if (!force && now - desktopModeLastCheck < UI_MODE_CACHE_MS) {
+    return desktopModeActive;
+  }
+  if (desktopModeRefreshInFlight) {
+    return desktopModeRefreshInFlight;
+  }
+
+  desktopModeRefreshInFlight = (async () => {
+    let resolved: boolean | null = null;
+    try {
+      const ui = (window as any)?.SteamClient?.UI;
+      const getMode = ui?.GetUIMode;
+      if (typeof getMode === "function") {
+        const modeValue = await getMode.call(ui);
+        const mode = parseUIMode(modeValue);
+        if (mode !== null) {
+          resolved = mode === UI_MODE_DESKTOP;
+        }
+      }
+    } catch (error) {
+      console.error("[ThemeDeck] ui mode probe failed", error);
+    }
+
+    if (resolved === null) {
+      resolved = await readDesktopModeFromWindows();
+    }
+
+    if (resolved !== null) {
+      setDesktopModeState(resolved);
+    }
+    desktopModeLastCheck = Date.now();
+    return desktopModeActive;
+  })();
+
+  try {
+    return await desktopModeRefreshInFlight;
+  } finally {
+    desktopModeRefreshInFlight = null;
+  }
+};
+
+const startDesktopModeWatcher = () => {
+  void refreshDesktopModeState(true);
+  if (uiModePollInterval) {
+    return;
+  }
+
+  const ui = (window as any)?.SteamClient?.UI;
+  const registerForUIModeChanged = ui?.RegisterForUIModeChanged;
+  if (typeof registerForUIModeChanged === "function") {
+    try {
+      const token = registerForUIModeChanged.call(ui, (modeValue: unknown) => {
+        const parsed = parseUIMode(modeValue);
+        if (parsed !== null) {
+          setDesktopModeState(parsed === UI_MODE_DESKTOP);
+          return;
+        }
+        void refreshDesktopModeState(true);
+      });
+      stopUIModeSubscription = wrapUnsubscribe(token);
+    } catch (error) {
+      console.error("[ThemeDeck] ui mode subscription failed", error);
+    }
+  }
+
+  uiModePollInterval = window.setInterval(() => {
+    void refreshDesktopModeState();
+  }, UI_MODE_POLL_MS);
+};
+
+const stopDesktopModeWatcher = () => {
+  stopUIModeSubscription?.();
+  stopUIModeSubscription = null;
+  if (uiModePollInterval) {
+    window.clearInterval(uiModePollInterval);
+    uiModePollInterval = null;
+  }
 };
 
 const startSteamAppWatchers = () => {
@@ -1488,6 +1654,13 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
 };
 
 const applyAutoPlaybackFromContext = () => {
+  if (desktopModeActive) {
+    if (playbackState.status === "playing") {
+      stopPlayback(true);
+    }
+    return;
+  }
+
   const shouldSuppressGlobal =
     !readGlobalAmbientEnabledSetting() ||
     (readAmbientDisableStoreSetting() && isStorePath());
@@ -1558,6 +1731,7 @@ const startAutoPlaybackCoordinator = () => {
     return;
   }
   autoPlaybackStarted = true;
+  startDesktopModeWatcher();
   refreshAutoPlaybackTrackCache();
   stopAutoPlaybackSubscription = subscribePlayback(() => {
     scheduleAutoPlaybackFromContext();
@@ -1596,6 +1770,7 @@ const stopAutoPlaybackCoordinator = () => {
     scheduleAutoPlaybackFromContext
   );
   window.removeEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
+  stopDesktopModeWatcher();
   if (autoPlaybackRouteInterval) {
     window.clearInterval(autoPlaybackRouteInterval);
     autoPlaybackRouteInterval = null;

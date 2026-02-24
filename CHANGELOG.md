@@ -1,5 +1,8 @@
 # Changelog
 
+## 2.4.1 - 2026-02-24
+- Prevents ThemeDeck from playing any game/global/store music tracks while Steam is in Desktop Mode.
+
 ## 2.4.0 - 2026-02-24
 - Adds an optional store-only track that plays only on Steam Store pages.
 - Adds store-only track controls for preview, remove, volume, and start-truncation.

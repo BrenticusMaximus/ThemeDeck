@@ -1,5 +1,9 @@
 # ThemeDeck Documentation
 
+## February 24, 2026 Update (v2.4.1)
+
+This update ensures ThemeDeck never plays any music tracks while Steam is in Desktop Mode.
+
 ## February 24, 2026 Update (v2.4.0)
 
 This update adds an optional **store-only music track** that plays only on Steam Store pages, with independent preview, volume, remove, and truncate-start controls.
