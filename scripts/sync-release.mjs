@@ -11,6 +11,12 @@ const targetDir = path.resolve(root, "release", "ThemeDeck", "dist");
 const pyModulesTargetDir = path.resolve(root, "release", "ThemeDeck", "py_modules");
 const mainSource = path.resolve(root, "main.py");
 const mainTarget = path.resolve(root, "release", "ThemeDeck", "main.py");
+const staticFiles = [
+  "plugin.json",
+  "package.json",
+  "README.md",
+  "LICENSE",
+];
 
 const ensureDir = (dir) => {
   fs.mkdirSync(dir, { recursive: true });
@@ -68,6 +74,16 @@ const syncDirectory = (src, dest, opts = {}) => {
 syncDirectory(sourceDir, targetDir, { required: true, cleanTarget: true });
 copyRecursive(mainSource, mainTarget);
 log(`Synced ${mainSource} -> ${mainTarget}`);
+for (const relPath of staticFiles) {
+  const src = path.resolve(root, relPath);
+  const dest = path.resolve(root, "release", "ThemeDeck", relPath);
+  if (fs.existsSync(src)) {
+    copyRecursive(src, dest);
+    log(`Synced ${src} -> ${dest}`);
+  } else {
+    log(`Skipping missing optional file: ${src}`);
+  }
+}
 if (fs.existsSync(pyModulesTargetDir)) {
   removeRecursive(pyModulesTargetDir);
   log(`Removed ${pyModulesTargetDir}`);

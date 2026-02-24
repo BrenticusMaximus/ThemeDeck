@@ -116,6 +116,7 @@ type GlobalTrack = {
   volume: number;
   startOffset: number;
 };
+type StoreTrack = GlobalTrack;
 
 type YtDlpStatus = {
   installed: boolean;
@@ -140,6 +141,7 @@ const DETAIL_PATTERNS = GAME_DETAIL_ROUTES.map((route) => {
 
 const fetchTracks = callable<[], RawTrackMap>("get_tracks");
 const fetchGlobalTrack = callable<[], BackendTrack | null>("get_global_track");
+const fetchStoreTrack = callable<[], BackendTrack | null>("get_store_track");
 const assignTrack = callable<
   [appId: number, path: string, filename: string],
   RawTrackMap
@@ -147,13 +149,20 @@ const assignTrack = callable<
 const assignGlobalTrack = callable<[path: string, filename: string], BackendTrack>(
   "set_global_track"
 );
+const assignStoreTrack = callable<[path: string, filename: string], BackendTrack>(
+  "set_store_track"
+);
 const deleteTrack = callable<[appId: number], RawTrackMap>("remove_track");
 const deleteGlobalTrack = callable<[], RawTrackMap>("remove_global_track");
+const deleteStoreTrack = callable<[], RawTrackMap>("remove_store_track");
 const updateTrackVolume = callable<[appId: number, volume: number], RawTrackMap>(
   "set_volume"
 );
 const updateGlobalVolume = callable<[volume: number], BackendTrack>(
   "set_global_volume"
+);
+const updateStoreVolume = callable<[volume: number], BackendTrack>(
+  "set_store_volume"
 );
 const updateTrackStartOffset = callable<
   [appId: number, startOffset: number],
@@ -161,6 +170,9 @@ const updateTrackStartOffset = callable<
 >("set_start_offset");
 const updateGlobalStartOffset = callable<[startOffset: number], BackendTrack>(
   "set_global_start_offset"
+);
+const updateStoreStartOffset = callable<[startOffset: number], BackendTrack>(
+  "set_store_start_offset"
 );
 const listDirectory = callable<[path?: string], DirectoryListing>("list_directory");
 const loadTrackAudio = callable<[path: string], AudioPayload>("load_track_audio");
@@ -191,6 +203,7 @@ const GLOBAL_AMBIENT_ENABLED_EVENT = "themedeck:global-ambient-enabled-changed";
 const AMBIENT_DISABLE_STORE_STORAGE_KEY = "themedeck:ambientDisableStore";
 const AMBIENT_DISABLE_STORE_EVENT = "themedeck:ambient-disable-store-changed";
 const GLOBAL_AMBIENT_APP_ID = -1;
+const STORE_TRACK_APP_ID = -2;
 const SP_TAB_CANDIDATES = [
   "SP",
   "sp",
@@ -222,6 +235,7 @@ let sharedAudio: HTMLAudioElement | null = null;
 const audioCache = new Map<string, AudioCacheEntry>();
 let latestTracksForAutoPlay: TrackMap = {};
 let latestGlobalTrackForAutoPlay: GlobalTrack | null = null;
+let latestStoreTrackForAutoPlay: StoreTrack | null = null;
 let autoPlaybackTick: number | null = null;
 let autoPlaybackStarted = false;
 let stopAutoPlaybackSubscription: (() => void) | null = null;
@@ -1410,6 +1424,20 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
     return null;
   }
 
+  const inStore = isStorePath();
+  if (inStore && latestStoreTrackForAutoPlay) {
+    return {
+      appId: STORE_TRACK_APP_ID,
+      path: latestStoreTrackForAutoPlay.path,
+      filename: latestStoreTrackForAutoPlay.filename,
+      volume: latestStoreTrackForAutoPlay.volume,
+      startOffset: latestStoreTrackForAutoPlay.startOffset,
+    };
+  }
+  if (inStore && readAmbientDisableStoreSetting()) {
+    return null;
+  }
+
   if (!readGlobalAmbientEnabledSetting()) {
     return null;
   }
@@ -1420,6 +1448,15 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
 
   const currentPath = getLibraryPath();
   if (!currentPath && playbackState.reason === "auto" && playbackState.status === "playing") {
+    if (playbackState.appId === STORE_TRACK_APP_ID && latestStoreTrackForAutoPlay) {
+      return {
+        appId: STORE_TRACK_APP_ID,
+        path: latestStoreTrackForAutoPlay.path,
+        filename: latestStoreTrackForAutoPlay.filename,
+        volume: latestStoreTrackForAutoPlay.volume,
+        startOffset: latestStoreTrackForAutoPlay.startOffset,
+      };
+    }
     if (playbackState.appId === GLOBAL_AMBIENT_APP_ID && latestGlobalTrackForAutoPlay) {
       return {
         appId: GLOBAL_AMBIENT_APP_ID,
@@ -1500,12 +1537,14 @@ const refreshAutoPlaybackTrackCache = async () => {
   }
   autoPlaybackTrackRefreshInFlight = true;
   try {
-    const [trackData, globalData] = await Promise.all([
+    const [trackData, globalData, storeData] = await Promise.all([
       fetchTracks(),
       fetchGlobalTrack(),
+      fetchStoreTrack(),
     ]);
     latestTracksForAutoPlay = normalizeTracks(trackData);
     latestGlobalTrackForAutoPlay = normalizeGlobalTrack(globalData);
+    latestStoreTrackForAutoPlay = normalizeGlobalTrack(storeData);
     scheduleAutoPlaybackFromContext();
   } catch (error) {
     console.error("[ThemeDeck] refresh auto playback cache failed", error);
@@ -1567,21 +1606,26 @@ const stopAutoPlaybackCoordinator = () => {
 const useTrackState = (options?: { silent?: boolean }) => {
   const [tracks, setTracks] = useState<TrackMap>({});
   const [globalTrack, setGlobalTrack] = useState<GlobalTrack | null>(null);
+  const [storeTrack, setStoreTrack] = useState<StoreTrack | null>(null);
   const [loadingTracks, setLoadingTracks] = useState(true);
   const silent = options?.silent ?? false;
 
   const refreshTracks = useCallback(async () => {
     try {
-      const [trackData, globalData] = await Promise.all([
+      const [trackData, globalData, storeData] = await Promise.all([
         fetchTracks(),
         fetchGlobalTrack(),
+        fetchStoreTrack(),
       ]);
       const normalizedTracks = normalizeTracks(trackData);
       const normalizedGlobal = normalizeGlobalTrack(globalData);
+      const normalizedStore = normalizeGlobalTrack(storeData);
       setTracks(normalizedTracks);
       setGlobalTrack(normalizedGlobal);
+      setStoreTrack(normalizedStore);
       latestTracksForAutoPlay = normalizedTracks;
       latestGlobalTrackForAutoPlay = normalizedGlobal;
+      latestStoreTrackForAutoPlay = normalizedStore;
       scheduleAutoPlaybackFromContext();
     } catch (error) {
       console.error("[ThemeDeck] load tracks failed", error);
@@ -1615,6 +1659,8 @@ const useTrackState = (options?: { silent?: boolean }) => {
     setTracks,
     globalTrack,
     setGlobalTrack,
+    storeTrack,
+    setStoreTrack,
     loadingTracks,
     refreshTracks,
   };
@@ -1702,8 +1748,15 @@ const useGlobalAmbientEnabledSetting = (): [boolean, (value: boolean) => void] =
 
 
 const Content = () => {
-  const { tracks, setTracks, globalTrack, setGlobalTrack, loadingTracks } =
-    useTrackState();
+  const {
+    tracks,
+    setTracks,
+    globalTrack,
+    setGlobalTrack,
+    storeTrack,
+    setStoreTrack,
+    loadingTracks,
+  } = useTrackState();
   const [library, setLibrary] = useState<GameOption[]>([]);
   const [autoPlay, setAutoPlay] = useAutoPlaySetting();
   const [globalAmbientEnabled, setGlobalAmbientEnabled] =
@@ -1951,6 +2004,95 @@ const Content = () => {
     }
   };
 
+  const handleStorePreviewToggle = () => {
+    if (!storeTrack) return;
+    if (playback.appId === STORE_TRACK_APP_ID && playback.status === "playing") {
+      stopPlayback(false);
+      return;
+    }
+    playTrack(
+      {
+        appId: STORE_TRACK_APP_ID,
+        path: storeTrack.path,
+        filename: storeTrack.filename,
+        volume: storeTrack.volume,
+        startOffset: storeTrack.startOffset,
+      },
+      "manual"
+    );
+  };
+
+  const handleStoreVolumeChange = async (value: number) => {
+    if (!storeTrack) return;
+    const normalizedVolume = clamp(value / 100);
+    const nextStore = { ...storeTrack, volume: normalizedVolume };
+    setStoreTrack(nextStore);
+    latestStoreTrackForAutoPlay = nextStore;
+    applyVolumeToActiveTrack(STORE_TRACK_APP_ID, normalizedVolume);
+    try {
+      const updated = await updateStoreVolume(normalizedVolume);
+      const normalized = normalizeGlobalTrack(updated);
+      setStoreTrack(normalized);
+      latestStoreTrackForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+    } catch (error) {
+      console.error("[ThemeDeck] store volume update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save store track volume",
+      });
+    }
+  };
+
+  const handleStoreStartOffsetChange = async (value: number) => {
+    if (!storeTrack) return;
+    const normalizedOffset = clamp(value, 0, 30);
+    const nextStore = { ...storeTrack, startOffset: normalizedOffset };
+    setStoreTrack(nextStore);
+    latestStoreTrackForAutoPlay = nextStore;
+    applyStartOffsetToActiveTrack(STORE_TRACK_APP_ID, normalizedOffset);
+    try {
+      const updated = await updateStoreStartOffset(normalizedOffset);
+      const normalized = normalizeGlobalTrack(updated);
+      setStoreTrack(normalized);
+      latestStoreTrackForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+    } catch (error) {
+      console.error("[ThemeDeck] store start offset update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save store song start truncation",
+      });
+    }
+  };
+
+  const handleRemoveStoreTrack = async () => {
+    if (!storeTrack) return;
+    try {
+      const removedPath = storeTrack.path;
+      const updated = await deleteStoreTrack();
+      const normalized = normalizeTracks(updated);
+      setTracks(normalized);
+      setStoreTrack(null);
+      latestTracksForAutoPlay = normalized;
+      latestStoreTrackForAutoPlay = null;
+      clearAudioCache(removedPath);
+      if (playback.appId === STORE_TRACK_APP_ID) {
+        stopPlayback(true);
+      }
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+    } catch (error) {
+      console.error("[ThemeDeck] remove store track failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Failed to remove store track",
+      });
+    }
+  };
+
   const handlePreviewToggle = (track: GameTrack) => {
     if (playback.appId === track.appId && playback.status === "playing") {
       stopPlayback(false);
@@ -2113,6 +2255,15 @@ const Content = () => {
               Choose global/ambient track...
             </button>
           </PanelSectionRow>
+          <PanelSectionRow>
+            <button
+              className="DialogButton"
+              onClick={() => Navigation.Navigate("/themedeck/store")}
+              style={{ minWidth: "14rem", whiteSpace: "nowrap" }}
+            >
+              Choose store-only track...
+            </button>
+          </PanelSectionRow>
         </PanelSection>
       </div>
       <PanelSection title="Global / ambient track">
@@ -2198,6 +2349,95 @@ const Content = () => {
                   valueSuffix="s"
                   showValue
                   onChange={handleGlobalStartOffsetChange}
+                />
+              </div>
+            </Focusable>
+          </PanelSectionRow>
+        )}
+      </PanelSection>
+      <PanelSection title="Store-only track">
+        {!storeTrack ? (
+          <PanelSectionRow>
+            <div>No store-only track selected.</div>
+          </PanelSectionRow>
+        ) : (
+          <PanelSectionRow>
+            <Focusable style={{ width: "100%" }}>
+              <div style={{ fontWeight: 600 }}>{storeTrack.filename}</div>
+              <div style={{ opacity: 0.8, fontSize: "0.9rem" }}>
+                {storeTrack.path}
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  gap: "0.5rem",
+                  marginTop: "0.5rem",
+                  flexWrap: "nowrap",
+                }}
+              >
+                <button
+                  className="DialogButton"
+                  style={{
+                    width: "3rem",
+                    height: "2.6rem",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: 0,
+                  }}
+                  title={
+                    playback.appId === STORE_TRACK_APP_ID &&
+                    playback.status === "playing"
+                      ? "Pause preview"
+                      : "Preview track"
+                  }
+                  onClick={handleStorePreviewToggle}
+                >
+                  {playback.appId === STORE_TRACK_APP_ID &&
+                  playback.status === "playing" ? (
+                    <FaPause />
+                  ) : (
+                    <FaPlay />
+                  )}
+                </button>
+                <button
+                  className="DialogButton"
+                  style={{
+                    width: "3rem",
+                    height: "2.6rem",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: 0,
+                  }}
+                  title="Remove store-only music"
+                  onClick={handleRemoveStoreTrack}
+                >
+                  <FaTrash />
+                </button>
+              </div>
+              <div style={{ marginTop: "0.5rem", paddingRight: "1.25rem" }}>
+                <SliderField
+                  value={Math.round(storeTrack.volume * 100)}
+                  label="Store-only playback volume"
+                  min={0}
+                  max={100}
+                  step={5}
+                  valueSuffix="%"
+                  showValue
+                  onChange={handleStoreVolumeChange}
+                />
+              </div>
+              <div style={{ marginTop: "0.35rem", paddingRight: "1.25rem" }}>
+                <SliderField
+                  value={Math.round(storeTrack.startOffset)}
+                  label="Truncate beginning of song"
+                  min={0}
+                  max={30}
+                  step={1}
+                  valueSuffix="s"
+                  showValue
+                  onChange={handleStoreStartOffsetChange}
                 />
               </div>
             </Focusable>
@@ -3392,6 +3632,268 @@ const ChangeGlobalTheme = () => {
   );
 };
 
+const ChangeStoreTheme = () => {
+  const [track, setTrack] = useState<StoreTrack | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [currentDir, setCurrentDir] = useState("/home/deck");
+  const [browser, setBrowser] = useState<DirectoryListing>({
+    path: "/home/deck",
+    dirs: [],
+    files: [],
+  });
+  const [browserLoading, setBrowserLoading] = useState(true);
+  const [manualPath, setManualPath] = useState("/home/deck");
+  const topFocusRef = useRef<HTMLDivElement | null>(null);
+
+  const loadTrack = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await fetchStoreTrack();
+      setTrack(normalizeGlobalTrack(data));
+    } catch (error) {
+      console.error("[ThemeDeck] failed to load store track", error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadTrack();
+  }, [loadTrack]);
+
+  const refreshDirectory = useCallback(
+    async (nextDir?: string) => {
+      setBrowserLoading(true);
+      try {
+        const listing = await listDirectory(nextDir || currentDir);
+        setBrowser(listing);
+        setCurrentDir(listing.path);
+        setManualPath(listing.path);
+      } catch (error) {
+        console.error("[ThemeDeck] list directory failed", error);
+      } finally {
+        setBrowserLoading(false);
+      }
+    },
+    [currentDir]
+  );
+
+  useEffect(() => {
+    refreshDirectory("/home/deck");
+  }, []);
+
+  useEffect(() => {
+    topFocusRef.current?.focus();
+  }, []);
+
+  const saveFromPath = async (fullPath: string) => {
+    try {
+      const filename = fullPath.split("/").pop() || "track";
+      const saved = await assignStoreTrack(fullPath, filename);
+      const normalized = normalizeGlobalTrack(saved);
+      setTrack(normalized);
+      latestStoreTrackForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Saved store-only music",
+      });
+    } catch (error) {
+      console.error("[ThemeDeck] store save from path failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: `Unable to add file: ${getErrorMessage(error, "Unknown error")}`,
+      });
+    }
+  };
+
+  const joinPath = (base: string, child: string) =>
+    base === "/" ? `/${child}` : `${base.replace(/\/$/, "")}/${child}`;
+
+  const goUp = () => {
+    if (currentDir === "/") return;
+    const parent = currentDir.replace(/\/[^/]+$/, "") || "/";
+    refreshDirectory(parent);
+  };
+
+  const handleDirClick = (dir: string) => {
+    refreshDirectory(joinPath(currentDir, dir));
+  };
+
+  const handleFileClick = (file: string) => {
+    saveFromPath(joinPath(currentDir, file));
+  };
+
+  const handleManualGo = () => {
+    if (!manualPath) return;
+    refreshDirectory(manualPath);
+  };
+
+  const handleRemove = async () => {
+    try {
+      await deleteStoreTrack();
+      setTrack(null);
+      latestStoreTrackForAutoPlay = null;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Cleared store-only music",
+      });
+    } catch (error) {
+      console.error("[ThemeDeck] store remove failed", error);
+    }
+  };
+
+  return (
+    <ScrollPanel>
+      <div
+        style={{
+          padding: 24,
+          paddingTop: 48,
+          paddingBottom: 140,
+          minHeight: "100vh",
+          boxSizing: "border-box",
+        }}
+      >
+        <div
+          ref={topFocusRef}
+          tabIndex={-1}
+          style={{ position: "absolute", width: 0, height: 0, outline: "none" }}
+        />
+        <PanelSection title="ThemeDeck store-only track">
+          <PanelSectionRow>
+            {loading ? (
+              <Spinner />
+            ) : track ? (
+              <div>
+                <div style={{ fontWeight: 600 }}>{track.filename}</div>
+                <div style={{ opacity: 0.8 }}>{track.path}</div>
+              </div>
+            ) : (
+              <div>No store-only track selected yet.</div>
+            )}
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div
+              style={{
+                width: "100%",
+                display: "flex",
+                gap: "0.5rem",
+                flexWrap: "nowrap",
+                alignItems: "center",
+              }}
+            >
+              {track ? (
+                <button
+                  className="DialogButton"
+                  onClick={handleRemove}
+                  style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
+                >
+                  Remove music
+                </button>
+              ) : null}
+              <button
+                className="DialogButton"
+                onClick={() => Navigation.NavigateBack()}
+                style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
+              >
+                Done
+              </button>
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
+
+        <PanelSection title="Browse local files to assign from system storage">
+          <PanelSectionRow>
+            <div
+              style={{
+                display: "flex",
+                width: "100%",
+                gap: "0.5rem",
+                alignItems: "center",
+              }}
+            >
+              <button className="DialogButton" onClick={goUp}>
+                Up
+              </button>
+              <div style={{ flexGrow: 1, fontFamily: "monospace" }}>
+                {currentDir}
+              </div>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr auto",
+                width: "100%",
+                gap: "0.5rem",
+                alignItems: "center",
+              }}
+            >
+              <TextField
+                value={manualPath}
+                onChange={(e) => setManualPath(e.target.value)}
+                style={{ width: "100%", minWidth: "20rem" }}
+              />
+              <button className="DialogButton" onClick={handleManualGo}>
+                Go
+              </button>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            {browserLoading ? (
+              <Spinner />
+            ) : (
+              <div
+                style={{
+                  width: "100%",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.35rem",
+                  paddingRight: "0.25rem",
+                }}
+              >
+                {browser.dirs.map((dir) => (
+                  <button
+                    key={`dir-${dir}`}
+                    className="DialogButton"
+                    onClick={() => handleDirClick(dir)}
+                    style={{ justifyContent: "flex-start" }}
+                  >
+                    📁 {dir}
+                  </button>
+                ))}
+                {browser.files
+                  .filter((file) =>
+                    AUDIO_EXTENSIONS.some((ext) =>
+                      file.toLowerCase().endsWith(`.${ext}`)
+                    )
+                  )
+                  .map((file) => (
+                    <button
+                      key={`file-${file}`}
+                      className="DialogButton"
+                      onClick={() => handleFileClick(file)}
+                      style={{ justifyContent: "flex-start" }}
+                    >
+                      🎵 {file}
+                    </button>
+                  ))}
+                {!browser.dirs.length && !browser.files.length && (
+                  <div style={{ opacity: 0.6 }}>Folder is empty.</div>
+                )}
+              </div>
+            )}
+          </PanelSectionRow>
+        </PanelSection>
+      </div>
+    </ScrollPanel>
+  );
+};
+
 export default definePlugin(() => {
   startLocationWatcher();
   startSteamAppWatchers();
@@ -3403,6 +3905,11 @@ export default definePlugin(() => {
   routerHook.addRoute(
     "/themedeck/global",
     () => <ChangeGlobalTheme />,
+    { exact: true }
+  );
+  routerHook.addRoute(
+    "/themedeck/store",
+    () => <ChangeStoreTheme />,
     { exact: true }
   );
   routerHook.addRoute(
@@ -3441,6 +3948,11 @@ export default definePlugin(() => {
         routerHook.removeRoute("/themedeck/global");
       } catch (error) {
         console.error("[ThemeDeck] remove global route failed", error);
+      }
+      try {
+        routerHook.removeRoute("/themedeck/store");
+      } catch (error) {
+        console.error("[ThemeDeck] remove store route failed", error);
       }
     },
   };

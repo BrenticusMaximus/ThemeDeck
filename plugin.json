@@ -5,7 +5,7 @@
   "api_version": 1,
   "publish": {
     "tags": ["music", "theme", "library"],
-    "description": "ThemeDeck assigns local music to each game and plays it when you open the game's details page.",
+    "description": "ThemeDeck assigns local music to game pages, plus optional global and store-only tracks with independent controls.",
     "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
   }
 }

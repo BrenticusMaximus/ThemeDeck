@@ -1,7 +1,7 @@
 {
   "name": "themedeck",
-  "version": "2.3.0",
-  "description": "ThemeDeck plays your chosen background music whenever you open a game's details page in Gaming Mode.",
+  "version": "2.4.0",
+  "description": "ThemeDeck plays game, global, and store-specific music tracks based on where you are in Gaming Mode.",
   "type": "module",
   "scripts": {
     "stamp": "node scripts/stamp-build.mjs",
