@@ -24,6 +24,7 @@ import {
 import {
   callable,
   definePlugin,
+  executeInTab,
   routerHook,
   toaster,
 } from "@decky/api";
@@ -44,7 +45,7 @@ import {
 import { BUILD_ID } from "./build-info";
 
 type BackendTrack = {
-  app_id: number;
+  app_id?: number;
   path: string;
   filename?: string;
   volume?: number;
@@ -109,6 +110,13 @@ type YouTubePreviewResponse = {
   stream_url: string;
 };
 
+type GlobalTrack = {
+  path: string;
+  filename: string;
+  volume: number;
+  startOffset: number;
+};
+
 type YtDlpStatus = {
   installed: boolean;
   path?: string;
@@ -131,18 +139,29 @@ const DETAIL_PATTERNS = GAME_DETAIL_ROUTES.map((route) => {
 });
 
 const fetchTracks = callable<[], RawTrackMap>("get_tracks");
+const fetchGlobalTrack = callable<[], BackendTrack | null>("get_global_track");
 const assignTrack = callable<
   [appId: number, path: string, filename: string],
   RawTrackMap
 >("set_track");
+const assignGlobalTrack = callable<[path: string, filename: string], BackendTrack>(
+  "set_global_track"
+);
 const deleteTrack = callable<[appId: number], RawTrackMap>("remove_track");
+const deleteGlobalTrack = callable<[], RawTrackMap>("remove_global_track");
 const updateTrackVolume = callable<[appId: number, volume: number], RawTrackMap>(
   "set_volume"
+);
+const updateGlobalVolume = callable<[volume: number], BackendTrack>(
+  "set_global_volume"
 );
 const updateTrackStartOffset = callable<
   [appId: number, startOffset: number],
   RawTrackMap
 >("set_start_offset");
+const updateGlobalStartOffset = callable<[startOffset: number], BackendTrack>(
+  "set_global_start_offset"
+);
 const listDirectory = callable<[path?: string], DirectoryListing>("list_directory");
 const loadTrackAudio = callable<[path: string], AudioPayload>("load_track_audio");
 const searchYouTube = callable<
@@ -167,6 +186,21 @@ const AUDIO_EXTENSIONS_LABEL = AUDIO_EXTENSIONS.map((ext) => `.${ext}`).join(
 );
 const AUTO_PLAY_STORAGE_KEY = "themedeck:autoPlay";
 const AUTO_PLAY_EVENT = "themedeck:auto-play-changed";
+const GLOBAL_AMBIENT_ENABLED_STORAGE_KEY = "themedeck:globalAmbientEnabled";
+const GLOBAL_AMBIENT_ENABLED_EVENT = "themedeck:global-ambient-enabled-changed";
+const AMBIENT_DISABLE_STORE_STORAGE_KEY = "themedeck:ambientDisableStore";
+const AMBIENT_DISABLE_STORE_EVENT = "themedeck:ambient-disable-store-changed";
+const GLOBAL_AMBIENT_APP_ID = -1;
+const SP_TAB_CANDIDATES = [
+  "SP",
+  "sp",
+  "SharedJSContext",
+  "Steam",
+  "SteamUI",
+  "MainMenu",
+  "GamepadUI",
+  "Library",
+] as const;
 
 type AudioCacheEntry = {
   objectUrl: string;
@@ -186,6 +220,17 @@ let playbackState: PlaybackState = {
 };
 let sharedAudio: HTMLAudioElement | null = null;
 const audioCache = new Map<string, AudioCacheEntry>();
+let latestTracksForAutoPlay: TrackMap = {};
+let latestGlobalTrackForAutoPlay: GlobalTrack | null = null;
+let autoPlaybackTick: number | null = null;
+let autoPlaybackStarted = false;
+let stopAutoPlaybackSubscription: (() => void) | null = null;
+let autoPlaybackTrackRefreshInFlight = false;
+let autoPlaybackRouteInterval: number | null = null;
+let autoPlaybackStoreProbeInFlight = false;
+let storeContextActive = false;
+let playInvocationCounter = 0;
+let playInFlightSignature: string | null = null;
 
 const readPreference = (key: string, fallback = true): boolean => {
   try {
@@ -214,6 +259,26 @@ const readAutoPlaySetting = (): boolean =>
 
 const persistAutoPlaySetting = (value: boolean) =>
   persistPreference(AUTO_PLAY_STORAGE_KEY, AUTO_PLAY_EVENT, value);
+
+const readGlobalAmbientEnabledSetting = (): boolean =>
+  readPreference(GLOBAL_AMBIENT_ENABLED_STORAGE_KEY, false);
+
+const persistGlobalAmbientEnabledSetting = (value: boolean) =>
+  persistPreference(
+    GLOBAL_AMBIENT_ENABLED_STORAGE_KEY,
+    GLOBAL_AMBIENT_ENABLED_EVENT,
+    value
+  );
+
+const readAmbientDisableStoreSetting = (): boolean =>
+  readPreference(AMBIENT_DISABLE_STORE_STORAGE_KEY, true);
+
+const persistAmbientDisableStoreSetting = (value: boolean) =>
+  persistPreference(
+    AMBIENT_DISABLE_STORE_STORAGE_KEY,
+    AMBIENT_DISABLE_STORE_EVENT,
+    value
+  );
 
 const subscribePlayback = (listener: (state: PlaybackState) => void) => {
   playbackListeners.add(listener);
@@ -343,11 +408,39 @@ const stopPlayback = (fade: boolean) => {
   }, 40);
 };
 
+const getPlaySignature = (track: GameTrack, reason: PlaybackReason): string =>
+  `${reason}|${track.appId}|${track.path}`;
+
+const isIgnorablePlaybackError = (error: unknown): boolean => {
+  if (error instanceof DOMException) {
+    if (error.name === "AbortError" || error.name === "NotAllowedError") {
+      return true;
+    }
+  }
+  const message = String(
+    (error as { message?: unknown })?.message ?? error ?? ""
+  ).toLowerCase();
+  return (
+    message.includes("interrupted") ||
+    message.includes("abort") ||
+    message.includes("notallowederror")
+  );
+};
+
 const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
+  const signature = getPlaySignature(track, reason);
+  if (playInFlightSignature === signature) {
+    return;
+  }
+  const invocationId = ++playInvocationCounter;
+  playInFlightSignature = signature;
   const audio = ensureAudio();
 
   try {
     const nextUrl = await resolveAudioUrl(track);
+    if (invocationId !== playInvocationCounter) {
+      return;
+    }
     const sameTrack =
       playbackState.appId === track.appId &&
       audio.src === nextUrl &&
@@ -397,8 +490,18 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       }
     }
     await audio.play();
+    if (invocationId !== playInvocationCounter) {
+      return;
+    }
     notifyPlayback({ appId: track.appId, reason, status: "playing" });
   } catch (error) {
+    if (invocationId !== playInvocationCounter) {
+      return;
+    }
+    if (isIgnorablePlaybackError(error)) {
+      console.warn("[ThemeDeck] playback interrupted", error);
+      return;
+    }
     console.error("[ThemeDeck] failed to play", error);
     const message =
       error instanceof Error && error.message
@@ -409,6 +512,13 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       body: `Can't play ${track.filename}: ${message}`,
     });
     stopPlayback(false);
+  } finally {
+    if (
+      invocationId === playInvocationCounter &&
+      playInFlightSignature === signature
+    ) {
+      playInFlightSignature = null;
+    }
   }
 };
 
@@ -442,6 +552,7 @@ const applyStartOffsetToActiveTrack = (appId: number, startOffset: number) => {
 const notifyFocus = (appId: number | null) => {
   focusedAppId = appId;
   focusListeners.forEach((listener) => listener(appId));
+  scheduleAutoPlaybackFromContext();
 };
 
 const getLibraryPath = (): string => {
@@ -478,8 +589,16 @@ const startLocationWatcher = () => {
     return;
   }
   const update = () => {
+    const pathname = getLibraryPath();
+    if (!pathname) {
+      // Steam can briefly report an empty path during focus transitions; do not
+      // clear focus state on that transient signal.
+      return;
+    }
     const appId = readAppIdFromLocation();
-    if (appId !== focusedAppId) {
+    // Only promote a resolved app id. Do not push null from this poller, because
+    // transient route states can otherwise interrupt active game playback.
+    if (appId && appId !== focusedAppId) {
       notifyFocus(appId);
     }
   };
@@ -684,9 +803,9 @@ const insertThemeDeckMenu = (children: any, appId: number) => {
       key="themedeck-change-music"
       onSelected={() => {
         const latestAppId =
+          extractAppId(appId) ??
           readAppIdFromLocation() ??
-          extractAppId(focusedAppId) ??
-          extractAppId(appId);
+          extractAppId(focusedAppId);
         if (!latestAppId) {
           toaster.toast({
             title: "ThemeDeck",
@@ -807,6 +926,8 @@ const patchContextMenuFocus = () => {
     return null;
   }
 
+  const state: { appId: number | null } = { appId: null };
+
   const patches: {
     outer?: Patch;
     inner?: Patch;
@@ -829,6 +950,7 @@ const patchContextMenuFocus = () => {
         }
       }
       if (appId) {
+        state.appId = appId;
         notifyFocus(appId);
       }
 
@@ -843,10 +965,12 @@ const patchContextMenuFocus = () => {
               (_renderArgs: Record<string, unknown>[], node: any) => {
                 const menuItems =
                   node?.props?.children?.[0] ?? node?.props?.children;
-                const patched = patchMenuItems(menuItems, appId);
+                const fallbackAppId =
+                  extractAppIdFromTree(node) ?? state.appId;
+                const patched = patchMenuItems(menuItems, fallbackAppId);
                 if (patched) {
+                  state.appId = patched;
                   notifyFocus(patched);
-                  appId = patched;
                 }
                 return node;
               }
@@ -856,10 +980,15 @@ const patchContextMenuFocus = () => {
               "shouldComponentUpdate",
               ([nextProps]: any, shouldUpdate: any) => {
                 if (shouldUpdate === true) {
-                  const patched = patchMenuItems(nextProps?.children, appId);
+                  const fallbackAppId =
+                    extractAppIdFromTree(nextProps?.children) ?? state.appId;
+                  const patched = patchMenuItems(
+                    nextProps?.children,
+                    fallbackAppId
+                  );
                   if (patched) {
+                    state.appId = patched;
                     notifyFocus(patched);
-                    appId = patched;
                   }
                 }
                 return shouldUpdate;
@@ -871,8 +1000,8 @@ const patchContextMenuFocus = () => {
       } else if (appId) {
         const patched = patchMenuItems(component?.props?.children, appId);
         if (patched) {
+          state.appId = patched;
           notifyFocus(patched);
-          appId = patched;
         }
       }
 
@@ -937,9 +1066,6 @@ const GameFocusBridge = () => {
   const params = useParams<{ appid?: string }>();
   const parsed = params?.appid ? Number.parseInt(params.appid, 10) : NaN;
   const appId = Number.isNaN(parsed) ? null : parsed;
-  const { tracks } = useTrackState({ silent: true });
-  const autoPlayEnabled = useAutoPlayValue();
-  const playback = usePlaybackStateValue();
 
   useEffect(() => {
     notifyFocus(appId);
@@ -953,36 +1079,6 @@ const GameFocusBridge = () => {
       }
     };
   }, [appId]);
-
-  useEffect(() => {
-    if (!autoPlayEnabled) {
-      if (playback.reason === "auto") {
-        stopPlayback(true);
-      }
-      return;
-    }
-
-    if (!appId) {
-      if (playback.reason === "auto") {
-        stopPlayback(true);
-      }
-      return;
-    }
-
-    const track = tracks[appId];
-    if (!track) {
-      if (playback.reason === "auto") {
-        stopPlayback(true);
-      }
-      return;
-    }
-
-    if (playback.reason === "manual") {
-      return;
-    }
-
-    playTrack(track, "auto");
-  }, [autoPlayEnabled, appId, tracks, playback.reason]);
 
   return null;
 };
@@ -1025,6 +1121,23 @@ const formatDuration = (seconds?: number | null) => {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 };
 
+const normalizeGlobalTrack = (
+  raw: BackendTrack | null | undefined
+): GlobalTrack | null => {
+  if (!raw?.path) {
+    return null;
+  }
+  return {
+    path: raw.path,
+    filename: raw.filename || raw.path.split("/").pop() || "Global track",
+    volume: typeof raw.volume === "number" ? clamp(raw.volume) : 1,
+    startOffset:
+      typeof raw.start_offset === "number"
+        ? clamp(raw.start_offset, 0, 30)
+        : 0,
+  };
+};
+
 const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
   const normalized: TrackMap = {};
   if (!raw) {
@@ -1056,15 +1169,420 @@ const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
   return normalized;
 };
 
+const getStoreRouteCandidates = (): string[] => {
+  const candidates = new Set<string>();
+  const pushLocation = (loc?: Location | null) => {
+    if (!loc) return;
+    const composed = `${loc.pathname || ""}${loc.hash || ""}${loc.search || ""}`
+      .trim()
+      .toLowerCase();
+    if (composed) {
+      candidates.add(composed);
+    }
+    const href = String(loc.href || "").trim().toLowerCase();
+    if (href) {
+      candidates.add(href);
+    }
+  };
+
+  try {
+    const focusedWindow =
+      window.SteamUIStore?.GetFocusedWindowInstance?.() ??
+      Router.WindowStore?.GamepadUIMainWindowInstance;
+    const browserWindow =
+      focusedWindow?.BrowserWindow ??
+      Router.WindowStore?.GamepadUIMainWindowInstance?.BrowserWindow;
+    pushLocation(browserWindow?.location ?? null);
+  } catch {
+    // ignore
+  }
+
+  pushLocation(window.location);
+  try {
+    pushLocation(window.top?.location ?? null);
+  } catch {
+    // ignore cross-origin access
+  }
+
+  return Array.from(candidates);
+};
+
+const looksLikeStoreSignal = (value: unknown): boolean => {
+  if (typeof value !== "string") return false;
+  const text = value.toLowerCase();
+  return (
+    text.includes("/store") ||
+    text.includes("#/store") ||
+    text.includes("tab=store") ||
+    text.includes("storehome") ||
+    text.includes("store.steampowered.com") ||
+    text.includes("store%2esteampowered%2ecom") ||
+    (text.includes("openurl") && text.includes("store"))
+  );
+};
+
+const isStoreRoute = (route: string): boolean => {
+  const text = (route || "").toLowerCase();
+  if (!text) return false;
+  const variants = new Set<string>([text]);
+  const tryDecode = (value: string) => {
+    try {
+      const decoded = decodeURIComponent(value);
+      if (decoded && decoded !== value) {
+        variants.add(decoded);
+      }
+    } catch {
+      // ignore decode issues
+    }
+  };
+  tryDecode(text);
+  for (const value of Array.from(variants)) {
+    tryDecode(value);
+  }
+  for (const value of variants) {
+    if (looksLikeStoreSignal(value)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const detectStoreFromWindowState = (): boolean => {
+  const focusedCandidates = [
+    (window as any).SteamUIStore?.GetFocusedWindowInstance?.(),
+    (Router as any)?.WindowStore?.GetFocusedWindowInstance?.(),
+    (Router as any)?.WindowStore?.m_FocusedWindowInstance,
+    (Router as any)?.WindowStore?.m_FocusedWindow,
+    (Router as any)?.WindowStore,
+    (window as any).SteamUIStore,
+  ];
+  for (const candidate of focusedCandidates) {
+    if (!candidate) continue;
+    const directValues = [
+      candidate?.strTitle,
+      candidate?.m_strTitle,
+      candidate?.title,
+      candidate?.name,
+      candidate?.WindowType,
+      candidate?.m_eWindowType,
+      candidate?.route,
+      candidate?.path,
+      candidate?.url,
+      candidate?.href,
+      candidate?.location?.href,
+      candidate?.BrowserWindow?.location?.href,
+      candidate?.BrowserWindow?.document?.URL,
+      candidate?.BrowserWindow?.document?.location?.href,
+    ];
+    if (directValues.some((value) => looksLikeStoreSignal(value))) {
+      return true;
+    }
+    const queue: unknown[] = [candidate];
+    const seen = new WeakSet<object>();
+    let scanned = 0;
+    while (queue.length && scanned < 250) {
+      const next = queue.shift();
+      scanned += 1;
+      if (!next || typeof next !== "object") {
+        continue;
+      }
+      const objectValue = next as Record<string, unknown>;
+      if (seen.has(objectValue)) {
+        continue;
+      }
+      seen.add(objectValue);
+      for (const [key, value] of Object.entries(objectValue)) {
+        if (
+          typeof value === "string" &&
+          /url|href|path|route|uri|src|title|name|location/i.test(key) &&
+          looksLikeStoreSignal(value)
+        ) {
+          return true;
+        }
+        if (value && typeof value === "object") {
+          queue.push(value);
+        }
+      }
+    }
+  }
+  return false;
+};
+
+const isStorePathSync = (): boolean => {
+  if (getStoreRouteCandidates().some((route) => isStoreRoute(route))) {
+    return true;
+  }
+  if (detectStoreFromWindowState()) {
+    return true;
+  }
+  try {
+    const hasStoreFrame =
+      document.querySelector(
+        "iframe[src*='store.steampowered.com'], webview[src*='store.steampowered.com'], a[href*='store.steampowered.com']"
+      ) !== null;
+    if (hasStoreFrame) {
+      return true;
+    }
+  } catch {
+    // ignore DOM probe failures
+  }
+  return false;
+};
+
+const isStorePath = (): boolean => storeContextActive || isStorePathSync();
+
+const detectStoreFromTabs = async (): Promise<boolean> => {
+  const probeCode = `
+    (() => {
+      try {
+        const href = String(window.location?.href || "").toLowerCase();
+        const path = String(window.location?.pathname || "").toLowerCase();
+        const hash = String(window.location?.hash || "").toLowerCase();
+        const search = String(window.location?.search || "").toLowerCase();
+        const full = href + " " + path + " " + hash + " " + search;
+        if (full.includes("store.steampowered.com") || full.includes("/store") || full.includes("#/store")) {
+          return true;
+        }
+        const hasStoreFrame = !!document.querySelector("iframe[src*='store.steampowered.com'], webview[src*='store.steampowered.com'], a[href*='store.steampowered.com']");
+        if (hasStoreFrame) {
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    })();
+  `;
+  const results = await Promise.all(
+    SP_TAB_CANDIDATES.map(async (tab) => {
+      try {
+        const result = await Promise.race([
+          executeInTab(tab, true, probeCode),
+          new Promise<null>((resolve) => {
+            window.setTimeout(() => resolve(null), 1000);
+          }),
+        ]);
+        const value =
+          result && typeof result === "object" && "result" in result
+            ? (result as { result?: unknown }).result
+            : result;
+        return value === true || value === "true";
+      } catch {
+        return false;
+      }
+    })
+  );
+  return results.some(Boolean);
+};
+
+const refreshStoreContext = async () => {
+  if (autoPlaybackStoreProbeInFlight) {
+    return;
+  }
+  autoPlaybackStoreProbeInFlight = true;
+  try {
+    const syncStore = isStorePathSync();
+    const tabStore = await detectStoreFromTabs();
+    const next = syncStore || tabStore;
+    if (next !== storeContextActive) {
+      storeContextActive = next;
+      scheduleAutoPlaybackFromContext();
+    }
+  } catch (error) {
+    console.error("[ThemeDeck] refresh store context failed", error);
+  } finally {
+    autoPlaybackStoreProbeInFlight = false;
+  }
+};
+
+const resolveAutoTrackFromContext = (): GameTrack | null => {
+  const routeAppId = readAppIdFromLocation();
+  const effectiveAppId = routeAppId ?? focusedAppId;
+
+  if (effectiveAppId && readAutoPlaySetting()) {
+    const gameTrack = latestTracksForAutoPlay[effectiveAppId];
+    if (gameTrack) {
+      return gameTrack;
+    }
+  }
+
+  if (effectiveAppId) {
+    return null;
+  }
+
+  if (!readGlobalAmbientEnabledSetting()) {
+    return null;
+  }
+
+  if (!latestGlobalTrackForAutoPlay) {
+    return null;
+  }
+
+  const currentPath = getLibraryPath();
+  if (!currentPath && playbackState.reason === "auto" && playbackState.status === "playing") {
+    if (playbackState.appId === GLOBAL_AMBIENT_APP_ID && latestGlobalTrackForAutoPlay) {
+      return {
+        appId: GLOBAL_AMBIENT_APP_ID,
+        path: latestGlobalTrackForAutoPlay.path,
+        filename: latestGlobalTrackForAutoPlay.filename,
+        volume: latestGlobalTrackForAutoPlay.volume,
+        startOffset: latestGlobalTrackForAutoPlay.startOffset,
+      };
+    }
+    if (playbackState.appId && playbackState.appId > 0) {
+      const currentGameTrack = latestTracksForAutoPlay[playbackState.appId];
+      if (currentGameTrack) {
+        return currentGameTrack;
+      }
+    }
+  }
+
+  if (readAmbientDisableStoreSetting() && isStorePath()) {
+    return null;
+  }
+
+  return {
+    appId: GLOBAL_AMBIENT_APP_ID,
+    path: latestGlobalTrackForAutoPlay.path,
+    filename: latestGlobalTrackForAutoPlay.filename,
+    volume: latestGlobalTrackForAutoPlay.volume,
+    startOffset: latestGlobalTrackForAutoPlay.startOffset,
+  };
+};
+
+const applyAutoPlaybackFromContext = () => {
+  const shouldSuppressGlobal =
+    !readGlobalAmbientEnabledSetting() ||
+    (readAmbientDisableStoreSetting() && isStorePath());
+  if (
+    shouldSuppressGlobal &&
+    playbackState.appId === GLOBAL_AMBIENT_APP_ID &&
+    playbackState.status === "playing"
+  ) {
+    stopPlayback(true);
+    return;
+  }
+  if (playbackState.reason === "manual") {
+    return;
+  }
+
+  const nextTrack = resolveAutoTrackFromContext();
+  if (!nextTrack) {
+    if (playbackState.reason === "auto" && playbackState.status === "playing") {
+      stopPlayback(true);
+    }
+    return;
+  }
+
+  if (
+    playbackState.reason === "auto" &&
+    playbackState.status === "playing" &&
+    playbackState.appId === nextTrack.appId
+  ) {
+    return;
+  }
+  playTrack(nextTrack, "auto");
+};
+
+const scheduleAutoPlaybackFromContext = () => {
+  if (autoPlaybackTick) {
+    window.clearTimeout(autoPlaybackTick);
+  }
+  autoPlaybackTick = window.setTimeout(() => {
+    autoPlaybackTick = null;
+    applyAutoPlaybackFromContext();
+  }, 0);
+};
+
+const refreshAutoPlaybackTrackCache = async () => {
+  if (autoPlaybackTrackRefreshInFlight) {
+    return;
+  }
+  autoPlaybackTrackRefreshInFlight = true;
+  try {
+    const [trackData, globalData] = await Promise.all([
+      fetchTracks(),
+      fetchGlobalTrack(),
+    ]);
+    latestTracksForAutoPlay = normalizeTracks(trackData);
+    latestGlobalTrackForAutoPlay = normalizeGlobalTrack(globalData);
+    scheduleAutoPlaybackFromContext();
+  } catch (error) {
+    console.error("[ThemeDeck] refresh auto playback cache failed", error);
+  } finally {
+    autoPlaybackTrackRefreshInFlight = false;
+  }
+};
+
+const startAutoPlaybackCoordinator = () => {
+  if (autoPlaybackStarted) {
+    return;
+  }
+  autoPlaybackStarted = true;
+  refreshAutoPlaybackTrackCache();
+  stopAutoPlaybackSubscription = subscribePlayback(() => {
+    scheduleAutoPlaybackFromContext();
+  });
+  window.addEventListener(AUTO_PLAY_EVENT, scheduleAutoPlaybackFromContext);
+  window.addEventListener(
+    GLOBAL_AMBIENT_ENABLED_EVENT,
+    scheduleAutoPlaybackFromContext
+  );
+  window.addEventListener(
+    AMBIENT_DISABLE_STORE_EVENT,
+    scheduleAutoPlaybackFromContext
+  );
+  window.addEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
+  refreshStoreContext();
+  autoPlaybackRouteInterval = window.setInterval(() => {
+    scheduleAutoPlaybackFromContext();
+    refreshStoreContext();
+  }, 750);
+};
+
+const stopAutoPlaybackCoordinator = () => {
+  if (!autoPlaybackStarted) {
+    return;
+  }
+  autoPlaybackStarted = false;
+  stopAutoPlaybackSubscription?.();
+  stopAutoPlaybackSubscription = null;
+  window.removeEventListener(AUTO_PLAY_EVENT, scheduleAutoPlaybackFromContext);
+  window.removeEventListener(
+    GLOBAL_AMBIENT_ENABLED_EVENT,
+    scheduleAutoPlaybackFromContext
+  );
+  window.removeEventListener(
+    AMBIENT_DISABLE_STORE_EVENT,
+    scheduleAutoPlaybackFromContext
+  );
+  window.removeEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
+  if (autoPlaybackRouteInterval) {
+    window.clearInterval(autoPlaybackRouteInterval);
+    autoPlaybackRouteInterval = null;
+  }
+  storeContextActive = false;
+};
+
 const useTrackState = (options?: { silent?: boolean }) => {
   const [tracks, setTracks] = useState<TrackMap>({});
+  const [globalTrack, setGlobalTrack] = useState<GlobalTrack | null>(null);
   const [loadingTracks, setLoadingTracks] = useState(true);
   const silent = options?.silent ?? false;
 
   const refreshTracks = useCallback(async () => {
     try {
-      const data = await fetchTracks();
-      setTracks(normalizeTracks(data));
+      const [trackData, globalData] = await Promise.all([
+        fetchTracks(),
+        fetchGlobalTrack(),
+      ]);
+      const normalizedTracks = normalizeTracks(trackData);
+      const normalizedGlobal = normalizeGlobalTrack(globalData);
+      setTracks(normalizedTracks);
+      setGlobalTrack(normalizedGlobal);
+      latestTracksForAutoPlay = normalizedTracks;
+      latestGlobalTrackForAutoPlay = normalizedGlobal;
+      scheduleAutoPlaybackFromContext();
     } catch (error) {
       console.error("[ThemeDeck] load tracks failed", error);
       if (!silent) {
@@ -1092,7 +1610,14 @@ const useTrackState = (options?: { silent?: boolean }) => {
       window.removeEventListener(TRACKS_UPDATED_EVENT, handler);
   }, [refreshTracks]);
 
-  return { tracks, setTracks, loadingTracks, refreshTracks };
+  return {
+    tracks,
+    setTracks,
+    globalTrack,
+    setGlobalTrack,
+    loadingTracks,
+    refreshTracks,
+  };
 };
 
 const getDisplayName = (appId: number) => {
@@ -1161,31 +1686,30 @@ const useAutoPlaySetting = (): [boolean, (value: boolean) => void] =>
     AUTO_PLAY_EVENT
   );
 
+const useAmbientDisableStoreSetting = (): [boolean, (value: boolean) => void] =>
+  useBooleanPreference(
+    readAmbientDisableStoreSetting,
+    persistAmbientDisableStoreSetting,
+    AMBIENT_DISABLE_STORE_EVENT
+  );
 
-const useAutoPlayValue = () => {
-  const [value, setValue] = useState<boolean>(() => readAutoPlaySetting());
-
-  useEffect(() => {
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent<boolean>).detail;
-      if (typeof detail === "boolean") {
-        setValue(detail);
-        return;
-      }
-      setValue(readAutoPlaySetting());
-    };
-    window.addEventListener(AUTO_PLAY_EVENT, handler as EventListener);
-    return () => window.removeEventListener(AUTO_PLAY_EVENT, handler as EventListener);
-  }, []);
-
-  return value;
-};
+const useGlobalAmbientEnabledSetting = (): [boolean, (value: boolean) => void] =>
+  useBooleanPreference(
+    readGlobalAmbientEnabledSetting,
+    persistGlobalAmbientEnabledSetting,
+    GLOBAL_AMBIENT_ENABLED_EVENT
+  );
 
 
 const Content = () => {
-  const { tracks, setTracks, loadingTracks } = useTrackState();
+  const { tracks, setTracks, globalTrack, setGlobalTrack, loadingTracks } =
+    useTrackState();
   const [library, setLibrary] = useState<GameOption[]>([]);
   const [autoPlay, setAutoPlay] = useAutoPlaySetting();
+  const [globalAmbientEnabled, setGlobalAmbientEnabled] =
+    useGlobalAmbientEnabledSetting();
+  const [ambientDisableStore, setAmbientDisableStore] =
+    useAmbientDisableStoreSetting();
   const [ytDlpStatus, setYtDlpStatus] = useState<YtDlpStatus>({
     installed: false,
   });
@@ -1335,6 +1859,98 @@ const Content = () => {
     }
   };
 
+  const handleGlobalPreviewToggle = () => {
+    if (!globalTrack) return;
+    if (
+      playback.appId === GLOBAL_AMBIENT_APP_ID &&
+      playback.status === "playing"
+    ) {
+      stopPlayback(false);
+      return;
+    }
+    playTrack(
+      {
+        appId: GLOBAL_AMBIENT_APP_ID,
+        path: globalTrack.path,
+        filename: globalTrack.filename,
+        volume: globalTrack.volume,
+        startOffset: globalTrack.startOffset,
+      },
+      "manual"
+    );
+  };
+
+  const handleGlobalVolumeChange = async (value: number) => {
+    if (!globalTrack) return;
+    const normalizedVolume = clamp(value / 100);
+    const nextGlobal = { ...globalTrack, volume: normalizedVolume };
+    setGlobalTrack(nextGlobal);
+    latestGlobalTrackForAutoPlay = nextGlobal;
+    applyVolumeToActiveTrack(GLOBAL_AMBIENT_APP_ID, normalizedVolume);
+    try {
+      const updated = await updateGlobalVolume(normalizedVolume);
+      const normalized = normalizeGlobalTrack(updated);
+      setGlobalTrack(normalized);
+      latestGlobalTrackForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+    } catch (error) {
+      console.error("[ThemeDeck] global volume update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save global track volume",
+      });
+    }
+  };
+
+  const handleGlobalStartOffsetChange = async (value: number) => {
+    if (!globalTrack) return;
+    const normalizedOffset = clamp(value, 0, 30);
+    const nextGlobal = { ...globalTrack, startOffset: normalizedOffset };
+    setGlobalTrack(nextGlobal);
+    latestGlobalTrackForAutoPlay = nextGlobal;
+    applyStartOffsetToActiveTrack(GLOBAL_AMBIENT_APP_ID, normalizedOffset);
+    try {
+      const updated = await updateGlobalStartOffset(normalizedOffset);
+      const normalized = normalizeGlobalTrack(updated);
+      setGlobalTrack(normalized);
+      latestGlobalTrackForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+    } catch (error) {
+      console.error("[ThemeDeck] global start offset update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save global song start truncation",
+      });
+    }
+  };
+
+  const handleRemoveGlobalTrack = async () => {
+    if (!globalTrack) return;
+    try {
+      const removedPath = globalTrack.path;
+      const updated = await deleteGlobalTrack();
+      const normalized = normalizeTracks(updated);
+      setTracks(normalized);
+      setGlobalTrack(null);
+      latestTracksForAutoPlay = normalized;
+      latestGlobalTrackForAutoPlay = null;
+      clearAudioCache(removedPath);
+      if (playback.appId === GLOBAL_AMBIENT_APP_ID) {
+        stopPlayback(true);
+      }
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+    } catch (error) {
+      console.error("[ThemeDeck] remove global track failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Failed to remove global track",
+      });
+    }
+  };
+
   const handlePreviewToggle = (track: GameTrack) => {
     if (playback.appId === track.appId && playback.status === "playing") {
       stopPlayback(false);
@@ -1466,8 +2082,128 @@ const Content = () => {
               onChange={(value) => setAutoPlay(value)}
             />
           </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              checked={globalAmbientEnabled}
+              label="Enable global/ambient track"
+              description="Keep global track assigned, but toggle its playback on non-game pages."
+              onChange={(value) => {
+                setGlobalAmbientEnabled(value);
+                scheduleAutoPlaybackFromContext();
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              checked={ambientDisableStore}
+              label="Disable global/ambient track while in game store"
+              description="When enabled, global ambient music is muted on store pages."
+              onChange={(value) => {
+                setAmbientDisableStore(value);
+                scheduleAutoPlaybackFromContext();
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <button
+              className="DialogButton"
+              onClick={() => Navigation.Navigate("/themedeck/global")}
+              style={{ minWidth: "14rem", whiteSpace: "nowrap" }}
+            >
+              Choose global/ambient track...
+            </button>
+          </PanelSectionRow>
         </PanelSection>
       </div>
+      <PanelSection title="Global / ambient track">
+        {!globalTrack ? (
+          <PanelSectionRow>
+            <div>No global track selected.</div>
+          </PanelSectionRow>
+        ) : (
+          <PanelSectionRow>
+            <Focusable style={{ width: "100%" }}>
+              <div style={{ fontWeight: 600 }}>{globalTrack.filename}</div>
+              <div style={{ opacity: 0.8, fontSize: "0.9rem" }}>
+                {globalTrack.path}
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  gap: "0.5rem",
+                  marginTop: "0.5rem",
+                  flexWrap: "nowrap",
+                }}
+              >
+                <button
+                  className="DialogButton"
+                  style={{
+                    width: "3rem",
+                    height: "2.6rem",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: 0,
+                  }}
+                  title={
+                    playback.appId === GLOBAL_AMBIENT_APP_ID &&
+                    playback.status === "playing"
+                      ? "Pause preview"
+                      : "Preview track"
+                  }
+                  onClick={handleGlobalPreviewToggle}
+                >
+                  {playback.appId === GLOBAL_AMBIENT_APP_ID &&
+                  playback.status === "playing" ? (
+                    <FaPause />
+                  ) : (
+                    <FaPlay />
+                  )}
+                </button>
+                <button
+                  className="DialogButton"
+                  style={{
+                    width: "3rem",
+                    height: "2.6rem",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: 0,
+                  }}
+                  title="Remove global ambient music"
+                  onClick={handleRemoveGlobalTrack}
+                >
+                  <FaTrash />
+                </button>
+              </div>
+              <div style={{ marginTop: "0.5rem", paddingRight: "1.25rem" }}>
+                <SliderField
+                  value={Math.round(globalTrack.volume * 100)}
+                  label="Global playback volume"
+                  min={0}
+                  max={100}
+                  step={5}
+                  valueSuffix="%"
+                  showValue
+                  onChange={handleGlobalVolumeChange}
+                />
+              </div>
+              <div style={{ marginTop: "0.35rem", paddingRight: "1.25rem" }}>
+                <SliderField
+                  value={Math.round(globalTrack.startOffset)}
+                  label="Truncate beginning of song"
+                  min={0}
+                  max={30}
+                  step={1}
+                  valueSuffix="s"
+                  showValue
+                  onChange={handleGlobalStartOffsetChange}
+                />
+              </div>
+            </Focusable>
+          </PanelSectionRow>
+        )}
+      </PanelSection>
       <PanelSection title="Assigned tracks">
         {loadingTracks ? (
           <PanelSectionRow>
@@ -2394,13 +3130,281 @@ const ChangeTheme = () => {
   );
 };
 
+const ChangeGlobalTheme = () => {
+  const [track, setTrack] = useState<GlobalTrack | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [currentDir, setCurrentDir] = useState("/home/deck");
+  const [browser, setBrowser] = useState<DirectoryListing>({
+    path: "/home/deck",
+    dirs: [],
+    files: [],
+  });
+  const [browserLoading, setBrowserLoading] = useState(true);
+  const [manualPath, setManualPath] = useState("/home/deck");
+  const topFocusRef = useRef<HTMLDivElement | null>(null);
+
+  const loadTrack = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await fetchGlobalTrack();
+      setTrack(normalizeGlobalTrack(data));
+    } catch (error) {
+      console.error("[ThemeDeck] failed to load global track", error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadTrack();
+  }, [loadTrack]);
+
+  const refreshDirectory = useCallback(
+    async (nextDir?: string) => {
+      setBrowserLoading(true);
+      try {
+        const listing = await listDirectory(nextDir || currentDir);
+        setBrowser(listing);
+        setCurrentDir(listing.path);
+        setManualPath(listing.path);
+      } catch (error) {
+        console.error("[ThemeDeck] list directory failed", error);
+      } finally {
+        setBrowserLoading(false);
+      }
+    },
+    [currentDir]
+  );
+
+  useEffect(() => {
+    refreshDirectory("/home/deck");
+  }, []);
+
+  useEffect(() => {
+    topFocusRef.current?.focus();
+  }, []);
+
+  const saveFromPath = async (fullPath: string) => {
+    try {
+      const filename = fullPath.split("/").pop() || "track";
+      const saved = await assignGlobalTrack(fullPath, filename);
+      const normalized = normalizeGlobalTrack(saved);
+      setTrack(normalized);
+      latestGlobalTrackForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Saved global ambient music",
+      });
+    } catch (error) {
+      console.error("[ThemeDeck] global save from path failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: `Unable to add file: ${getErrorMessage(error, "Unknown error")}`,
+      });
+    }
+  };
+
+  const joinPath = (base: string, child: string) =>
+    base === "/" ? `/${child}` : `${base.replace(/\/$/, "")}/${child}`;
+
+  const goUp = () => {
+    if (currentDir === "/") return;
+    const parent = currentDir.replace(/\/[^/]+$/, "") || "/";
+    refreshDirectory(parent);
+  };
+
+  const handleDirClick = (dir: string) => {
+    refreshDirectory(joinPath(currentDir, dir));
+  };
+
+  const handleFileClick = (file: string) => {
+    saveFromPath(joinPath(currentDir, file));
+  };
+
+  const handleManualGo = () => {
+    if (!manualPath) return;
+    refreshDirectory(manualPath);
+  };
+
+  const handleRemove = async () => {
+    try {
+      await deleteGlobalTrack();
+      setTrack(null);
+      latestGlobalTrackForAutoPlay = null;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Cleared global ambient music",
+      });
+    } catch (error) {
+      console.error("[ThemeDeck] global remove failed", error);
+    }
+  };
+
+  return (
+    <ScrollPanel>
+      <div
+        style={{
+          padding: 24,
+          paddingTop: 48,
+          paddingBottom: 140,
+          minHeight: "100vh",
+          boxSizing: "border-box",
+        }}
+      >
+        <div
+          ref={topFocusRef}
+          tabIndex={-1}
+          style={{ position: "absolute", width: 0, height: 0, outline: "none" }}
+        />
+        <PanelSection title="ThemeDeck global / ambient track">
+          <PanelSectionRow>
+            {loading ? (
+              <Spinner />
+            ) : track ? (
+              <div>
+                <div style={{ fontWeight: 600 }}>{track.filename}</div>
+                <div style={{ opacity: 0.8 }}>{track.path}</div>
+              </div>
+            ) : (
+              <div>No global track selected yet.</div>
+            )}
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div
+              style={{
+                width: "100%",
+                display: "flex",
+                gap: "0.5rem",
+                flexWrap: "nowrap",
+                alignItems: "center",
+              }}
+            >
+              {track ? (
+                <button
+                  className="DialogButton"
+                  onClick={handleRemove}
+                  style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
+                >
+                  Remove music
+                </button>
+              ) : null}
+              <button
+                className="DialogButton"
+                onClick={() => Navigation.NavigateBack()}
+                style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
+              >
+                Done
+              </button>
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
+
+        <PanelSection title="Browse local files to assign from system storage">
+          <PanelSectionRow>
+            <div
+              style={{
+                display: "flex",
+                width: "100%",
+                gap: "0.5rem",
+                alignItems: "center",
+              }}
+            >
+              <button className="DialogButton" onClick={goUp}>
+                Up
+              </button>
+              <div style={{ flexGrow: 1, fontFamily: "monospace" }}>
+                {currentDir}
+              </div>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr auto",
+                width: "100%",
+                gap: "0.5rem",
+                alignItems: "center",
+              }}
+            >
+              <TextField
+                value={manualPath}
+                onChange={(e) => setManualPath(e.target.value)}
+                style={{ width: "100%", minWidth: "20rem" }}
+              />
+              <button className="DialogButton" onClick={handleManualGo}>
+                Go
+              </button>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            {browserLoading ? (
+              <Spinner />
+            ) : (
+              <div
+                style={{
+                  width: "100%",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.35rem",
+                  paddingRight: "0.25rem",
+                }}
+              >
+                {browser.dirs.map((dir) => (
+                  <button
+                    key={`dir-${dir}`}
+                    className="DialogButton"
+                    onClick={() => handleDirClick(dir)}
+                    style={{ justifyContent: "flex-start" }}
+                  >
+                    📁 {dir}
+                  </button>
+                ))}
+                {browser.files
+                  .filter((file) =>
+                    AUDIO_EXTENSIONS.some((ext) =>
+                      file.toLowerCase().endsWith(`.${ext}`)
+                    )
+                  )
+                  .map((file) => (
+                    <button
+                      key={`file-${file}`}
+                      className="DialogButton"
+                      onClick={() => handleFileClick(file)}
+                      style={{ justifyContent: "flex-start" }}
+                    >
+                      🎵 {file}
+                    </button>
+                  ))}
+                {!browser.dirs.length && !browser.files.length && (
+                  <div style={{ opacity: 0.6 }}>Folder is empty.</div>
+                )}
+              </div>
+            )}
+          </PanelSectionRow>
+        </PanelSection>
+      </div>
+    </ScrollPanel>
+  );
+};
+
 export default definePlugin(() => {
   startLocationWatcher();
   startSteamAppWatchers();
+  startAutoPlaybackCoordinator();
   const gamePatches = GAME_DETAIL_ROUTES.map((path) =>
     injectBridgeIntoRoute(path)
   );
   const contextMenuUnpatch = patchContextMenuFocus();
+  routerHook.addRoute(
+    "/themedeck/global",
+    () => <ChangeGlobalTheme />,
+    { exact: true }
+  );
   routerHook.addRoute(
     "/themedeck/:appid",
     () => <ChangeTheme />,
@@ -2417,6 +3421,7 @@ export default definePlugin(() => {
     onDismount() {
       stopLocationWatcher();
       stopSteamAppWatchers();
+      stopAutoPlaybackCoordinator();
       stopPlayback(false);
       clearAudioCache();
       contextMenuUnpatch?.();
@@ -2431,6 +3436,11 @@ export default definePlugin(() => {
         routerHook.removeRoute("/themedeck/:appid");
       } catch (error) {
         console.error("[ThemeDeck] remove route failed", error);
+      }
+      try {
+        routerHook.removeRoute("/themedeck/global");
+      } catch (error) {
+        console.error("[ThemeDeck] remove global route failed", error);
       }
     },
   };

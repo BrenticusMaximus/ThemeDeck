@@ -1,5 +1,9 @@
 # ThemeDeck Documentation
 
+## February 23, 2026 Update (v2.3.0)
+
+This update adds an optional **global/ambient music track** for non-game pages, including its own individual volume setting and playback controls.
+
 ## February 21, 2026 Update (v2.2.0)
 
 This update allows users to attach ThemeDeck music for games that are not installed yet. If a game has a Steam game page, users can now assign music and have it play there.

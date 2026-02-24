@@ -35,6 +35,7 @@ def clamp_seconds(value: float, minimum: float = 0.0, maximum: float = 30.0) -> 
 class Plugin:
     def __init__(self) -> None:
         self._tracks: dict[str, dict[str, Any]] = {}
+        self._global_track_key = "__global__"
         self._settings_dir = Path(decky.DECKY_PLUGIN_SETTINGS_DIR)
         self._tracks_file = self._settings_dir / "tracks.json"
         self._bin_dir = self._settings_dir / "bin"
@@ -147,6 +148,54 @@ class Plugin:
 
     async def get_track(self, app_id: int) -> dict[str, Any] | None:
         return self._tracks.get(str(app_id))
+
+    async def get_global_track(self) -> dict[str, Any] | None:
+        return self._tracks.get(self._global_track_key)
+
+    async def set_global_track(self, path: str, filename: str) -> dict[str, Any]:
+        decky.logger.info(f"set_global_track request path={path}")
+        try:
+            resolved = Path(path).expanduser().resolve()
+            if not resolved.exists() or not resolved.is_file():
+                raise ValueError(f"File not found or inaccessible: {resolved}")
+            try:
+                resolved.open("rb").close()
+            except PermissionError as error:
+                raise PermissionError(f"Permission denied: {resolved}") from error
+            previous = self._tracks.get(self._global_track_key, {})
+            self._tracks[self._global_track_key] = {
+                "scope": "global",
+                "path": str(resolved),
+                "filename": filename,
+                "volume": previous.get("volume", 1.0),
+                "start_offset": previous.get("start_offset", 0.0),
+            }
+            self._save_tracks()
+            return self._tracks[self._global_track_key]
+        except Exception as error:
+            decky.logger.error(f"set_global_track failed path={path}: {error}")
+            raise
+
+    async def set_global_volume(self, volume: float) -> dict[str, Any]:
+        if self._global_track_key not in self._tracks:
+            raise ValueError("No global track found")
+        self._tracks[self._global_track_key]["volume"] = clamp(volume)
+        self._save_tracks()
+        return self._tracks[self._global_track_key]
+
+    async def set_global_start_offset(self, start_offset: float) -> dict[str, Any]:
+        if self._global_track_key not in self._tracks:
+            raise ValueError("No global track found")
+        self._tracks[self._global_track_key]["start_offset"] = clamp_seconds(
+            start_offset
+        )
+        self._save_tracks()
+        return self._tracks[self._global_track_key]
+
+    async def remove_global_track(self) -> dict[str, dict[str, Any]]:
+        self._tracks.pop(self._global_track_key, None)
+        self._save_tracks()
+        return self._tracks
 
     async def list_directory(
         self, path: str | None = None
