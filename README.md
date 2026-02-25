@@ -1,5 +1,9 @@
 # ThemeDeck Documentation
 
+## February 25, 2026 Update (v2.5.1)
+
+This update fixes a critical launch-state issue by ensuring ThemeDeck never plays global/ambient music or game-page theme music while a game is running.
+
 ## February 25, 2026 Update (v2.5.0)
 
 This update adds bulk auto-assign for games without music, a "Show games without music" list with live name-resolution progress, and improved game ID handling to reduce duplicate/alias entries.
@@ -57,6 +61,7 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 - Choose how ambient music behaves when interrupted (stop, pause, or mute until return).
 - Optionally disable ambient music while in the Steam Store.
 - Prevent all plugin music from playing in Desktop Mode.
+- Prevent all plugin music from playing while a game is launched/running.
 - Bulk auto-assign music to games that don’t have tracks yet.
 - See live bulk progress and stop the process anytime.
 - View a list of games still missing music.
