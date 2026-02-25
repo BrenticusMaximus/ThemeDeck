@@ -127,6 +127,18 @@ type YtDlpStatus = {
   version?: string;
 };
 
+type BulkAssignStatus = {
+  running: boolean;
+  stopRequested: boolean;
+  total: number;
+  completed: number;
+  assigned: number;
+  skipped: number;
+  failed: number;
+  currentGame: string;
+  message: string;
+};
+
 const GAME_DETAIL_ROUTES = [
   "/library/app/:appid",
   "/library/details/:appid",
@@ -144,6 +156,13 @@ const DETAIL_PATTERNS = GAME_DETAIL_ROUTES.map((route) => {
 const fetchTracks = callable<[], RawTrackMap>("get_tracks");
 const fetchGlobalTrack = callable<[], BackendTrack | null>("get_global_track");
 const fetchStoreTrack = callable<[], BackendTrack | null>("get_store_track");
+const fetchLocalconfigAppIds = callable<[], { app_ids?: number[] }>(
+  "get_localconfig_app_ids"
+);
+const resolveStoreAppNames = callable<
+  [appIds: number[]],
+  Record<string, string>
+>("resolve_store_app_names");
 const assignTrack = callable<
   [appId: number, path: string, filename: string],
   RawTrackMap
@@ -224,6 +243,16 @@ const SP_TAB_CANDIDATES = [
   "GamepadUI",
   "Library",
 ] as const;
+const LIBRARY_EXCLUDED_APP_IDS = new Set<number>([
+  7, // Steam client
+  760, // Steam screenshots/uploader component
+  12210, // Steam Linux runtime/tool entries
+  12211,
+  12212,
+  12213,
+  12218,
+  228980, // Steamworks Common Redistributables
+]);
 
 type AudioCacheEntry = {
   objectUrl: string;
@@ -2238,6 +2267,29 @@ const Content = () => {
     installed: false,
   });
   const [ytDlpBusy, setYtDlpBusy] = useState(false);
+  const [bulkAssign, setBulkAssign] = useState<BulkAssignStatus>({
+    running: false,
+    stopRequested: false,
+    total: 0,
+    completed: 0,
+    assigned: 0,
+    skipped: 0,
+    failed: 0,
+    currentGame: "",
+    message: "",
+  });
+  const bulkAssignStopRequestedRef = useRef(false);
+  const bulkAssignRunIdRef = useRef(0);
+  const [showMissingGames, setShowMissingGames] = useState(false);
+  const [resolvedMissingNames, setResolvedMissingNames] = useState<Record<number, string>>(
+    {}
+  );
+  const [failedMissingNameIds, setFailedMissingNameIds] = useState<Record<number, true>>(
+    {}
+  );
+  const missingNameAttemptsRef = useRef<Map<number, number>>(new Map());
+  const resolvingMissingNameIdsRef = useRef<Set<number>>(new Set());
+  const [missingResolveInFlightCount, setMissingResolveInFlightCount] = useState(0);
   const [pendingRemoval, setPendingRemoval] = useState<number | null>(null);
   const playback = usePlaybackStateValue();
   const topFocusRef = useRef<HTMLDivElement | null>(null);
@@ -2262,48 +2314,372 @@ const Content = () => {
         .sort((a, b) => getGameName(a.appId).localeCompare(getGameName(b.appId))),
     [tracks, getGameName]
   );
-  const loadLibrary = useCallback(() => {
+  const libraryGames = useMemo(() => {
+    const seen = new Set<number>();
+    const unique: GameOption[] = [];
+    for (const game of library) {
+      if (!game || !Number.isFinite(game.appid) || game.appid <= 0) {
+        continue;
+      }
+      if (seen.has(game.appid)) {
+        continue;
+      }
+      seen.add(game.appid);
+      unique.push(game);
+    }
+    return unique;
+  }, [library]);
+  const unassignedLibraryGameCount = useMemo(
+    () => libraryGames.filter((game) => !tracks[game.appid]).length,
+    [libraryGames, tracks]
+  );
+  const missingGamesStatus = useMemo(() => {
+    const unknownNamePattern = /^App\s+\d+$/i;
+    return libraryGames
+      .filter((game) => !tracks[game.appid])
+      .map((game) => {
+        const resolvedName = String(resolvedMissingNames[game.appid] || "").trim();
+        const baseName = String(getGameName(game.appid) || game.name || "").trim();
+        const fallbackName = resolvedName || baseName;
+        const isUnknown = !fallbackName || unknownNamePattern.test(fallbackName);
+        const failed = !!failedMissingNameIds[game.appid];
+        const status: "resolved" | "pending" | "failed" = isUnknown
+          ? failed
+            ? "failed"
+            : "pending"
+          : "resolved";
+        const name =
+          status === "failed"
+            ? "Name unavailable"
+            : fallbackName;
+        return {
+          appid: game.appid,
+          name,
+          status,
+        };
+      })
+      .sort((a, b) => {
+        if (a.status !== b.status) {
+          if (a.status === "resolved") return -1;
+          if (b.status === "resolved") return 1;
+          if (a.status === "failed") return 1;
+          if (b.status === "failed") return -1;
+        }
+        return a.name.localeCompare(b.name);
+      });
+  }, [libraryGames, tracks, getGameName, resolvedMissingNames, failedMissingNameIds]);
+
+  const missingGamesList = useMemo(
+    () => missingGamesStatus.filter((game) => game.status !== "pending"),
+    [missingGamesStatus]
+  );
+
+  const missingGameNameStats = useMemo(() => {
+    const total = missingGamesStatus.length;
+    const resolved = missingGamesStatus.filter(
+      (game) => game.status === "resolved"
+    ).length;
+    const failed = missingGamesStatus.filter(
+      (game) => game.status === "failed"
+    ).length;
+    const pending = Math.max(0, total - resolved - failed);
+    const processed = resolved + failed;
+    const percent = total > 0 ? Math.round((processed / total) * 100) : 100;
+    return { total, resolved, failed, pending, processed, percent };
+  }, [missingGamesStatus]);
+
+  const unresolvedMissingGameIds = useMemo(() => {
+    return missingGamesStatus
+      .filter((game) => game.status === "pending")
+      .map((game) => game.appid);
+  }, [missingGamesStatus]);
+
+  useEffect(() => {
+    const activeMissingIds = new Set(
+      libraryGames
+        .filter((game) => !tracks[game.appid])
+        .map((game) => game.appid)
+    );
+
+    setResolvedMissingNames((prev) => {
+      let changed = false;
+      const next: Record<number, string> = {};
+      for (const [idRaw, name] of Object.entries(prev)) {
+        const appId = Number.parseInt(idRaw, 10);
+        if (activeMissingIds.has(appId)) {
+          next[appId] = name;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setFailedMissingNameIds((prev) => {
+      let changed = false;
+      const next: Record<number, true> = {};
+      for (const idRaw of Object.keys(prev)) {
+        const appId = Number.parseInt(idRaw, 10);
+        if (activeMissingIds.has(appId)) {
+          next[appId] = true;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+
+    for (const appId of Array.from(missingNameAttemptsRef.current.keys())) {
+      if (!activeMissingIds.has(appId)) {
+        missingNameAttemptsRef.current.delete(appId);
+      }
+    }
+    for (const appId of Array.from(resolvingMissingNameIdsRef.current.values())) {
+      if (!activeMissingIds.has(appId)) {
+        resolvingMissingNameIdsRef.current.delete(appId);
+      }
+    }
+    setMissingResolveInFlightCount(resolvingMissingNameIdsRef.current.size);
+  }, [libraryGames, tracks]);
+
+  useEffect(() => {
+    if (!showMissingGames) {
+      return;
+    }
+
+    let cancelled = false;
+    const resolveBatch = async () => {
+      if (cancelled) {
+        return;
+      }
+      if (!unresolvedMissingGameIds.length) {
+        return;
+      }
+      const idsToResolve = unresolvedMissingGameIds
+        .filter((appId) => !resolvingMissingNameIdsRef.current.has(appId))
+        .slice(0, 6);
+      if (!idsToResolve.length) {
+        return;
+      }
+
+      idsToResolve.forEach((appId) => {
+        resolvingMissingNameIdsRef.current.add(appId);
+      });
+      setMissingResolveInFlightCount(resolvingMissingNameIdsRef.current.size);
+
+      try {
+        const resolved = await resolveStoreAppNames(idsToResolve);
+        if (cancelled || !resolved || typeof resolved !== "object") {
+          return;
+        }
+        const updates: Record<number, string> = {};
+        const resolvedIdSet = new Set<number>();
+        for (const [idRaw, nameRaw] of Object.entries(resolved)) {
+          const appId = Number.parseInt(idRaw, 10);
+          const name = String(nameRaw || "").trim();
+          if (!Number.isFinite(appId) || appId <= 0 || !name) {
+            continue;
+          }
+          updates[appId] = name;
+          resolvedIdSet.add(appId);
+          missingNameAttemptsRef.current.delete(appId);
+        }
+
+        const failedNow: number[] = [];
+        for (const appId of idsToResolve) {
+          if (resolvedIdSet.has(appId)) {
+            continue;
+          }
+          const attempts = (missingNameAttemptsRef.current.get(appId) || 0) + 1;
+          missingNameAttemptsRef.current.set(appId, attempts);
+          if (attempts >= 3) {
+            failedNow.push(appId);
+            missingNameAttemptsRef.current.delete(appId);
+          }
+        }
+
+        if (Object.keys(updates).length) {
+          setResolvedMissingNames((prev) => ({
+            ...prev,
+            ...updates,
+          }));
+        }
+        if (Object.keys(updates).length || failedNow.length) {
+          setFailedMissingNameIds((prev) => {
+            const next = { ...prev };
+            for (const appId of Object.keys(updates).map((id) => Number(id))) {
+              delete next[appId];
+            }
+            for (const appId of failedNow) {
+              next[appId] = true;
+            }
+            return next;
+          });
+        }
+      } catch (error) {
+        console.error("[ThemeDeck] failed to resolve missing game names", error);
+      } finally {
+        idsToResolve.forEach((appId) =>
+          resolvingMissingNameIdsRef.current.delete(appId)
+        );
+        setMissingResolveInFlightCount(resolvingMissingNameIdsRef.current.size);
+      }
+    };
+
+    void resolveBatch();
+    const intervalId = window.setInterval(() => {
+      void resolveBatch();
+    }, 1800);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [showMissingGames, unresolvedMissingGameIds]);
+  const loadLibrary = useCallback(async () => {
     try {
-      const bootstrap =
-        (window as any)?.SteamClient?.Apps?.GetLibraryBootstrapData?.() ??
-        (window as any)?.appStore?.GetLibraryBootstrapData?.();
-      if (!bootstrap) return;
-      const rawApps =
-        bootstrap?.library?.apps ||
-        bootstrap?.apps ||
-        bootstrap?.rgApps ||
-        [];
-      const values: any[] = Array.isArray(rawApps)
-        ? rawApps
-        : Object.values(rawApps);
-      const games: GameOption[] = values
-        .map((entry) => {
-          const appid =
+      const byId = new Map<number, GameOption>();
+      const addEntry = (entry: any, fallbackId?: unknown) => {
+        const fallbackAppId = Number.parseInt(String(fallbackId ?? ""), 10);
+        let appid = Number.NaN;
+        let nameCandidate: string | undefined;
+
+        if (entry && typeof entry === "object") {
+          const appidRaw =
             entry?.appid ??
             entry?.app_id ??
             entry?.unAppID ??
-            entry?.nAppID;
-          if (!appid) return null;
-          return {
-            appid: Number(appid),
-            name:
-              entry?.display_name ||
-              entry?.localized_name ||
-              entry?.name ||
-              entry?.strTitle ||
-              `App ${appid}`,
-          };
-        })
-        .filter((entry): entry is GameOption => !!entry)
-        .sort((a, b) => a.name.localeCompare(b.name));
+            entry?.nAppID ??
+            entry?.id ??
+            fallbackId;
+          appid = Number.parseInt(String(appidRaw ?? ""), 10);
+          nameCandidate =
+            entry?.display_name ||
+            entry?.localized_name ||
+            entry?.name ||
+            entry?.strTitle ||
+            entry?.title;
+        } else if (typeof entry === "number" || typeof entry === "bigint") {
+          appid = Number(entry);
+        } else if (typeof entry === "string") {
+          const entryAsId = Number.parseInt(entry, 10);
+          if (Number.isFinite(entryAsId) && entryAsId > 0) {
+            appid = entryAsId;
+          } else if (Number.isFinite(fallbackAppId) && fallbackAppId > 0) {
+            appid = fallbackAppId;
+            nameCandidate = entry;
+          }
+        } else if (Number.isFinite(fallbackAppId) && fallbackAppId > 0) {
+          appid = fallbackAppId;
+        }
+
+        if (!Number.isFinite(appid) || appid <= 0) {
+          return;
+        }
+        if (LIBRARY_EXCLUDED_APP_IDS.has(appid)) {
+          return;
+        }
+        const overview =
+          appStore?.GetAppOverviewByAppID?.(appid) ||
+          appStore?.GetAppOverviewByGameID?.(appid);
+        const appType = Number(overview?.app_type ?? entry?.app_type ?? NaN);
+        const isDlc = Number.isFinite(appType) && (appType & (1 << 5)) !== 0;
+        if (isDlc) {
+          return;
+        }
+        if (overview?.visible_in_game_list === false) {
+          return;
+        }
+        const name = String(
+          overview?.display_name ||
+            overview?.localized_name ||
+            overview?.name ||
+            nameCandidate ||
+            getDisplayName(appid) ||
+            `App ${appid}`
+        );
+        const existing = byId.get(appid);
+        if (!existing || existing.name.startsWith("App ")) {
+          byId.set(appid, { appid, name });
+        }
+      };
+      const addCollection = (raw: any) => {
+        if (!raw) {
+          return;
+        }
+        if (Array.isArray(raw)) {
+          raw.forEach((entry) => addEntry(entry));
+          return;
+        }
+        if (raw instanceof Set) {
+          raw.forEach((value) => addEntry(value));
+          return;
+        }
+        if (raw instanceof Map) {
+          raw.forEach((value, key) => addEntry(value, key));
+          return;
+        }
+        if (typeof raw === "object") {
+          Object.entries(raw).forEach(([key, value]) => addEntry(value, key));
+          addEntry(raw);
+        }
+      };
+
+      const steamApps = (window as any)?.SteamClient?.Apps;
+      const appStore = (window as any)?.appStore;
+      const bootstrap =
+        steamApps?.GetLibraryBootstrapData?.() ??
+        appStore?.GetLibraryBootstrapData?.();
+      addCollection(bootstrap?.library?.apps);
+      addCollection(bootstrap?.apps);
+      addCollection(bootstrap?.rgApps);
+
+      addCollection(appStore?.m_mapAppOverview);
+      addCollection(appStore?.m_mapAppData);
+      addCollection(appStore?.m_mapOwnedApps);
+      addCollection(appStore?.m_mapApps);
+      addCollection(appStore?.m_rgApps);
+      addCollection(appStore?.m_rgAppData);
+      addCollection(appStore?.m_rgAppOverviews);
+      addCollection(appStore?.m_rgOwnedApps);
+
+      try {
+        const ownedResponse = await Promise.resolve(steamApps?.GetOwnedGames?.());
+        addCollection(ownedResponse?.apps);
+        addCollection(ownedResponse?.rgApps);
+        addCollection(ownedResponse?.games);
+        addCollection(ownedResponse?.rgGames);
+      } catch (_ignored) {
+        // no-op
+      }
+
+      try {
+        const localconfigAppIds = await fetchLocalconfigAppIds();
+        addCollection(localconfigAppIds?.app_ids ?? []);
+      } catch (error) {
+        console.error("[ThemeDeck] localconfig app id fallback failed", error);
+      }
+
+      const games = Array.from(byId.values()).sort((a, b) =>
+        a.name.localeCompare(b.name)
+      );
       setLibrary(games);
+      console.info("[ThemeDeck] library detection count", games.length);
     } catch (error) {
       console.error("[ThemeDeck] library load failed", error);
     }
   }, []);
 
   useEffect(() => {
-    loadLibrary();
+    void loadLibrary();
+    const intervalId = window.setInterval(() => {
+      void loadLibrary();
+    }, 5000);
+    const timeoutId = window.setTimeout(() => {
+      window.clearInterval(intervalId);
+    }, 30000);
+    return () => {
+      window.clearInterval(intervalId);
+      window.clearTimeout(timeoutId);
+    };
   }, [loadLibrary]);
 
   const refreshYtDlpStatus = useCallback(async () => {
@@ -2348,6 +2724,331 @@ const Content = () => {
       refreshYtDlpStatus();
     }
   };
+
+  const handleStopBulkAssign = useCallback(() => {
+    if (!bulkAssign.running) {
+      return;
+    }
+    bulkAssignStopRequestedRef.current = true;
+    setBulkAssign((prev) => ({
+      ...prev,
+      stopRequested: true,
+      message: "Stopping after current operation...",
+    }));
+  }, [bulkAssign.running]);
+
+  const handleAutoAssignMissingTracks = useCallback(async () => {
+    if (bulkAssign.running || ytDlpBusy) {
+      return;
+    }
+    if (!ytDlpStatus.installed) {
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "yt-dlp is not installed yet.",
+      });
+      return;
+    }
+    if (!libraryGames.length) {
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "No games found in library.",
+      });
+      return;
+    }
+
+    let latestTracks = tracks;
+    try {
+      latestTracks = normalizeTracks(await fetchTracks());
+    } catch (_ignored) {
+      // Keep using current in-memory tracks if refresh fails.
+    }
+
+    const allMissingGames = libraryGames.filter((game) => !latestTracks[game.appid]);
+    if (!allMissingGames.length) {
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "All library games already have assigned music.",
+      });
+      return;
+    }
+
+    const unknownNamePattern = /^App\s+\d+$/i;
+    const resolvedNameById = new Map<number, string>();
+    for (const game of allMissingGames) {
+      const baseName = getGameName(game.appid) || game.name || `App ${game.appid}`;
+      if (baseName && !unknownNamePattern.test(baseName.trim())) {
+        resolvedNameById.set(game.appid, baseName);
+      }
+    }
+
+    const unresolvedIds = allMissingGames
+      .map((game) => game.appid)
+      .filter((appId) => !resolvedNameById.has(appId));
+
+    if (unresolvedIds.length) {
+      try {
+        const resolvedFromStore = await resolveStoreAppNames(unresolvedIds);
+        for (const [idRaw, nameRaw] of Object.entries(resolvedFromStore || {})) {
+          const appId = Number.parseInt(idRaw, 10);
+          const name = String(nameRaw || "").trim();
+          if (!Number.isFinite(appId) || appId <= 0 || !name) {
+            continue;
+          }
+          resolvedNameById.set(appId, name);
+        }
+      } catch (error) {
+        console.error("[ThemeDeck] resolve store app names failed", error);
+      }
+    }
+
+    const getSearchName = (game: GameOption): string =>
+      (resolvedNameById.get(game.appid) ||
+        getGameName(game.appid) ||
+        game.name ||
+        `App ${game.appid}`) as string;
+
+    const missingGames = allMissingGames;
+    const unknownNameCount = allMissingGames.filter((game) =>
+      unknownNamePattern.test(getSearchName(game).trim())
+    ).length;
+
+    const runId = Date.now();
+    bulkAssignRunIdRef.current = runId;
+    bulkAssignStopRequestedRef.current = false;
+
+    let completed = 0;
+    let assigned = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    setBulkAssign({
+      running: true,
+      stopRequested: false,
+      total: missingGames.length,
+      completed: 0,
+      assigned: 0,
+      skipped: 0,
+      failed: 0,
+      currentGame: "",
+      message:
+        unknownNameCount > 0
+          ? `Preparing bulk assignment... (${unknownNameCount} unnamed games will still be attempted)`
+          : "Preparing bulk assignment...",
+    });
+
+    for (const game of missingGames) {
+      if (
+        bulkAssignRunIdRef.current !== runId ||
+        bulkAssignStopRequestedRef.current
+      ) {
+        break;
+      }
+
+      const gameName = getSearchName(game);
+      const isUnknownName = unknownNamePattern.test(gameName.trim());
+      const baseSearchName = isUnknownName ? `Steam app ${game.appid}` : gameName;
+      const queryCandidates = Array.from(
+        new Set(
+          isUnknownName
+            ? [
+                `Steam app ${game.appid} soundtrack`,
+                `App ${game.appid} soundtrack`,
+                `App ${game.appid} game music`,
+              ]
+            : [
+                `${baseSearchName} soundtrack`,
+                `${baseSearchName} OST`,
+                `${baseSearchName} theme`,
+                `${baseSearchName} game music`,
+                baseSearchName,
+              ]
+        )
+      );
+
+      try {
+        latestTracks = normalizeTracks(await fetchTracks());
+      } catch (_ignored) {
+        latestTracks = tracks;
+      }
+      if (latestTracks[game.appid]) {
+        completed += 1;
+        skipped += 1;
+        setBulkAssign((prev) => ({
+          ...prev,
+          completed,
+          skipped,
+          currentGame: gameName,
+          message: `Skipped ${gameName} (already assigned).`,
+        }));
+        continue;
+      }
+
+      const candidateResults: YouTubeSearchResult[] = [];
+      const seenVideoIds = new Set<string>();
+      let hadSearchError = false;
+      let searchErrorSummary = "";
+      for (const query of queryCandidates) {
+        if (
+          bulkAssignRunIdRef.current !== runId ||
+          bulkAssignStopRequestedRef.current
+        ) {
+          break;
+        }
+        setBulkAssign((prev) => ({
+          ...prev,
+          currentGame: gameName,
+          message: `Searching YouTube for ${gameName} (${query})...`,
+        }));
+        try {
+          const response = await searchYouTube(query, 5);
+          const results = response?.results || [];
+          for (const result of results) {
+            if (!result?.id || seenVideoIds.has(result.id)) {
+              continue;
+            }
+            seenVideoIds.add(result.id);
+            candidateResults.push(result);
+            if (candidateResults.length >= 8) {
+              break;
+            }
+          }
+          if (candidateResults.length >= 3) {
+            break;
+          }
+        } catch (error) {
+          hadSearchError = true;
+          searchErrorSummary = getErrorMessage(error, "Unknown search error");
+        }
+      }
+
+      if (
+        bulkAssignRunIdRef.current !== runId ||
+        bulkAssignStopRequestedRef.current
+      ) {
+        break;
+      }
+
+      if (!candidateResults.length) {
+        completed += 1;
+        if (hadSearchError) {
+          failed += 1;
+        } else {
+          skipped += 1;
+        }
+        setBulkAssign((prev) => ({
+          ...prev,
+          completed,
+          skipped,
+          failed,
+          currentGame: gameName,
+          message: hadSearchError
+            ? `Search failed for ${gameName}: ${searchErrorSummary}`
+            : `No eligible YouTube results for ${gameName}.`,
+        }));
+        continue;
+      }
+
+      try {
+        latestTracks = normalizeTracks(await fetchTracks());
+      } catch (_ignored) {
+        latestTracks = tracks;
+      }
+      if (latestTracks[game.appid]) {
+        completed += 1;
+        skipped += 1;
+        setBulkAssign((prev) => ({
+          ...prev,
+          completed,
+          skipped,
+          currentGame: gameName,
+          message: `Skipped ${gameName} (already assigned).`,
+        }));
+        continue;
+      }
+
+      let assignedCurrentGame = false;
+      let lastDownloadError = "";
+      for (let index = 0; index < candidateResults.length; index += 1) {
+        if (
+          bulkAssignRunIdRef.current !== runId ||
+          bulkAssignStopRequestedRef.current
+        ) {
+          break;
+        }
+        const result = candidateResults[index];
+        setBulkAssign((prev) => ({
+          ...prev,
+          currentGame: gameName,
+          message: `Downloading match ${index + 1}/${candidateResults.length} for ${gameName}...`,
+        }));
+
+        try {
+          const response = await downloadYouTubeAudio(game.appid, result.webpage_url);
+          const normalized = normalizeTracks(response?.tracks);
+          latestTracks = normalized;
+          setTracks(normalized);
+          latestTracksForAutoPlay = normalized;
+          window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+          assigned += 1;
+          completed += 1;
+          assignedCurrentGame = true;
+          setBulkAssign((prev) => ({
+            ...prev,
+            completed,
+            assigned,
+            currentGame: gameName,
+            message: `Assigned ${gameName}.`,
+          }));
+          break;
+        } catch (error) {
+          lastDownloadError = getErrorMessage(error, "Unknown download error");
+        }
+      }
+
+      if (!assignedCurrentGame) {
+        completed += 1;
+        failed += 1;
+        setBulkAssign((prev) => ({
+          ...prev,
+          completed,
+          failed,
+          currentGame: gameName,
+          message: `All download attempts failed for ${gameName}: ${lastDownloadError || "No usable results"}`,
+        }));
+      }
+    }
+
+    if (bulkAssignRunIdRef.current !== runId) {
+      return;
+    }
+
+    const wasStopped = bulkAssignStopRequestedRef.current;
+    bulkAssignStopRequestedRef.current = false;
+    setBulkAssign((prev) => ({
+      ...prev,
+      running: false,
+      stopRequested: false,
+      currentGame: "",
+      message: wasStopped
+        ? `Stopped. Assigned ${assigned}, skipped ${skipped}, failed ${failed}.`
+        : `Done. Assigned ${assigned}, skipped ${skipped}, failed ${failed}.`,
+    }));
+
+    toaster.toast({
+      title: "ThemeDeck",
+      body: wasStopped
+        ? `Bulk assign stopped. Assigned ${assigned}, skipped ${skipped}, failed ${failed}.`
+        : `Bulk assign complete. Assigned ${assigned}, skipped ${skipped}, failed ${failed}.`,
+    });
+  }, [
+    bulkAssign.running,
+    getGameName,
+    libraryGames,
+    tracks,
+    ytDlpBusy,
+    ytDlpStatus.installed,
+    setTracks,
+  ]);
 
   const removeTrack = async (appId: number) => {
     try {
@@ -2627,7 +3328,54 @@ const Content = () => {
 
   return (
     <ScrollPanel>
-      <div style={{ paddingBottom: "1.5rem" }}>
+      <div
+        className="themedeck-main"
+        style={{
+          paddingBottom: "1.5rem",
+          paddingRight: "0.85rem",
+          paddingLeft: "0.25rem",
+          width: "100%",
+          maxWidth: "100%",
+          boxSizing: "border-box",
+          overflowX: "hidden",
+        }}
+      >
+      <style>{`
+        .themedeck-main,
+        .themedeck-main * {
+          min-width: 0 !important;
+          box-sizing: border-box !important;
+        }
+        .themedeck-main .themedeck-fit {
+          width: calc(100% - 0.35rem) !important;
+          max-width: calc(100% - 0.35rem) !important;
+          min-width: 0 !important;
+          margin-right: auto !important;
+          box-sizing: border-box !important;
+        }
+        .themedeck-main .themedeck-wrap {
+          white-space: normal !important;
+          overflow-wrap: anywhere !important;
+          word-break: break-word !important;
+        }
+        .themedeck-main [class*="PanelSectionRow"] {
+          max-width: 100% !important;
+          width: 100% !important;
+          min-width: 0 !important;
+        }
+        .themedeck-main [class*="PanelSectionRow"] > * {
+          max-width: 100% !important;
+          min-width: 0 !important;
+        }
+        .themedeck-main [class*="FieldLabel"],
+        .themedeck-main [class*="FieldDescription"],
+        .themedeck-main [class*="ValueSuffix"],
+        .themedeck-main [class*="Value"] {
+          white-space: normal !important;
+          overflow-wrap: anywhere !important;
+          word-break: break-word !important;
+        }
+      `}</style>
       <div
         ref={topFocusRef}
         tabIndex={-1}
@@ -2668,9 +3416,9 @@ const Content = () => {
               style={{
                 width: "100%",
                 display: "flex",
-                gap: "0.5rem",
-                alignItems: "center",
-                flexWrap: "wrap",
+                flexDirection: "column",
+                gap: "0.35rem",
+                alignItems: "stretch",
               }}
             >
               <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
@@ -2678,14 +3426,212 @@ const Content = () => {
                   ? `yt-dlp ${ytDlpStatus.version || ""}`.trim()
                   : "yt-dlp not installed"}
               </div>
-              <button
-                className="DialogButton"
-                onClick={handleUpdateYtDlp}
-                disabled={ytDlpBusy}
-                style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
+                <button
+                  className="DialogButton themedeck-fit themedeck-wrap"
+                  onClick={handleUpdateYtDlp}
+                  disabled={ytDlpBusy}
+                  style={{
+                    textAlign: "left",
+                    fontSize: "0.92rem",
+                    paddingRight: "0.65rem",
+                    paddingLeft: "0.65rem",
+                  }}
+                >
+                  {ytDlpBusy ? "Updating..." : "Update yt-dlp"}
+                </button>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ width: "100%" }}>
+              <div style={{ fontWeight: 600 }}>Auto-assign missing game tracks (yt-dlp)</div>
+              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
+                Uses first YouTube result per game and only targets games with no assigned track.
+              </div>
+              <div style={{ opacity: 0.95, fontSize: "0.88rem", marginTop: "0.25rem", fontWeight: 600 }}>
+                Games currently without music assigned: {unassignedLibraryGameCount}
+              </div>
+              <div style={{ opacity: 0.75, fontSize: "0.8rem", marginTop: "0.15rem" }}>
+                Total library games detected: {libraryGames.length}
+              </div>
+              <div
+                style={{
+                  marginTop: "0.5rem",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.35rem",
+                  alignItems: "stretch",
+                }}
               >
-                {ytDlpBusy ? "Updating..." : "Update yt-dlp"}
+                <button
+                  className="DialogButton themedeck-fit themedeck-wrap"
+                  onClick={handleAutoAssignMissingTracks}
+                  disabled={
+                    bulkAssign.running || ytDlpBusy || !ytDlpStatus.installed
+                  }
+                  style={{
+                    textAlign: "left",
+                    fontSize: "0.92rem",
+                    paddingRight: "0.65rem",
+                    paddingLeft: "0.65rem",
+                  }}
+                >
+                  {bulkAssign.running ? "Running..." : "Auto-assign missing"}
+                </button>
+                <button
+                  className="DialogButton themedeck-fit themedeck-wrap"
+                  onClick={handleStopBulkAssign}
+                  disabled={!bulkAssign.running}
+                  style={{
+                    fontSize: "0.92rem",
+                    paddingRight: "0.65rem",
+                    paddingLeft: "0.65rem",
+                  }}
+                >
+                  STOP
+                </button>
+              </div>
+              {(bulkAssign.running || bulkAssign.message) && (
+                <div style={{ marginTop: "0.55rem" }}>
+                  <div
+                    style={{
+                      width: "100%",
+                      height: "0.55rem",
+                      borderRadius: "0.35rem",
+                      background: "rgba(255,255,255,0.18)",
+                      overflow: "hidden",
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${
+                          bulkAssign.total > 0
+                            ? Math.min(
+                                100,
+                                Math.round((bulkAssign.completed / bulkAssign.total) * 100)
+                              )
+                            : 0
+                        }%`,
+                        height: "100%",
+                        background: "rgba(98, 168, 255, 0.95)",
+                        transition: "width 0.2s ease",
+                      }}
+                    />
+                  </div>
+                  <div style={{ marginTop: "0.35rem", fontSize: "0.82rem", opacity: 0.85 }}>
+                    {bulkAssign.completed}/{bulkAssign.total} completed
+                    {" • "}assigned {bulkAssign.assigned}
+                  </div>
+                  <div style={{ marginTop: "0.15rem", fontSize: "0.82rem", opacity: 0.85 }}>
+                    skipped {bulkAssign.skipped}
+                    {" • "}failed {bulkAssign.failed}
+                  </div>
+                  {bulkAssign.currentGame && (
+                    <div style={{ marginTop: "0.2rem", fontSize: "0.82rem", opacity: 0.85 }}>
+                      Current game: {bulkAssign.currentGame}
+                      {bulkAssign.stopRequested ? " (stopping...)" : ""}
+                    </div>
+                  )}
+                  {!!bulkAssign.message && (
+                    <div style={{ marginTop: "0.2rem", fontSize: "0.82rem", opacity: 0.85 }}>
+                      {bulkAssign.message}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div
+              style={{
+                width: "100%",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.45rem",
+              }}
+            >
+              <button
+                className="DialogButton themedeck-fit themedeck-wrap"
+                onClick={() => setShowMissingGames((prev) => !prev)}
+                style={{
+                  textAlign: "left",
+                  fontSize: "0.92rem",
+                  paddingRight: "0.65rem",
+                  paddingLeft: "0.65rem",
+                }}
+              >
+                {showMissingGames ? "Hide games without music" : "Show games without music"}
               </button>
+              {showMissingGames ? (
+                <div
+                  style={{
+                    width: "100%",
+                    borderRadius: "0.4rem",
+                    background: "rgba(255,255,255,0.05)",
+                    padding: "0.55rem 0.65rem",
+                    maxHeight: "16rem",
+                    overflowY: "auto",
+                    overflowX: "hidden",
+                  }}
+                >
+                  {missingGameNameStats.total > 0 ? (
+                    <>
+                      <div style={{ fontSize: "0.82rem", opacity: 0.9, marginBottom: "0.35rem" }}>
+                        {missingGameNameStats.resolved}/{missingGameNameStats.total} names resolved
+                        {" • "}pending {missingGameNameStats.pending}
+                        {" • "}unavailable {missingGameNameStats.failed}
+                        {missingResolveInFlightCount > 0
+                          ? ` • checking ${missingResolveInFlightCount}`
+                          : ""}
+                      </div>
+                      <div
+                        style={{
+                          width: "100%",
+                          height: "0.5rem",
+                          borderRadius: "0.35rem",
+                          background: "rgba(255,255,255,0.16)",
+                          overflow: "hidden",
+                          marginBottom: "0.45rem",
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: `${missingGameNameStats.percent}%`,
+                            height: "100%",
+                            background: "rgba(98, 168, 255, 0.95)",
+                            transition: "width 0.25s ease",
+                          }}
+                        />
+                      </div>
+                      {missingGameNameStats.pending > 0 && missingGamesList.length === 0 ? (
+                        <div style={{ opacity: 0.8, fontSize: "0.86rem", marginBottom: "0.25rem" }}>
+                          Resolving game names...
+                        </div>
+                      ) : null}
+                      {missingGamesList.map((game) => (
+                        <div
+                          key={game.appid}
+                          style={{
+                            padding: "0.22rem 0",
+                            fontSize: "0.86rem",
+                            overflowWrap: "anywhere",
+                            wordBreak: "break-word",
+                            color:
+                              game.status === "failed"
+                                ? "rgba(255, 200, 200, 0.92)"
+                                : "inherit",
+                          }}
+                        >
+                          {game.name} ({game.appid})
+                        </div>
+                      ))}
+                    </>
+                  ) : (
+                    <div style={{ opacity: 0.8, fontSize: "0.86rem" }}>
+                      No games are missing music.
+                    </div>
+                  )}
+                </div>
+              ) : null}
             </div>
           </PanelSectionRow>
           <PanelSectionRow>
@@ -2740,21 +3686,21 @@ const Content = () => {
                   [
                     {
                       value: "stop",
-                      label: "Stop (restart on return)",
+                      label: "Stop (restart)",
                     },
                     {
                       value: "pause",
-                      label: "Pause until return",
+                      label: "Pause",
                     },
                     {
                       value: "mute",
-                      label: "Mute until return",
+                      label: "Mute",
                     },
                   ] as Array<{ value: AmbientInterruptionMode; label: string }>
                 ).map((option) => (
                   <button
                     key={option.value}
-                    className="DialogButton"
+                    className="DialogButton themedeck-fit themedeck-wrap"
                     onClick={() => setAmbientInterruptionMode(option.value)}
                     role="radio"
                     aria-checked={ambientInterruptionMode === option.value}
@@ -2764,6 +3710,12 @@ const Content = () => {
                       gap: "0.5rem",
                       justifyContent: "flex-start",
                       width: "100%",
+                      boxSizing: "border-box",
+                      whiteSpace: "normal",
+                      textAlign: "left",
+                      fontSize: "0.92rem",
+                      paddingRight: "0.65rem",
+                      paddingLeft: "0.65rem",
                       border:
                         ambientInterruptionMode === option.value
                           ? "1px solid rgba(120, 180, 255, 0.85)"
@@ -2781,18 +3733,28 @@ const Content = () => {
           </PanelSectionRow>
           <PanelSectionRow>
             <button
-              className="DialogButton"
+              className="DialogButton themedeck-fit themedeck-wrap"
               onClick={() => Navigation.Navigate("/themedeck/global")}
-              style={{ minWidth: "14rem", whiteSpace: "nowrap" }}
+              style={{
+                textAlign: "left",
+                fontSize: "0.92rem",
+                paddingRight: "0.65rem",
+                paddingLeft: "0.65rem",
+              }}
             >
               Choose global/ambient track...
             </button>
           </PanelSectionRow>
           <PanelSectionRow>
             <button
-              className="DialogButton"
+              className="DialogButton themedeck-fit themedeck-wrap"
               onClick={() => Navigation.Navigate("/themedeck/store")}
-              style={{ minWidth: "14rem", whiteSpace: "nowrap" }}
+              style={{
+                textAlign: "left",
+                fontSize: "0.92rem",
+                paddingRight: "0.65rem",
+                paddingLeft: "0.65rem",
+              }}
             >
               Choose store-only track...
             </button>
@@ -2807,8 +3769,10 @@ const Content = () => {
         ) : (
           <PanelSectionRow>
             <Focusable style={{ width: "100%" }}>
-              <div style={{ fontWeight: 600 }}>{globalTrack.filename}</div>
-              <div style={{ opacity: 0.8, fontSize: "0.9rem" }}>
+              <div style={{ fontWeight: 600, overflowWrap: "anywhere" }}>
+                {globalTrack.filename}
+              </div>
+              <div style={{ opacity: 0.8, fontSize: "0.9rem", overflowWrap: "anywhere" }}>
                 {globalTrack.path}
               </div>
               <div
@@ -2860,10 +3824,10 @@ const Content = () => {
                   <FaTrash />
                 </button>
               </div>
-              <div style={{ marginTop: "0.5rem", paddingRight: "1.25rem" }}>
+              <div style={{ marginTop: "0.5rem" }}>
                 <SliderField
                   value={Math.round(globalTrack.volume * 100)}
-                  label="Global playback volume"
+                  label="Volume"
                   min={0}
                   max={100}
                   step={5}
@@ -2872,10 +3836,10 @@ const Content = () => {
                   onChange={handleGlobalVolumeChange}
                 />
               </div>
-              <div style={{ marginTop: "0.35rem", paddingRight: "1.25rem" }}>
+              <div style={{ marginTop: "0.35rem" }}>
                 <SliderField
                   value={Math.round(globalTrack.startOffset)}
-                  label="Truncate beginning of song"
+                  label="Start skip"
                   min={0}
                   max={30}
                   step={1}
@@ -2896,8 +3860,10 @@ const Content = () => {
         ) : (
           <PanelSectionRow>
             <Focusable style={{ width: "100%" }}>
-              <div style={{ fontWeight: 600 }}>{storeTrack.filename}</div>
-              <div style={{ opacity: 0.8, fontSize: "0.9rem" }}>
+              <div style={{ fontWeight: 600, overflowWrap: "anywhere" }}>
+                {storeTrack.filename}
+              </div>
+              <div style={{ opacity: 0.8, fontSize: "0.9rem", overflowWrap: "anywhere" }}>
                 {storeTrack.path}
               </div>
               <div
@@ -2949,10 +3915,10 @@ const Content = () => {
                   <FaTrash />
                 </button>
               </div>
-              <div style={{ marginTop: "0.5rem", paddingRight: "1.25rem" }}>
+              <div style={{ marginTop: "0.5rem" }}>
                 <SliderField
                   value={Math.round(storeTrack.volume * 100)}
-                  label="Store-only playback volume"
+                  label="Volume"
                   min={0}
                   max={100}
                   step={5}
@@ -2961,10 +3927,10 @@ const Content = () => {
                   onChange={handleStoreVolumeChange}
                 />
               </div>
-              <div style={{ marginTop: "0.35rem", paddingRight: "1.25rem" }}>
+              <div style={{ marginTop: "0.35rem" }}>
                 <SliderField
                   value={Math.round(storeTrack.startOffset)}
-                  label="Truncate beginning of song"
+                  label="Start skip"
                   min={0}
                   max={30}
                   step={1}
@@ -2990,10 +3956,10 @@ const Content = () => {
           gameTracks.map((track) => (
             <PanelSectionRow key={track.appId}>
               <Focusable style={{ width: "100%" }}>
-                <div style={{ fontWeight: 600 }}>
+                <div style={{ fontWeight: 600, overflowWrap: "anywhere" }}>
                   {getGameName(track.appId)}
                 </div>
-                <div style={{ opacity: 0.8, fontSize: "0.9rem" }}>
+                <div style={{ opacity: 0.8, fontSize: "0.9rem", overflowWrap: "anywhere" }}>
                   {track.filename}
                 </div>
                 <div
@@ -3084,10 +4050,10 @@ const Content = () => {
                     </div>
                   </div>
                 )}
-                <div style={{ marginTop: "0.5rem", paddingRight: "1.25rem" }}>
+                <div style={{ marginTop: "0.5rem" }}>
                   <SliderField
                     value={Math.round(track.volume * 100)}
-                    label="Game playback volume"
+                    label="Volume"
                     min={0}
                     max={100}
                     step={5}
@@ -3098,10 +4064,10 @@ const Content = () => {
                     }
                   />
                 </div>
-                <div style={{ marginTop: "0.35rem", paddingRight: "1.25rem" }}>
+                <div style={{ marginTop: "0.35rem" }}>
                   <SliderField
                     value={Math.round(track.startOffset)}
-                    label="Truncate beginning of song"
+                    label="Start skip"
                     min={0}
                     max={30}
                     step={1}

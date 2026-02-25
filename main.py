@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html as html_lib
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -11,6 +13,7 @@ import tempfile
 import traceback
 import urllib.parse
 import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +67,64 @@ class Plugin:
 
     async def get_tracks(self) -> dict[str, dict[str, Any]]:
         return self._tracks
+
+    async def get_localconfig_app_ids(self) -> dict[str, Any]:
+        return {"app_ids": self._read_localconfig_app_ids()}
+
+    async def resolve_store_app_names(self, app_ids: list[int]) -> dict[str, str]:
+        unique_ids = sorted(
+            {
+                int(value)
+                for value in app_ids or []
+                if isinstance(value, (int, float, str)) and str(value).strip()
+            }
+        )
+        unique_ids = [app_id for app_id in unique_ids if app_id > 0]
+        if not unique_ids:
+            return {}
+
+        resolved: dict[str, str] = {}
+        chunk_size = 20
+        for index in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[index : index + chunk_size]
+            try:
+                resolved.update(
+                    await asyncio.to_thread(self._resolve_store_app_names_chunk, chunk)
+                )
+            except Exception as error:
+                decky.logger.error(
+                    f"resolve_store_app_names chunk failed ({chunk[0]}..{chunk[-1]}): {error}"
+                )
+
+        unresolved_ids = [app_id for app_id in unique_ids if str(app_id) not in resolved]
+        if unresolved_ids:
+            decky.logger.info(
+                f"resolve_store_app_names falling back for {len(unresolved_ids)} app ids"
+            )
+
+            semaphore = asyncio.Semaphore(2)
+
+            async def resolve_one(app_id: int) -> tuple[int, str | None]:
+                async with semaphore:
+                    try:
+                        community_name = await asyncio.to_thread(
+                            self._resolve_steamcommunity_app_name, app_id
+                        )
+                        if community_name:
+                            return app_id, community_name
+                    except Exception as error:
+                        decky.logger.error(
+                            f"resolve_steamcommunity_app_name failed ({app_id}): {error}"
+                        )
+                    return app_id, None
+
+            resolved_pairs = await asyncio.gather(
+                *(resolve_one(app_id) for app_id in unresolved_ids)
+            )
+            for app_id, name in resolved_pairs:
+                if name:
+                    resolved[str(app_id)] = name
+        return resolved
 
     async def set_track(
         self, app_id: int, path: str, filename: str
@@ -515,6 +576,183 @@ class Plugin:
                 json.dump(self._tracks, handle, indent=2, ensure_ascii=False)
         except Exception as error:
             decky.logger.error(f"Failed to save tracks.json: {error}")
+
+    def _read_localconfig_app_ids(self) -> list[int]:
+        candidates = [
+            Path.home() / ".local" / "share" / "Steam" / "userdata",
+            Path.home() / ".steam" / "steam" / "userdata",
+        ]
+        app_ids: set[int] = set()
+        for base in candidates:
+            if not base.exists():
+                continue
+            try:
+                for user_dir in base.iterdir():
+                    if not user_dir.is_dir():
+                        continue
+                    localconfig = user_dir / "config" / "localconfig.vdf"
+                    if not localconfig.exists() or not localconfig.is_file():
+                        continue
+                    app_ids.update(self._extract_app_ids_from_localconfig(localconfig))
+            except Exception as error:
+                decky.logger.error(
+                    f"Failed scanning localconfig under {base}: {error}"
+                )
+        return sorted(app_ids)
+
+    def _extract_app_ids_from_localconfig(self, path: Path) -> set[int]:
+        app_ids: set[int] = set()
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception as error:
+            decky.logger.error(f"Failed reading localconfig {path}: {error}")
+            return app_ids
+
+        current_section: str | None = None
+        pending_section: str | None = None
+        depth = 0
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if current_section is None:
+                section_match = re.fullmatch(r'"([^"]+)"', line)
+                # Only trust the localconfig "apps" section. "apptickets" includes
+                # alias/internal ticket ids that can map to the same canonical app.
+                if section_match and section_match.group(1).lower() in {"apps"}:
+                    pending_section = section_match.group(1).lower()
+                    continue
+                if pending_section and line == "{":
+                    current_section = pending_section
+                    pending_section = None
+                    depth = 1
+                    continue
+                pending_section = None
+                continue
+
+            if line == "{":
+                depth += 1
+                continue
+            if line == "}":
+                depth -= 1
+                if depth <= 0:
+                    current_section = None
+                    depth = 0
+                continue
+
+            if depth == 1:
+                match = re.match(r'^"(\d{1,7})"', line)
+                if match:
+                    try:
+                        app_id = int(match.group(1))
+                    except ValueError:
+                        continue
+                    if app_id > 0:
+                        app_ids.add(app_id)
+
+        return app_ids
+
+    def _resolve_store_app_names_chunk(self, app_ids: list[int]) -> dict[str, str]:
+        if not app_ids:
+            return {}
+        resolved: dict[str, str] = {}
+        for app_id in app_ids:
+            if app_id <= 0:
+                continue
+            name = self._resolve_store_app_name_single(app_id)
+            if name:
+                resolved[str(app_id)] = name
+        return resolved
+
+    def _resolve_store_app_name_single(self, app_id: int) -> str | None:
+        if app_id <= 0:
+            return None
+        context = ssl._create_unverified_context()
+        url = (
+            "https://store.steampowered.com/api/appdetails"
+            f"?appids={app_id}&filters=basic&l=english"
+        )
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "ThemeDeck/2.5.0 (+Decky Loader)"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10, context=context) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get(str(app_id))
+        if not isinstance(value, dict) or not value.get("success"):
+            return None
+        data = value.get("data")
+        if not isinstance(data, dict):
+            return None
+        name = data.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return None
+
+    def _resolve_steamcommunity_app_name(self, app_id: int) -> str | None:
+        if app_id <= 0:
+            return None
+
+        url = f"https://steamcommunity.com/app/{app_id}/?l=english"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) ThemeDeck/2.5.0",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        context = ssl._create_unverified_context()
+        try:
+            with urllib.request.urlopen(request, timeout=10, context=context) as response:
+                final_url = response.geturl()
+                payload = response.read().decode("utf-8", errors="ignore")
+        except urllib.error.HTTPError as error:
+            # Steam Community rate-limits occasionally; skip quietly.
+            if error.code == 429:
+                return None
+            raise
+
+        canonical_match = re.search(r"/app/(\d+)", final_url or "", re.IGNORECASE)
+        if canonical_match:
+            canonical_app_id = int(canonical_match.group(1))
+            if canonical_app_id > 0:
+                # Secondary safety: normalize redirect/alias ids to canonical app id.
+                canonical_name = self._resolve_store_app_name_single(canonical_app_id)
+                if canonical_name:
+                    return canonical_name
+
+        title_match = re.search(
+            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+            payload,
+            re.IGNORECASE,
+        )
+        if not title_match:
+            title_match = re.search(
+                r"<title>(.*?)</title>", payload, re.IGNORECASE | re.DOTALL
+            )
+        if not title_match:
+            return None
+
+        raw_title = html_lib.unescape(title_match.group(1)).strip()
+        if not raw_title:
+            return None
+
+        cleaned = re.sub(r"^\s*Steam Community\s*::\s*", "", raw_title, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+on\s+Steam\s*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*::\s*Steam Community\s*$", "", cleaned, flags=re.IGNORECASE)
+        if cleaned.lower() in {"steam community", "error", "access denied"}:
+            return None
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return None
+        return cleaned
 
     def _resolve_yt_dlp_invocation(self) -> dict[str, Any] | None:
         if self._yt_venv_yt_dlp.exists() and os.access(self._yt_venv_yt_dlp, os.X_OK):
