@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.4.2 - 2026-02-25
+- Prevents global/ambient auto-play while inside ThemeDeck track-assignment screens.
+- Stops global ambient playback when entering ThemeDeck assignment routes to avoid overlap during per-game selection.
+
 ## 2.4.1 - 2026-02-24
 - Prevents ThemeDeck from playing any game/global/store music tracks while Steam is in Desktop Mode.
 

@@ -60,6 +60,7 @@ type GameTrack = {
   filename: string;
   volume: number;
   startOffset: number;
+  resumeTime?: number;
 };
 
 type TrackMap = Record<number, GameTrack>;
@@ -117,6 +118,7 @@ type GlobalTrack = {
   startOffset: number;
 };
 type StoreTrack = GlobalTrack;
+type AmbientInterruptionMode = "stop" | "pause" | "mute";
 
 type YtDlpStatus = {
   installed: boolean;
@@ -202,6 +204,10 @@ const GLOBAL_AMBIENT_ENABLED_STORAGE_KEY = "themedeck:globalAmbientEnabled";
 const GLOBAL_AMBIENT_ENABLED_EVENT = "themedeck:global-ambient-enabled-changed";
 const AMBIENT_DISABLE_STORE_STORAGE_KEY = "themedeck:ambientDisableStore";
 const AMBIENT_DISABLE_STORE_EVENT = "themedeck:ambient-disable-store-changed";
+const AMBIENT_INTERRUPTION_MODE_STORAGE_KEY =
+  "themedeck:ambientInterruptionMode";
+const AMBIENT_INTERRUPTION_MODE_EVENT =
+  "themedeck:ambient-interruption-mode-changed";
 const GLOBAL_AMBIENT_APP_ID = -1;
 const STORE_TRACK_APP_ID = -2;
 const UI_MODE_GAMEPAD = 4;
@@ -254,6 +260,16 @@ let desktopModeLastCheck = 0;
 let desktopModeRefreshInFlight: Promise<boolean> | null = null;
 let uiModePollInterval: number | null = null;
 let stopUIModeSubscription: (() => void) | null = null;
+let globalAmbientResumeSnapshot: {
+  path: string;
+  seconds: number;
+  capturedAtMs: number;
+  durationSeconds: number | null;
+  mode: AmbientInterruptionMode;
+} | null = null;
+let ambientInterruptionModeRuntime: AmbientInterruptionMode = "stop";
+let stopPlaybackFadeInterval: number | null = null;
+let stopPlaybackToken = 0;
 
 const readPreference = (key: string, fallback = true): boolean => {
   try {
@@ -302,6 +318,45 @@ const persistAmbientDisableStoreSetting = (value: boolean) =>
     AMBIENT_DISABLE_STORE_EVENT,
     value
   );
+
+const parseAmbientInterruptionMode = (
+  value: unknown
+): AmbientInterruptionMode => {
+  if (value === "mute" || value === "pause" || value === "stop") {
+    return value;
+  }
+  return "stop";
+};
+
+const readAmbientInterruptionModeSetting = (): AmbientInterruptionMode => {
+  try {
+    const raw = window.localStorage?.getItem(AMBIENT_INTERRUPTION_MODE_STORAGE_KEY);
+    const parsed = parseAmbientInterruptionMode(raw);
+    ambientInterruptionModeRuntime = parsed;
+    return parsed;
+  } catch (error) {
+    console.error("[ThemeDeck] unable to read ambient interruption mode", error);
+    return ambientInterruptionModeRuntime;
+  }
+};
+
+const persistAmbientInterruptionModeSetting = (value: AmbientInterruptionMode) => {
+  const normalized = parseAmbientInterruptionMode(value);
+  ambientInterruptionModeRuntime = normalized;
+  try {
+    window.localStorage?.setItem(AMBIENT_INTERRUPTION_MODE_STORAGE_KEY, normalized);
+  } catch (error) {
+    console.error("[ThemeDeck] unable to store ambient interruption mode", error);
+  }
+  window.dispatchEvent(
+    new CustomEvent<AmbientInterruptionMode>(AMBIENT_INTERRUPTION_MODE_EVENT, {
+      detail: normalized,
+    })
+  );
+};
+
+const getAmbientInterruptionModeRuntime = (): AmbientInterruptionMode =>
+  ambientInterruptionModeRuntime;
 
 const subscribePlayback = (listener: (state: PlaybackState) => void) => {
   playbackListeners.add(listener);
@@ -390,7 +445,132 @@ const resolveAudioUrl = async (track: GameTrack) => {
   return objectUrl;
 };
 
+const clearGlobalAmbientResumeSnapshot = () => {
+  globalAmbientResumeSnapshot = null;
+};
+
+const captureGlobalAmbientResumeSnapshot = () => {
+  const mode = getAmbientInterruptionModeRuntime();
+  if (mode === "stop") {
+    clearGlobalAmbientResumeSnapshot();
+    return;
+  }
+  if (
+    playbackState.appId !== GLOBAL_AMBIENT_APP_ID ||
+    playbackState.status !== "playing"
+  ) {
+    return;
+  }
+  const audio = sharedAudio;
+  const globalTrack = latestGlobalTrackForAutoPlay;
+  if (!audio || !globalTrack) {
+    return;
+  }
+  let seconds = 0;
+  try {
+    if (Number.isFinite(audio.currentTime)) {
+      seconds = Math.max(0, audio.currentTime);
+    }
+  } catch (_ignored) {
+    // no-op
+  }
+  const durationSeconds =
+    Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : null;
+  globalAmbientResumeSnapshot = {
+    path: globalTrack.path,
+    seconds,
+    capturedAtMs: Date.now(),
+    durationSeconds,
+    mode,
+  };
+};
+
+const getGlobalAmbientResumeTime = (track: GlobalTrack): number | undefined => {
+  const snapshot = globalAmbientResumeSnapshot;
+  if (!snapshot) {
+    return undefined;
+  }
+  if (snapshot.path !== track.path) {
+    clearGlobalAmbientResumeSnapshot();
+    return undefined;
+  }
+  let nextSeconds = snapshot.seconds;
+  if (snapshot.mode === "mute") {
+    nextSeconds += Math.max(0, (Date.now() - snapshot.capturedAtMs) / 1000);
+  }
+  const duration = snapshot.durationSeconds;
+  if (duration && Number.isFinite(duration) && duration > 0) {
+    nextSeconds %= duration;
+  }
+  return Math.max(0, nextSeconds);
+};
+
+const seekAudioToOffset = async (
+  audio: HTMLAudioElement,
+  targetSeconds: number
+): Promise<boolean> => {
+  const resolveTargetTime = () => {
+    if (Number.isFinite(audio.duration) && audio.duration > 0) {
+      return targetSeconds % audio.duration;
+    }
+    return targetSeconds;
+  };
+
+  const tryApply = () => {
+    try {
+      audio.currentTime = resolveTargetTime();
+      return true;
+    } catch (_ignored) {
+      return false;
+    }
+  };
+
+  if (tryApply()) {
+    return true;
+  }
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timeoutId = 0;
+    const finish = (success: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+      audio.removeEventListener("loadedmetadata", onReady);
+      audio.removeEventListener("canplay", onReady);
+      audio.removeEventListener("durationchange", onReady);
+      audio.removeEventListener("error", onError);
+      resolve(success);
+    };
+
+    const onReady = () => {
+      finish(tryApply());
+    };
+    const onError = () => {
+      finish(false);
+    };
+
+    timeoutId = window.setTimeout(() => {
+      finish(tryApply());
+    }, 1500);
+
+    audio.addEventListener("loadedmetadata", onReady);
+    audio.addEventListener("canplay", onReady);
+    audio.addEventListener("durationchange", onReady);
+    audio.addEventListener("error", onError);
+  });
+};
+
 const stopPlayback = (fade: boolean) => {
+  const token = ++stopPlaybackToken;
+  if (stopPlaybackFadeInterval) {
+    window.clearInterval(stopPlaybackFadeInterval);
+    stopPlaybackFadeInterval = null;
+  }
   const audio = sharedAudio;
   if (!audio) {
     notifyPlayback({
@@ -402,6 +582,13 @@ const stopPlayback = (fade: boolean) => {
   }
 
   const finish = () => {
+    if (token !== stopPlaybackToken) {
+      return;
+    }
+    if (stopPlaybackFadeInterval) {
+      window.clearInterval(stopPlaybackFadeInterval);
+      stopPlaybackFadeInterval = null;
+    }
     audio.pause();
     audio.currentTime = 0;
     audio.src = "";
@@ -420,11 +607,21 @@ const stopPlayback = (fade: boolean) => {
   const startingVolume = audio.volume;
   let step = 0;
   const steps = 8;
-  const interval = window.setInterval(() => {
+  stopPlaybackFadeInterval = window.setInterval(() => {
+    if (token !== stopPlaybackToken) {
+      if (stopPlaybackFadeInterval) {
+        window.clearInterval(stopPlaybackFadeInterval);
+        stopPlaybackFadeInterval = null;
+      }
+      return;
+    }
     step += 1;
     audio.volume = Math.max(0, startingVolume * (1 - step / steps));
     if (step >= steps) {
-      window.clearInterval(interval);
+      if (stopPlaybackFadeInterval) {
+        window.clearInterval(stopPlaybackFadeInterval);
+        stopPlaybackFadeInterval = null;
+      }
       audio.volume = startingVolume;
       finish();
     }
@@ -451,6 +648,11 @@ const isIgnorablePlaybackError = (error: unknown): boolean => {
 };
 
 const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
+  stopPlaybackToken += 1;
+  if (stopPlaybackFadeInterval) {
+    window.clearInterval(stopPlaybackFadeInterval);
+    stopPlaybackFadeInterval = null;
+  }
   const inDesktopMode = await refreshDesktopModeState();
   if (inDesktopMode) {
     return;
@@ -479,37 +681,14 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     }
 
     audio.volume = clamp(track.volume ?? 1);
-    const offset = clamp(track.startOffset ?? 0, 0, 30);
+    const configuredOffset = clamp(track.startOffset ?? 0, 0, 30);
+    const offset =
+      typeof track.resumeTime === "number" && Number.isFinite(track.resumeTime)
+        ? Math.max(0, track.resumeTime)
+        : configuredOffset;
+    let seekApplied = true;
     if (offset > 0) {
-      if (audio.readyState >= 1) {
-        try {
-          audio.currentTime = offset;
-        } catch (_ignored) {
-          // no-op
-        }
-      } else {
-        await new Promise<void>((resolve) => {
-          const applyOffset = () => {
-            try {
-              audio.currentTime = offset;
-            } catch (_ignored) {
-              // no-op
-            }
-            resolve();
-          };
-          const timeoutId = window.setTimeout(resolve, 400);
-          const onLoaded = () => {
-            window.clearTimeout(timeoutId);
-            applyOffset();
-          };
-          const onError = () => {
-            window.clearTimeout(timeoutId);
-            resolve();
-          };
-          audio.addEventListener("loadedmetadata", onLoaded, { once: true });
-          audio.addEventListener("error", onError, { once: true });
-        });
-      }
+      seekApplied = await seekAudioToOffset(audio, offset);
     } else if (!sameTrack) {
       try {
         audio.currentTime = 0;
@@ -518,8 +697,18 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       }
     }
     await audio.play();
+    if (offset > 0 && !seekApplied) {
+      await seekAudioToOffset(audio, offset);
+    }
     if (invocationId !== playInvocationCounter) {
       return;
+    }
+    if (
+      reason === "auto" &&
+      track.appId === GLOBAL_AMBIENT_APP_ID &&
+      typeof track.resumeTime === "number"
+    ) {
+      clearGlobalAmbientResumeSnapshot();
     }
     notifyPlayback({ appId: track.appId, reason, status: "playing" });
   } catch (error) {
@@ -1250,13 +1439,13 @@ const GameFocusBridge = () => {
   useEffect(() => {
     notifyFocus(appId);
     return () => {
-      notifyFocus(null);
-      if (
-        playbackState.reason === "auto" &&
-        playbackState.status === "playing"
-      ) {
-        stopPlayback(true);
-      }
+      // Route transitions can briefly unmount/remount detail pages; avoid pushing
+      // transient null focus that can cause ambient restart jitter.
+      window.setTimeout(() => {
+        if (readAppIdFromLocation() === null) {
+          notifyFocus(null);
+        }
+      }, 120);
     };
   }, [appId]);
 
@@ -1401,6 +1590,16 @@ const looksLikeStoreSignal = (value: unknown): boolean => {
   );
 };
 
+const looksLikeThemeDeckSignal = (value: unknown): boolean => {
+  if (typeof value !== "string") return false;
+  const text = value.toLowerCase();
+  return (
+    text.includes("/themedeck") ||
+    text.includes("#/themedeck") ||
+    text.includes("%2fthemedeck")
+  );
+};
+
 const isStoreRoute = (route: string): boolean => {
   const text = (route || "").toLowerCase();
   if (!text) return false;
@@ -1484,6 +1683,22 @@ const detectStoreFromWindowState = (): boolean => {
         }
       }
     }
+  }
+  return false;
+};
+
+const isThemeDeckRouteActive = (): boolean => {
+  const candidates = getStoreRouteCandidates();
+  if (candidates.some((route) => looksLikeThemeDeckSignal(route))) {
+    return true;
+  }
+  try {
+    const path = getLibraryPath();
+    if (looksLikeThemeDeckSignal(path)) {
+      return true;
+    }
+  } catch {
+    // ignore
   }
   return false;
 };
@@ -1624,12 +1839,14 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
       };
     }
     if (playbackState.appId === GLOBAL_AMBIENT_APP_ID && latestGlobalTrackForAutoPlay) {
+      const resumeTime = getGlobalAmbientResumeTime(latestGlobalTrackForAutoPlay);
       return {
         appId: GLOBAL_AMBIENT_APP_ID,
         path: latestGlobalTrackForAutoPlay.path,
         filename: latestGlobalTrackForAutoPlay.filename,
         volume: latestGlobalTrackForAutoPlay.volume,
         startOffset: latestGlobalTrackForAutoPlay.startOffset,
+        resumeTime,
       };
     }
     if (playbackState.appId && playbackState.appId > 0) {
@@ -1644,18 +1861,30 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
     return null;
   }
 
+  const resumeTime = getGlobalAmbientResumeTime(latestGlobalTrackForAutoPlay);
   return {
     appId: GLOBAL_AMBIENT_APP_ID,
     path: latestGlobalTrackForAutoPlay.path,
     filename: latestGlobalTrackForAutoPlay.filename,
     volume: latestGlobalTrackForAutoPlay.volume,
     startOffset: latestGlobalTrackForAutoPlay.startOffset,
+    resumeTime,
   };
 };
 
 const applyAutoPlaybackFromContext = () => {
   if (desktopModeActive) {
     if (playbackState.status === "playing") {
+      stopPlayback(true);
+    }
+    return;
+  }
+
+  if (isThemeDeckRouteActive()) {
+    if (playbackState.reason === "auto" && playbackState.status === "playing") {
+      if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
+        captureGlobalAmbientResumeSnapshot();
+      }
       stopPlayback(true);
     }
     return;
@@ -1669,6 +1898,7 @@ const applyAutoPlaybackFromContext = () => {
     playbackState.appId === GLOBAL_AMBIENT_APP_ID &&
     playbackState.status === "playing"
   ) {
+    captureGlobalAmbientResumeSnapshot();
     stopPlayback(true);
     return;
   }
@@ -1679,9 +1909,21 @@ const applyAutoPlaybackFromContext = () => {
   const nextTrack = resolveAutoTrackFromContext();
   if (!nextTrack) {
     if (playbackState.reason === "auto" && playbackState.status === "playing") {
+      if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
+        captureGlobalAmbientResumeSnapshot();
+      }
       stopPlayback(true);
     }
     return;
+  }
+
+  if (
+    playbackState.reason === "auto" &&
+    playbackState.status === "playing" &&
+    playbackState.appId === GLOBAL_AMBIENT_APP_ID &&
+    nextTrack.appId !== GLOBAL_AMBIENT_APP_ID
+  ) {
+    captureGlobalAmbientResumeSnapshot();
   }
 
   if (
@@ -1718,6 +1960,13 @@ const refreshAutoPlaybackTrackCache = async () => {
     latestTracksForAutoPlay = normalizeTracks(trackData);
     latestGlobalTrackForAutoPlay = normalizeGlobalTrack(globalData);
     latestStoreTrackForAutoPlay = normalizeGlobalTrack(storeData);
+    if (
+      !latestGlobalTrackForAutoPlay ||
+      (globalAmbientResumeSnapshot &&
+        globalAmbientResumeSnapshot.path !== latestGlobalTrackForAutoPlay.path)
+    ) {
+      clearGlobalAmbientResumeSnapshot();
+    }
     scheduleAutoPlaybackFromContext();
   } catch (error) {
     console.error("[ThemeDeck] refresh auto playback cache failed", error);
@@ -1731,6 +1980,7 @@ const startAutoPlaybackCoordinator = () => {
     return;
   }
   autoPlaybackStarted = true;
+  ambientInterruptionModeRuntime = readAmbientInterruptionModeSetting();
   startDesktopModeWatcher();
   refreshAutoPlaybackTrackCache();
   stopAutoPlaybackSubscription = subscribePlayback(() => {
@@ -1743,6 +1993,10 @@ const startAutoPlaybackCoordinator = () => {
   );
   window.addEventListener(
     AMBIENT_DISABLE_STORE_EVENT,
+    scheduleAutoPlaybackFromContext
+  );
+  window.addEventListener(
+    AMBIENT_INTERRUPTION_MODE_EVENT,
     scheduleAutoPlaybackFromContext
   );
   window.addEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
@@ -1767,6 +2021,10 @@ const stopAutoPlaybackCoordinator = () => {
   );
   window.removeEventListener(
     AMBIENT_DISABLE_STORE_EVENT,
+    scheduleAutoPlaybackFromContext
+  );
+  window.removeEventListener(
+    AMBIENT_INTERRUPTION_MODE_EVENT,
     scheduleAutoPlaybackFromContext
   );
   window.removeEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
@@ -1921,6 +2179,42 @@ const useGlobalAmbientEnabledSetting = (): [boolean, (value: boolean) => void] =
     GLOBAL_AMBIENT_ENABLED_EVENT
   );
 
+const useAmbientInterruptionModeSetting = (): [
+  AmbientInterruptionMode,
+  (value: AmbientInterruptionMode) => void
+] => {
+  const [mode, setMode] = useState<AmbientInterruptionMode>(
+    readAmbientInterruptionModeSetting()
+  );
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<AmbientInterruptionMode>).detail;
+      setMode(parseAmbientInterruptionMode(detail));
+    };
+    window.addEventListener(
+      AMBIENT_INTERRUPTION_MODE_EVENT,
+      handler as EventListener
+    );
+    return () =>
+      window.removeEventListener(
+        AMBIENT_INTERRUPTION_MODE_EVENT,
+        handler as EventListener
+      );
+  }, []);
+
+  const update = useCallback((value: AmbientInterruptionMode) => {
+    const normalized = parseAmbientInterruptionMode(value);
+    setMode(normalized);
+    if (normalized === "stop") {
+      clearGlobalAmbientResumeSnapshot();
+    }
+    persistAmbientInterruptionModeSetting(normalized);
+  }, []);
+
+  return [mode, update];
+};
+
 
 const Content = () => {
   const {
@@ -1938,6 +2232,8 @@ const Content = () => {
     useGlobalAmbientEnabledSetting();
   const [ambientDisableStore, setAmbientDisableStore] =
     useAmbientDisableStoreSetting();
+  const [ambientInterruptionMode, setAmbientInterruptionMode] =
+    useAmbientInterruptionModeSetting();
   const [ytDlpStatus, setYtDlpStatus] = useState<YtDlpStatus>({
     installed: false,
   });
@@ -2164,6 +2460,7 @@ const Content = () => {
       setGlobalTrack(null);
       latestTracksForAutoPlay = normalized;
       latestGlobalTrackForAutoPlay = null;
+      clearGlobalAmbientResumeSnapshot();
       clearAudioCache(removedPath);
       if (playback.appId === GLOBAL_AMBIENT_APP_ID) {
         stopPlayback(true);
@@ -2420,6 +2717,67 @@ const Content = () => {
                 scheduleAutoPlaybackFromContext();
               }}
             />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ width: "100%" }}>
+              <div style={{ fontWeight: 600 }}>
+                Global/ambient interruption behavior
+              </div>
+              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
+                When game/store music interrupts global ambient:
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.35rem",
+                  marginTop: "0.45rem",
+                }}
+                role="radiogroup"
+                aria-label="Global ambient interruption behavior"
+              >
+                {(
+                  [
+                    {
+                      value: "stop",
+                      label: "Stop (restart on return)",
+                    },
+                    {
+                      value: "pause",
+                      label: "Pause until return",
+                    },
+                    {
+                      value: "mute",
+                      label: "Mute until return",
+                    },
+                  ] as Array<{ value: AmbientInterruptionMode; label: string }>
+                ).map((option) => (
+                  <button
+                    key={option.value}
+                    className="DialogButton"
+                    onClick={() => setAmbientInterruptionMode(option.value)}
+                    role="radio"
+                    aria-checked={ambientInterruptionMode === option.value}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "0.5rem",
+                      justifyContent: "flex-start",
+                      width: "100%",
+                      border:
+                        ambientInterruptionMode === option.value
+                          ? "1px solid rgba(120, 180, 255, 0.85)"
+                          : undefined,
+                    }}
+                  >
+                    <span style={{ minWidth: "1.4rem", textAlign: "center" }}>
+                      {ambientInterruptionMode === option.value ? "(x)" : "( )"}
+                    </span>
+                    <span>{option.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
           </PanelSectionRow>
           <PanelSectionRow>
             <button
@@ -3606,6 +3964,7 @@ const ChangeGlobalTheme = () => {
       const normalized = normalizeGlobalTrack(saved);
       setTrack(normalized);
       latestGlobalTrackForAutoPlay = normalized;
+      clearGlobalAmbientResumeSnapshot();
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
       scheduleAutoPlaybackFromContext();
       toaster.toast({
@@ -3648,6 +4007,7 @@ const ChangeGlobalTheme = () => {
       await deleteGlobalTrack();
       setTrack(null);
       latestGlobalTrackForAutoPlay = null;
+      clearGlobalAmbientResumeSnapshot();
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
       scheduleAutoPlaybackFromContext();
       toaster.toast({

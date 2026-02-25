@@ -1,5 +1,9 @@
 # ThemeDeck Documentation
 
+## February 25, 2026 Update (v2.4.2)
+
+This update prevents global/ambient auto-play while you are inside ThemeDeck assignment pages, so global music no longer plays when selecting or assigning per-game tracks.
+
 ## February 24, 2026 Update (v2.4.1)
 
 This update ensures ThemeDeck never plays any music tracks while Steam is in Desktop Mode.
