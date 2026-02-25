@@ -1,5 +1,9 @@
 # ThemeDeck Documentation
 
+## February 25, 2026 Update (v2.5.0)
+
+This update adds bulk auto-assign for games without music, a "Show games without music" list with live name-resolution progress, and improved game ID handling to reduce duplicate/alias entries.
+
 ## February 25, 2026 Update (v2.4.2)
 
 This update prevents global/ambient auto-play while you are inside ThemeDeck assignment pages, so global music no longer plays when selecting or assigning per-game tracks.
