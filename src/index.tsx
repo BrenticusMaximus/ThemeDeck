@@ -233,6 +233,7 @@ const UI_MODE_GAMEPAD = 4;
 const UI_MODE_DESKTOP = 7;
 const UI_MODE_POLL_MS = 2000;
 const UI_MODE_CACHE_MS = 1000;
+const RUNNING_APP_POLL_MS = 1250;
 const SP_TAB_CANDIDATES = [
   "SP",
   "sp",
@@ -289,6 +290,11 @@ let desktopModeLastCheck = 0;
 let desktopModeRefreshInFlight: Promise<boolean> | null = null;
 let uiModePollInterval: number | null = null;
 let stopUIModeSubscription: (() => void) | null = null;
+let runningGameAppId: number | null = null;
+let runningAppPollInterval: number | null = null;
+let runningAppRetry: number | null = null;
+let runningAppRefreshInFlight = false;
+const runningAppSubscriptions: Array<() => void> = [];
 let globalAmbientResumeSnapshot: {
   path: string;
   seconds: number;
@@ -686,6 +692,9 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
   if (inDesktopMode) {
     return;
   }
+  if (runningGameAppId !== null) {
+    return;
+  }
 
   const signature = getPlaySignature(track, reason);
   if (playInFlightSignature === signature) {
@@ -698,6 +707,9 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
   try {
     const nextUrl = await resolveAudioUrl(track);
     if (invocationId !== playInvocationCounter) {
+      return;
+    }
+    if (runningGameAppId !== null) {
       return;
     }
     const sameTrack =
@@ -724,6 +736,9 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       } catch (_ignored) {
         // no-op
       }
+    }
+    if (runningGameAppId !== null) {
+      return;
     }
     await audio.play();
     if (offset > 0 && !seekApplied) {
@@ -1103,6 +1118,289 @@ const stopSteamAppWatchers = () => {
     window.clearInterval(steamAppRetry);
     steamAppRetry = null;
   }
+};
+
+const isEligibleRunningAppId = (appId: number): boolean =>
+  Number.isFinite(appId) &&
+  appId > 0 &&
+  !LIBRARY_EXCLUDED_APP_IDS.has(appId);
+
+const hasRunningMarker = (candidate: any): boolean => {
+  if (!candidate || typeof candidate !== "object") {
+    return false;
+  }
+  const flags = [
+    candidate.running,
+    candidate.is_running,
+    candidate.isRunning,
+    candidate.bIsRunning,
+    candidate.BIsRunning,
+    candidate.playing,
+    candidate.in_game,
+    candidate.inGame,
+  ];
+  if (flags.some((value) => value === true || value === 1 || value === "1")) {
+    return true;
+  }
+  const stateText = String(
+    candidate.state ??
+      candidate.app_state ??
+      candidate.strAppState ??
+      candidate.status ??
+      ""
+  )
+    .trim()
+    .toLowerCase();
+  if (
+    stateText.includes("running") ||
+    stateText.includes("in-game") ||
+    stateText.includes("in_game") ||
+    stateText.includes("ingame")
+  ) {
+    return true;
+  }
+  return false;
+};
+
+const collectRunningAppIds = (
+  candidate: any,
+  target: Set<number>,
+  assumeRunning: boolean,
+  visited = new Set<any>()
+) => {
+  if (candidate == null) {
+    return;
+  }
+
+  if (typeof candidate === "number" || typeof candidate === "bigint") {
+    const appId = Number(candidate);
+    if (assumeRunning && isEligibleRunningAppId(appId)) {
+      target.add(appId);
+    }
+    return;
+  }
+
+  if (typeof candidate === "string") {
+    const parsed = Number.parseInt(candidate, 10);
+    if (assumeRunning && !Number.isNaN(parsed) && isEligibleRunningAppId(parsed)) {
+      target.add(parsed);
+    }
+    return;
+  }
+
+  if (typeof candidate !== "object") {
+    return;
+  }
+
+  if (visited.has(candidate)) {
+    return;
+  }
+  visited.add(candidate);
+
+  if (Array.isArray(candidate)) {
+    candidate.forEach((entry) =>
+      collectRunningAppIds(entry, target, assumeRunning, visited)
+    );
+    return;
+  }
+  if (candidate instanceof Set) {
+    candidate.forEach((entry) =>
+      collectRunningAppIds(entry, target, assumeRunning, visited)
+    );
+    return;
+  }
+  if (candidate instanceof Map) {
+    candidate.forEach((value, key) => {
+      collectRunningAppIds(value, target, assumeRunning, visited);
+      if (assumeRunning) {
+        collectRunningAppIds(key, target, true, visited);
+      }
+    });
+    return;
+  }
+
+  const appId = extractAppId(candidate);
+  if (appId && (assumeRunning || hasRunningMarker(candidate))) {
+    if (isEligibleRunningAppId(appId)) {
+      target.add(appId);
+    }
+  }
+
+  [
+    "runningApps",
+    "running_apps",
+    "apps",
+    "sessions",
+    "games",
+    "rgRunningApps",
+    "rgApps",
+    "rgGames",
+    "map_running",
+  ].forEach((key) => {
+    if (key in candidate) {
+      collectRunningAppIds(candidate[key], target, assumeRunning, visited);
+    }
+  });
+};
+
+const readRunningGameAppId = async (): Promise<number | null> => {
+  const ids = new Set<number>();
+  const steamApps = (window as any)?.SteamClient?.Apps;
+  const appStore = (window as any)?.appStore;
+
+  const methodSources: Array<{ owner: any; method: string; assumeRunning: boolean }> = [
+    { owner: steamApps, method: "GetRunningApps", assumeRunning: true },
+    { owner: steamApps, method: "GetRunningAppList", assumeRunning: true },
+    { owner: steamApps, method: "GetAppsRunning", assumeRunning: true },
+    { owner: steamApps, method: "GetCurrentlyRunningApp", assumeRunning: true },
+    { owner: appStore, method: "GetRunningApps", assumeRunning: true },
+    { owner: appStore, method: "GetCurrentlyRunningApp", assumeRunning: true },
+  ];
+
+  for (const source of methodSources) {
+    const fn = source.owner?.[source.method];
+    if (typeof fn !== "function") {
+      continue;
+    }
+    try {
+      const result = await Promise.resolve(fn.call(source.owner));
+      collectRunningAppIds(result, ids, source.assumeRunning);
+    } catch (_ignored) {
+      // no-op
+    }
+  }
+
+  [
+    steamApps?.m_mapRunningApps,
+    steamApps?.m_runningApps,
+    steamApps?.runningApps,
+    appStore?.m_mapRunningApps,
+    appStore?.m_runningApps,
+    appStore?.runningApps,
+    (Router as any)?.WindowStore?.m_mapRunningApps,
+    (Router as any)?.WindowStore?.m_runningApps,
+    (Router as any)?.WindowStore?.runningApps,
+    (Router as any)?.MainRunningApp,
+    (Router as any)?.RunningApp,
+  ].forEach((value) => collectRunningAppIds(value, ids, true));
+
+  const routeAppId = readAppIdFromLocation();
+  if (routeAppId && ids.has(routeAppId)) {
+    return routeAppId;
+  }
+  if (focusedAppId && ids.has(focusedAppId)) {
+    return focusedAppId;
+  }
+  const ordered = Array.from(ids.values()).sort((a, b) => a - b);
+  return ordered[0] ?? null;
+};
+
+const setRunningGameAppId = (next: number | null) => {
+  const normalized = next && isEligibleRunningAppId(next) ? next : null;
+  if (runningGameAppId === normalized) {
+    return;
+  }
+  runningGameAppId = normalized;
+  if (runningGameAppId !== null && playbackState.status === "playing") {
+    if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
+      captureGlobalAmbientResumeSnapshot();
+    }
+    stopPlayback(true);
+  }
+  scheduleAutoPlaybackFromContext();
+};
+
+const refreshRunningGameState = async () => {
+  if (runningAppRefreshInFlight) {
+    return;
+  }
+  runningAppRefreshInFlight = true;
+  try {
+    const next = await readRunningGameAppId();
+    setRunningGameAppId(next);
+  } catch (error) {
+    console.error("[ThemeDeck] running game probe failed", error);
+  } finally {
+    runningAppRefreshInFlight = false;
+  }
+};
+
+const startRunningGameWatcher = () => {
+  if (runningAppPollInterval) {
+    return;
+  }
+
+  const apps = (window as any)?.SteamClient?.Apps;
+  if (!apps) {
+    if (!runningAppRetry) {
+      runningAppRetry = window.setInterval(() => {
+        const retryApps = (window as any)?.SteamClient?.Apps;
+        if (!retryApps) {
+          return;
+        }
+        window.clearInterval(runningAppRetry!);
+        runningAppRetry = null;
+        startRunningGameWatcher();
+      }, 2000);
+    }
+    return;
+  }
+
+  const registerMethods = [
+    "RegisterForRunningAppsChanged",
+    "RegisterForRunningAppChanges",
+    "RegisterForAppRunningStateChanged",
+    "RegisterForAppRunningStateChange",
+    "RegisterForGameActionStart",
+    "RegisterForGameActionEnd",
+    "RegisterForGameLaunched",
+    "RegisterForGameExited",
+    "RegisterForAppDetails",
+    "RegisterForAppOverviewChanges",
+  ];
+
+  registerMethods.forEach((method) => {
+    const register = apps?.[method];
+    if (typeof register !== "function") {
+      return;
+    }
+    try {
+      const token = register.call(apps, () => {
+        void refreshRunningGameState();
+      });
+      const clean = wrapUnsubscribe(token);
+      if (clean) {
+        runningAppSubscriptions.push(clean);
+      }
+    } catch (error) {
+      console.error("[ThemeDeck] running watcher failed", { method, error });
+    }
+  });
+
+  runningAppPollInterval = window.setInterval(() => {
+    void refreshRunningGameState();
+  }, RUNNING_APP_POLL_MS);
+  void refreshRunningGameState();
+};
+
+const stopRunningGameWatcher = () => {
+  runningAppSubscriptions.splice(0).forEach((clean) => {
+    try {
+      clean();
+    } catch (error) {
+      console.error("[ThemeDeck] running watcher cleanup failed", error);
+    }
+  });
+  if (runningAppPollInterval) {
+    window.clearInterval(runningAppPollInterval);
+    runningAppPollInterval = null;
+  }
+  if (runningAppRetry) {
+    window.clearInterval(runningAppRetry);
+    runningAppRetry = null;
+  }
+  runningAppRefreshInFlight = false;
+  runningGameAppId = null;
 };
 
 const resolveLibraryContextMenu = () => {
@@ -1820,6 +2118,10 @@ const refreshStoreContext = async () => {
 };
 
 const resolveAutoTrackFromContext = (): GameTrack | null => {
+  if (runningGameAppId !== null) {
+    return null;
+  }
+
   const routeAppId = readAppIdFromLocation();
   const effectiveAppId = routeAppId ?? focusedAppId;
 
@@ -1904,6 +2206,16 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
 const applyAutoPlaybackFromContext = () => {
   if (desktopModeActive) {
     if (playbackState.status === "playing") {
+      stopPlayback(true);
+    }
+    return;
+  }
+
+  if (runningGameAppId !== null) {
+    if (playbackState.status === "playing") {
+      if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
+        captureGlobalAmbientResumeSnapshot();
+      }
       stopPlayback(true);
     }
     return;
@@ -2011,6 +2323,7 @@ const startAutoPlaybackCoordinator = () => {
   autoPlaybackStarted = true;
   ambientInterruptionModeRuntime = readAmbientInterruptionModeSetting();
   startDesktopModeWatcher();
+  startRunningGameWatcher();
   refreshAutoPlaybackTrackCache();
   stopAutoPlaybackSubscription = subscribePlayback(() => {
     scheduleAutoPlaybackFromContext();
@@ -2041,6 +2354,7 @@ const stopAutoPlaybackCoordinator = () => {
     return;
   }
   autoPlaybackStarted = false;
+  stopRunningGameWatcher();
   stopAutoPlaybackSubscription?.();
   stopAutoPlaybackSubscription = null;
   window.removeEventListener(AUTO_PLAY_EVENT, scheduleAutoPlaybackFromContext);
