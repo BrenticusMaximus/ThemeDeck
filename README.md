@@ -6,6 +6,8 @@
 
 ThemeDeck lets you add and manage custom music across your Steam library and key Steam UI pages.
 
+![ThemeDeck February 19 2026 update thumbnail](https://images.steamusercontent.com/ugc/10217922894651388729/0056712F90842A587703E222C9AD211D53B2344E/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
+
 ## Main Features
 
 - Add custom music to any game page in your library.
@@ -71,7 +73,5 @@ This update adds a per-game **Truncate beginning of song** setting (0-30 seconds
 ## February 19, 2026 Update (v2.0.0)
 
 This update adds **YouTube search/download support powered by `yt-dlp`** so users can search game music, preview tracks, download locally, and assign directly from ThemeDeck. You still have the option to manually assign local music tracks.
-
-![ThemeDeck February 19 2026 update thumbnail](https://images.steamusercontent.com/ugc/10217922894651388729/0056712F90842A587703E222C9AD211D53B2344E/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
 <a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
