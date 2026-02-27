@@ -42,7 +42,6 @@ import {
   FaPlay,
   FaTrash,
 } from "react-icons/fa";
-import { BUILD_ID } from "./build-info";
 
 type BackendTrack = {
   app_id?: number;
@@ -119,6 +118,7 @@ type GlobalTrack = {
 };
 type StoreTrack = GlobalTrack;
 type AmbientInterruptionMode = "stop" | "pause" | "mute";
+type LaunchStopMode = "launch_start" | "game_started";
 
 type YtDlpStatus = {
   installed: boolean;
@@ -214,19 +214,20 @@ const updateYtDlp = callable<[], YtDlpStatus>("update_yt_dlp");
 
 const TRACKS_UPDATED_EVENT = "themedeck:tracks-updated";
 const AUDIO_EXTENSIONS = ["mp3", "aac", "flac", "ogg", "wav", "m4a"];
-const AUDIO_EXTENSIONS_LABEL = AUDIO_EXTENSIONS.map((ext) => `.${ext}`).join(
-  ", "
-);
 const AUTO_PLAY_STORAGE_KEY = "themedeck:autoPlay";
 const AUTO_PLAY_EVENT = "themedeck:auto-play-changed";
 const GLOBAL_AMBIENT_ENABLED_STORAGE_KEY = "themedeck:globalAmbientEnabled";
 const GLOBAL_AMBIENT_ENABLED_EVENT = "themedeck:global-ambient-enabled-changed";
+const STORE_TRACK_ENABLED_STORAGE_KEY = "themedeck:storeTrackEnabled";
+const STORE_TRACK_ENABLED_EVENT = "themedeck:store-track-enabled-changed";
 const AMBIENT_DISABLE_STORE_STORAGE_KEY = "themedeck:ambientDisableStore";
 const AMBIENT_DISABLE_STORE_EVENT = "themedeck:ambient-disable-store-changed";
 const AMBIENT_INTERRUPTION_MODE_STORAGE_KEY =
   "themedeck:ambientInterruptionMode";
 const AMBIENT_INTERRUPTION_MODE_EVENT =
   "themedeck:ambient-interruption-mode-changed";
+const LAUNCH_STOP_MODE_STORAGE_KEY = "themedeck:launchStopMode";
+const LAUNCH_STOP_MODE_EVENT = "themedeck:launch-stop-mode-changed";
 const GLOBAL_AMBIENT_APP_ID = -1;
 const STORE_TRACK_APP_ID = -2;
 const UI_MODE_GAMEPAD = 4;
@@ -295,6 +296,7 @@ let runningAppPollInterval: number | null = null;
 let runningAppRetry: number | null = null;
 let runningAppRefreshInFlight = false;
 const runningAppSubscriptions: Array<() => void> = [];
+let launchStopModeRuntime: LaunchStopMode = "launch_start";
 let globalAmbientResumeSnapshot: {
   path: string;
   seconds: number;
@@ -344,6 +346,16 @@ const persistGlobalAmbientEnabledSetting = (value: boolean) =>
     value
   );
 
+const readStoreTrackEnabledSetting = (): boolean =>
+  readPreference(STORE_TRACK_ENABLED_STORAGE_KEY, true);
+
+const persistStoreTrackEnabledSetting = (value: boolean) =>
+  persistPreference(
+    STORE_TRACK_ENABLED_STORAGE_KEY,
+    STORE_TRACK_ENABLED_EVENT,
+    value
+  );
+
 const readAmbientDisableStoreSetting = (): boolean =>
   readPreference(AMBIENT_DISABLE_STORE_STORAGE_KEY, true);
 
@@ -362,6 +374,42 @@ const parseAmbientInterruptionMode = (
   }
   return "stop";
 };
+
+const parseLaunchStopMode = (value: unknown): LaunchStopMode => {
+  if (value === "game_started" || value === "launch_start") {
+    return value;
+  }
+  return "launch_start";
+};
+
+const readLaunchStopModeSetting = (): LaunchStopMode => {
+  try {
+    const raw = window.localStorage?.getItem(LAUNCH_STOP_MODE_STORAGE_KEY);
+    const parsed = parseLaunchStopMode(raw);
+    launchStopModeRuntime = parsed;
+    return parsed;
+  } catch (error) {
+    console.error("[ThemeDeck] unable to read launch stop mode", error);
+    return launchStopModeRuntime;
+  }
+};
+
+const persistLaunchStopModeSetting = (value: LaunchStopMode) => {
+  const normalized = parseLaunchStopMode(value);
+  launchStopModeRuntime = normalized;
+  try {
+    window.localStorage?.setItem(LAUNCH_STOP_MODE_STORAGE_KEY, normalized);
+  } catch (error) {
+    console.error("[ThemeDeck] unable to store launch stop mode", error);
+  }
+  window.dispatchEvent(
+    new CustomEvent<LaunchStopMode>(LAUNCH_STOP_MODE_EVENT, {
+      detail: normalized,
+    })
+  );
+};
+
+const getLaunchStopModeRuntime = (): LaunchStopMode => launchStopModeRuntime;
 
 const readAmbientInterruptionModeSetting = (): AmbientInterruptionMode => {
   try {
@@ -1125,46 +1173,104 @@ const isEligibleRunningAppId = (appId: number): boolean =>
   appId > 0 &&
   !LIBRARY_EXCLUDED_APP_IDS.has(appId);
 
-const hasRunningMarker = (candidate: any): boolean => {
-  if (!candidate || typeof candidate !== "object") {
-    return false;
-  }
-  const flags = [
-    candidate.running,
-    candidate.is_running,
-    candidate.isRunning,
-    candidate.bIsRunning,
-    candidate.BIsRunning,
-    candidate.playing,
-    candidate.in_game,
-    candidate.inGame,
-  ];
-  if (flags.some((value) => value === true || value === 1 || value === "1")) {
-    return true;
-  }
-  const stateText = String(
-    candidate.state ??
-      candidate.app_state ??
-      candidate.strAppState ??
-      candidate.status ??
+const getStateText = (candidate: any): string =>
+  String(
+    candidate?.state ??
+      candidate?.app_state ??
+      candidate?.strAppState ??
+      candidate?.status ??
+      candidate?.m_eAppState ??
+      candidate?.eAppState ??
       ""
   )
     .trim()
     .toLowerCase();
+
+const hasStartedMarker = (candidate: any): boolean => {
+  if (!candidate || typeof candidate !== "object") {
+    return false;
+  }
+  const startedFlags = [
+    candidate.playing,
+    candidate.in_game,
+    candidate.inGame,
+    candidate.bInGame,
+    candidate.BInGame,
+    candidate.is_ingame,
+    candidate.isInGame,
+  ];
   if (
-    stateText.includes("running") ||
+    startedFlags.some(
+      (value) =>
+        value === true ||
+        value === 1 ||
+        value === "1" ||
+        String(value).toLowerCase() === "true"
+    )
+  ) {
+    return true;
+  }
+  const stateText = getStateText(candidate);
+  if (!stateText) {
+    return false;
+  }
+  if (
     stateText.includes("in-game") ||
     stateText.includes("in_game") ||
-    stateText.includes("ingame")
+    stateText.includes("ingame") ||
+    stateText.includes("playing") ||
+    stateText.includes("active") ||
+    stateText === "running"
   ) {
     return true;
   }
   return false;
 };
 
-const collectRunningAppIds = (
+const hasLaunchingMarker = (candidate: any): boolean => {
+  if (!candidate || typeof candidate !== "object") {
+    return false;
+  }
+  const launchFlags = [
+    candidate.running,
+    candidate.is_running,
+    candidate.isRunning,
+    candidate.bIsRunning,
+    candidate.BIsRunning,
+  ];
+  if (
+    launchFlags.some(
+      (value) =>
+        value === true ||
+        value === 1 ||
+        value === "1" ||
+        String(value).toLowerCase() === "true"
+    )
+  ) {
+    return true;
+  }
+  const stateText = getStateText(candidate);
+  if (!stateText) {
+    return false;
+  }
+  return (
+    stateText.includes("launch") ||
+    stateText.includes("starting") ||
+    stateText.includes("prelaunch") ||
+    stateText.includes("pre-launch") ||
+    stateText.includes("queued") ||
+    stateText.includes("initializing")
+  );
+};
+
+type RunningAppSnapshot = {
+  started: Set<number>;
+  launching: Set<number>;
+};
+
+const collectRunningAppStates = (
   candidate: any,
-  target: Set<number>,
+  target: RunningAppSnapshot,
   assumeRunning: boolean,
   visited = new Set<any>()
 ) => {
@@ -1175,7 +1281,7 @@ const collectRunningAppIds = (
   if (typeof candidate === "number" || typeof candidate === "bigint") {
     const appId = Number(candidate);
     if (assumeRunning && isEligibleRunningAppId(appId)) {
-      target.add(appId);
+      target.launching.add(appId);
     }
     return;
   }
@@ -1183,7 +1289,7 @@ const collectRunningAppIds = (
   if (typeof candidate === "string") {
     const parsed = Number.parseInt(candidate, 10);
     if (assumeRunning && !Number.isNaN(parsed) && isEligibleRunningAppId(parsed)) {
-      target.add(parsed);
+      target.launching.add(parsed);
     }
     return;
   }
@@ -1199,30 +1305,36 @@ const collectRunningAppIds = (
 
   if (Array.isArray(candidate)) {
     candidate.forEach((entry) =>
-      collectRunningAppIds(entry, target, assumeRunning, visited)
+      collectRunningAppStates(entry, target, assumeRunning, visited)
     );
     return;
   }
   if (candidate instanceof Set) {
     candidate.forEach((entry) =>
-      collectRunningAppIds(entry, target, assumeRunning, visited)
+      collectRunningAppStates(entry, target, assumeRunning, visited)
     );
     return;
   }
   if (candidate instanceof Map) {
     candidate.forEach((value, key) => {
-      collectRunningAppIds(value, target, assumeRunning, visited);
+      collectRunningAppStates(value, target, assumeRunning, visited);
       if (assumeRunning) {
-        collectRunningAppIds(key, target, true, visited);
+        collectRunningAppStates(key, target, true, visited);
       }
     });
     return;
   }
 
   const appId = extractAppId(candidate);
-  if (appId && (assumeRunning || hasRunningMarker(candidate))) {
+  const started = hasStartedMarker(candidate);
+  const launching = hasLaunchingMarker(candidate);
+  if (appId && (assumeRunning || started || launching)) {
     if (isEligibleRunningAppId(appId)) {
-      target.add(appId);
+      if (started) {
+        target.started.add(appId);
+      } else {
+        target.launching.add(appId);
+      }
     }
   }
 
@@ -1238,13 +1350,16 @@ const collectRunningAppIds = (
     "map_running",
   ].forEach((key) => {
     if (key in candidate) {
-      collectRunningAppIds(candidate[key], target, assumeRunning, visited);
+      collectRunningAppStates(candidate[key], target, assumeRunning, visited);
     }
   });
 };
 
 const readRunningGameAppId = async (): Promise<number | null> => {
-  const ids = new Set<number>();
+  const snapshot: RunningAppSnapshot = {
+    started: new Set<number>(),
+    launching: new Set<number>(),
+  };
   const steamApps = (window as any)?.SteamClient?.Apps;
   const appStore = (window as any)?.appStore;
 
@@ -1264,7 +1379,7 @@ const readRunningGameAppId = async (): Promise<number | null> => {
     }
     try {
       const result = await Promise.resolve(fn.call(source.owner));
-      collectRunningAppIds(result, ids, source.assumeRunning);
+      collectRunningAppStates(result, snapshot, source.assumeRunning);
     } catch (_ignored) {
       // no-op
     }
@@ -1282,7 +1397,13 @@ const readRunningGameAppId = async (): Promise<number | null> => {
     (Router as any)?.WindowStore?.runningApps,
     (Router as any)?.MainRunningApp,
     (Router as any)?.RunningApp,
-  ].forEach((value) => collectRunningAppIds(value, ids, true));
+  ].forEach((value) => collectRunningAppStates(value, snapshot, true));
+
+  const mode = getLaunchStopModeRuntime();
+  const ids =
+    mode === "game_started"
+      ? snapshot.started
+      : new Set<number>([...snapshot.started, ...snapshot.launching]);
 
   const routeAppId = readAppIdFromLocation();
   if (routeAppId && ids.has(routeAppId)) {
@@ -2137,7 +2258,7 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
   }
 
   const inStore = isStorePath();
-  if (inStore && latestStoreTrackForAutoPlay) {
+  if (inStore && readStoreTrackEnabledSetting() && latestStoreTrackForAutoPlay) {
     return {
       appId: STORE_TRACK_APP_ID,
       path: latestStoreTrackForAutoPlay.path,
@@ -2160,7 +2281,11 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
 
   const currentPath = getLibraryPath();
   if (!currentPath && playbackState.reason === "auto" && playbackState.status === "playing") {
-    if (playbackState.appId === STORE_TRACK_APP_ID && latestStoreTrackForAutoPlay) {
+    if (
+      playbackState.appId === STORE_TRACK_APP_ID &&
+      readStoreTrackEnabledSetting() &&
+      latestStoreTrackForAutoPlay
+    ) {
       return {
         appId: STORE_TRACK_APP_ID,
         path: latestStoreTrackForAutoPlay.path,
@@ -2316,12 +2441,18 @@ const refreshAutoPlaybackTrackCache = async () => {
   }
 };
 
+const handleLaunchStopModeChanged = () => {
+  void refreshRunningGameState();
+  scheduleAutoPlaybackFromContext();
+};
+
 const startAutoPlaybackCoordinator = () => {
   if (autoPlaybackStarted) {
     return;
   }
   autoPlaybackStarted = true;
   ambientInterruptionModeRuntime = readAmbientInterruptionModeSetting();
+  launchStopModeRuntime = readLaunchStopModeSetting();
   startDesktopModeWatcher();
   startRunningGameWatcher();
   refreshAutoPlaybackTrackCache();
@@ -2334,6 +2465,10 @@ const startAutoPlaybackCoordinator = () => {
     scheduleAutoPlaybackFromContext
   );
   window.addEventListener(
+    STORE_TRACK_ENABLED_EVENT,
+    scheduleAutoPlaybackFromContext
+  );
+  window.addEventListener(
     AMBIENT_DISABLE_STORE_EVENT,
     scheduleAutoPlaybackFromContext
   );
@@ -2341,6 +2476,7 @@ const startAutoPlaybackCoordinator = () => {
     AMBIENT_INTERRUPTION_MODE_EVENT,
     scheduleAutoPlaybackFromContext
   );
+  window.addEventListener(LAUNCH_STOP_MODE_EVENT, handleLaunchStopModeChanged);
   window.addEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
   refreshStoreContext();
   autoPlaybackRouteInterval = window.setInterval(() => {
@@ -2363,12 +2499,20 @@ const stopAutoPlaybackCoordinator = () => {
     scheduleAutoPlaybackFromContext
   );
   window.removeEventListener(
+    STORE_TRACK_ENABLED_EVENT,
+    scheduleAutoPlaybackFromContext
+  );
+  window.removeEventListener(
     AMBIENT_DISABLE_STORE_EVENT,
     scheduleAutoPlaybackFromContext
   );
   window.removeEventListener(
     AMBIENT_INTERRUPTION_MODE_EVENT,
     scheduleAutoPlaybackFromContext
+  );
+  window.removeEventListener(
+    LAUNCH_STOP_MODE_EVENT,
+    handleLaunchStopModeChanged
   );
   window.removeEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
   stopDesktopModeWatcher();
@@ -2522,6 +2666,13 @@ const useGlobalAmbientEnabledSetting = (): [boolean, (value: boolean) => void] =
     GLOBAL_AMBIENT_ENABLED_EVENT
   );
 
+const useStoreTrackEnabledSetting = (): [boolean, (value: boolean) => void] =>
+  useBooleanPreference(
+    readStoreTrackEnabledSetting,
+    persistStoreTrackEnabledSetting,
+    STORE_TRACK_ENABLED_EVENT
+  );
+
 const useAmbientInterruptionModeSetting = (): [
   AmbientInterruptionMode,
   (value: AmbientInterruptionMode) => void
@@ -2558,6 +2709,31 @@ const useAmbientInterruptionModeSetting = (): [
   return [mode, update];
 };
 
+const useLaunchStopModeSetting = (): [
+  LaunchStopMode,
+  (value: LaunchStopMode) => void
+] => {
+  const [mode, setMode] = useState<LaunchStopMode>(readLaunchStopModeSetting());
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<LaunchStopMode>).detail;
+      setMode(parseLaunchStopMode(detail));
+    };
+    window.addEventListener(LAUNCH_STOP_MODE_EVENT, handler as EventListener);
+    return () =>
+      window.removeEventListener(LAUNCH_STOP_MODE_EVENT, handler as EventListener);
+  }, []);
+
+  const update = useCallback((value: LaunchStopMode) => {
+    const normalized = parseLaunchStopMode(value);
+    setMode(normalized);
+    persistLaunchStopModeSetting(normalized);
+  }, []);
+
+  return [mode, update];
+};
+
 
 const Content = () => {
   const {
@@ -2573,10 +2749,12 @@ const Content = () => {
   const [autoPlay, setAutoPlay] = useAutoPlaySetting();
   const [globalAmbientEnabled, setGlobalAmbientEnabled] =
     useGlobalAmbientEnabledSetting();
+  const [storeTrackEnabled, setStoreTrackEnabled] = useStoreTrackEnabledSetting();
   const [ambientDisableStore, setAmbientDisableStore] =
     useAmbientDisableStoreSetting();
   const [ambientInterruptionMode, setAmbientInterruptionMode] =
     useAmbientInterruptionModeSetting();
+  const [launchStopMode, setLaunchStopMode] = useLaunchStopModeSetting();
   const [ytDlpStatus, setYtDlpStatus] = useState<YtDlpStatus>({
     installed: false,
   });
@@ -3698,256 +3876,18 @@ const Content = () => {
       <PanelSection>
         <PanelSectionRow>
           <div style={{ width: "100%", paddingTop: "0.2rem" }}>
-            <div style={{ fontSize: "0.85rem", opacity: 0.7 }}>
-              Build timestamp:
+            <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>
+              February 25, 2026 (v2.5.2)
             </div>
-            <div style={{ fontSize: "0.85rem", opacity: 0.9, fontFamily: "monospace" }}>
-              {BUILD_ID}
+            <div style={{ fontSize: "0.86rem", opacity: 0.88, marginTop: "0.25rem" }}>
+              To assign music tracks, go to a game's page, select the "gear" icon, then "Choose ThemeDeck music..."
             </div>
             <hr style={{ margin: "0.4rem 0" }} />
           </div>
         </PanelSectionRow>
       </PanelSection>
-      <div style={{ marginTop: "-0.35rem" }}>
-        <PanelSection title="Instructions">
-          <PanelSectionRow>
-            <Focusable style={{ width: "100%", paddingBottom: "0.4rem" }}>
-              To assign music to a game page, open that game's details screen,
-              choose <em>Settings</em>, then select <em>Choose ThemeDeck music…</em> to
-              browse for a local file or search/download from YouTube.
-              <br />
-              <br />
-              Supported formats include {AUDIO_EXTENSIONS_LABEL}.
-              <br />
-              <br />
-              <span style={{ color: "#ff7f7f", fontWeight: 700 }}>
-                Only update yt-dlp if YouTube search doesn't work.
-              </span>
-            </Focusable>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div
-              style={{
-                width: "100%",
-                display: "flex",
-                flexDirection: "column",
-                gap: "0.35rem",
-                alignItems: "stretch",
-              }}
-            >
-              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                {ytDlpStatus.installed
-                  ? `yt-dlp ${ytDlpStatus.version || ""}`.trim()
-                  : "yt-dlp not installed"}
-              </div>
-                <button
-                  className="DialogButton themedeck-fit themedeck-wrap"
-                  onClick={handleUpdateYtDlp}
-                  disabled={ytDlpBusy}
-                  style={{
-                    textAlign: "left",
-                    fontSize: "0.92rem",
-                    paddingRight: "0.65rem",
-                    paddingLeft: "0.65rem",
-                  }}
-                >
-                  {ytDlpBusy ? "Updating..." : "Update yt-dlp"}
-                </button>
-            </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div style={{ width: "100%" }}>
-              <div style={{ fontWeight: 600 }}>Auto-assign missing game tracks (yt-dlp)</div>
-              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                Uses first YouTube result per game and only targets games with no assigned track.
-              </div>
-              <div style={{ opacity: 0.95, fontSize: "0.88rem", marginTop: "0.25rem", fontWeight: 600 }}>
-                Games currently without music assigned: {unassignedLibraryGameCount}
-              </div>
-              <div style={{ opacity: 0.75, fontSize: "0.8rem", marginTop: "0.15rem" }}>
-                Total library games detected: {libraryGames.length}
-              </div>
-              <div
-                style={{
-                  marginTop: "0.5rem",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.35rem",
-                  alignItems: "stretch",
-                }}
-              >
-                <button
-                  className="DialogButton themedeck-fit themedeck-wrap"
-                  onClick={handleAutoAssignMissingTracks}
-                  disabled={
-                    bulkAssign.running || ytDlpBusy || !ytDlpStatus.installed
-                  }
-                  style={{
-                    textAlign: "left",
-                    fontSize: "0.92rem",
-                    paddingRight: "0.65rem",
-                    paddingLeft: "0.65rem",
-                  }}
-                >
-                  {bulkAssign.running ? "Running..." : "Auto-assign missing"}
-                </button>
-                <button
-                  className="DialogButton themedeck-fit themedeck-wrap"
-                  onClick={handleStopBulkAssign}
-                  disabled={!bulkAssign.running}
-                  style={{
-                    fontSize: "0.92rem",
-                    paddingRight: "0.65rem",
-                    paddingLeft: "0.65rem",
-                  }}
-                >
-                  STOP
-                </button>
-              </div>
-              {(bulkAssign.running || bulkAssign.message) && (
-                <div style={{ marginTop: "0.55rem" }}>
-                  <div
-                    style={{
-                      width: "100%",
-                      height: "0.55rem",
-                      borderRadius: "0.35rem",
-                      background: "rgba(255,255,255,0.18)",
-                      overflow: "hidden",
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: `${
-                          bulkAssign.total > 0
-                            ? Math.min(
-                                100,
-                                Math.round((bulkAssign.completed / bulkAssign.total) * 100)
-                              )
-                            : 0
-                        }%`,
-                        height: "100%",
-                        background: "rgba(98, 168, 255, 0.95)",
-                        transition: "width 0.2s ease",
-                      }}
-                    />
-                  </div>
-                  <div style={{ marginTop: "0.35rem", fontSize: "0.82rem", opacity: 0.85 }}>
-                    {bulkAssign.completed}/{bulkAssign.total} completed
-                    {" • "}assigned {bulkAssign.assigned}
-                  </div>
-                  <div style={{ marginTop: "0.15rem", fontSize: "0.82rem", opacity: 0.85 }}>
-                    skipped {bulkAssign.skipped}
-                    {" • "}failed {bulkAssign.failed}
-                  </div>
-                  {bulkAssign.currentGame && (
-                    <div style={{ marginTop: "0.2rem", fontSize: "0.82rem", opacity: 0.85 }}>
-                      Current game: {bulkAssign.currentGame}
-                      {bulkAssign.stopRequested ? " (stopping...)" : ""}
-                    </div>
-                  )}
-                  {!!bulkAssign.message && (
-                    <div style={{ marginTop: "0.2rem", fontSize: "0.82rem", opacity: 0.85 }}>
-                      {bulkAssign.message}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div
-              style={{
-                width: "100%",
-                display: "flex",
-                flexDirection: "column",
-                gap: "0.45rem",
-              }}
-            >
-              <button
-                className="DialogButton themedeck-fit themedeck-wrap"
-                onClick={() => setShowMissingGames((prev) => !prev)}
-                style={{
-                  textAlign: "left",
-                  fontSize: "0.92rem",
-                  paddingRight: "0.65rem",
-                  paddingLeft: "0.65rem",
-                }}
-              >
-                {showMissingGames ? "Hide games without music" : "Show games without music"}
-              </button>
-              {showMissingGames ? (
-                <div
-                  style={{
-                    width: "100%",
-                    borderRadius: "0.4rem",
-                    background: "rgba(255,255,255,0.05)",
-                    padding: "0.55rem 0.65rem",
-                    maxHeight: "16rem",
-                    overflowY: "auto",
-                    overflowX: "hidden",
-                  }}
-                >
-                  {missingGameNameStats.total > 0 ? (
-                    <>
-                      <div style={{ fontSize: "0.82rem", opacity: 0.9, marginBottom: "0.35rem" }}>
-                        {missingGameNameStats.resolved}/{missingGameNameStats.total} names resolved
-                        {" • "}pending {missingGameNameStats.pending}
-                        {" • "}unavailable {missingGameNameStats.failed}
-                        {missingResolveInFlightCount > 0
-                          ? ` • checking ${missingResolveInFlightCount}`
-                          : ""}
-                      </div>
-                      <div
-                        style={{
-                          width: "100%",
-                          height: "0.5rem",
-                          borderRadius: "0.35rem",
-                          background: "rgba(255,255,255,0.16)",
-                          overflow: "hidden",
-                          marginBottom: "0.45rem",
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: `${missingGameNameStats.percent}%`,
-                            height: "100%",
-                            background: "rgba(98, 168, 255, 0.95)",
-                            transition: "width 0.25s ease",
-                          }}
-                        />
-                      </div>
-                      {missingGameNameStats.pending > 0 && missingGamesList.length === 0 ? (
-                        <div style={{ opacity: 0.8, fontSize: "0.86rem", marginBottom: "0.25rem" }}>
-                          Resolving game names...
-                        </div>
-                      ) : null}
-                      {missingGamesList.map((game) => (
-                        <div
-                          key={game.appid}
-                          style={{
-                            padding: "0.22rem 0",
-                            fontSize: "0.86rem",
-                            overflowWrap: "anywhere",
-                            wordBreak: "break-word",
-                            color:
-                              game.status === "failed"
-                                ? "rgba(255, 200, 200, 0.92)"
-                                : "inherit",
-                          }}
-                        >
-                          {game.name} ({game.appid})
-                        </div>
-                      ))}
-                    </>
-                  ) : (
-                    <div style={{ opacity: 0.8, fontSize: "0.86rem" }}>
-                      No games are missing music.
-                    </div>
-                  )}
-                </div>
-              ) : null}
-            </div>
-          </PanelSectionRow>
+      <div style={{ marginTop: "-0.75rem" }}>
+        <PanelSection>
           <PanelSectionRow>
             <ToggleField
               checked={autoPlay}
@@ -3957,12 +3897,86 @@ const Content = () => {
             />
           </PanelSectionRow>
           <PanelSectionRow>
+            <div style={{ width: "100%" }}>
+              <div style={{ fontWeight: 600 }}>
+                Stop music after pressing Play
+              </div>
+              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
+                Choose when ThemeDeck music should stop during game launch:
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.35rem",
+                  marginTop: "0.45rem",
+                }}
+                role="radiogroup"
+                aria-label="Stop music timing on launch"
+              >
+                {(
+                  [
+                    {
+                      value: "launch_start",
+                      label: "At launch start",
+                    },
+                    {
+                      value: "game_started",
+                      label: "At launch finish",
+                    },
+                  ] as Array<{ value: LaunchStopMode; label: string }>
+                ).map((option) => (
+                  <button
+                    key={option.value}
+                    className="DialogButton themedeck-fit themedeck-wrap"
+                    onClick={() => setLaunchStopMode(option.value)}
+                    role="radio"
+                    aria-checked={launchStopMode === option.value}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "0.5rem",
+                      justifyContent: "flex-start",
+                      width: "100%",
+                      boxSizing: "border-box",
+                      whiteSpace: "normal",
+                      textAlign: "left",
+                      fontSize: "0.92rem",
+                      paddingRight: "0.65rem",
+                      paddingLeft: "0.65rem",
+                      border:
+                        launchStopMode === option.value
+                          ? "1px solid rgba(120, 180, 255, 0.85)"
+                          : undefined,
+                    }}
+                  >
+                    <span style={{ minWidth: "1.4rem", textAlign: "center" }}>
+                      {launchStopMode === option.value ? "(x)" : "( )"}
+                    </span>
+                    <span>{option.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
             <ToggleField
               checked={globalAmbientEnabled}
               label="Enable global/ambient track"
               description="Keep global track assigned, but toggle its playback on non-game pages."
               onChange={(value) => {
                 setGlobalAmbientEnabled(value);
+                scheduleAutoPlaybackFromContext();
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              checked={storeTrackEnabled}
+              label="Enable store track"
+              description="Keep store track assigned, but toggle its playback on store pages."
+              onChange={(value) => {
+                setStoreTrackEnabled(value);
                 scheduleAutoPlaybackFromContext();
               }}
             />
@@ -4073,8 +4087,237 @@ const Content = () => {
               Choose store-only track...
             </button>
           </PanelSectionRow>
+          <PanelSectionRow>
+            <div
+              style={{
+                width: "100%",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.4rem",
+                alignItems: "stretch",
+              }}
+            >
+              <div style={{ color: "#ff6b6b", fontWeight: 700, fontSize: "0.86rem" }}>
+                Only update yt-dlp if YouTube search doesn't work.
+              </div>
+              <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
+                {ytDlpStatus.installed
+                  ? `yt-dlp ${ytDlpStatus.version || ""}`.trim()
+                  : "yt-dlp not installed"}
+              </div>
+              <button
+                className="DialogButton themedeck-fit themedeck-wrap"
+                onClick={handleUpdateYtDlp}
+                disabled={ytDlpBusy}
+                style={{
+                  textAlign: "left",
+                  fontSize: "0.92rem",
+                  paddingRight: "0.65rem",
+                  paddingLeft: "0.65rem",
+                  color: "#ff6b6b",
+                  border: "1px solid rgba(255, 107, 107, 0.7)",
+                }}
+              >
+                {ytDlpBusy ? "Updating..." : "Update yt-dlp"}
+              </button>
+            </div>
+          </PanelSectionRow>
         </PanelSection>
       </div>
+      <PanelSection title="Auto-assign missing game tracks (yt-dlp)">
+        <PanelSectionRow>
+          <div style={{ width: "100%" }}>
+            <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
+              Uses first YouTube result per game and only targets games with no assigned track.
+            </div>
+            <div style={{ opacity: 0.95, fontSize: "0.88rem", marginTop: "0.25rem", fontWeight: 600 }}>
+              Games currently without music assigned: {unassignedLibraryGameCount}
+            </div>
+            <div style={{ opacity: 0.75, fontSize: "0.8rem", marginTop: "0.15rem" }}>
+              Total library games detected: {libraryGames.length}
+            </div>
+            <div
+              style={{
+                marginTop: "0.5rem",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.35rem",
+                alignItems: "stretch",
+              }}
+            >
+              <button
+                className="DialogButton themedeck-fit themedeck-wrap"
+                onClick={handleAutoAssignMissingTracks}
+                disabled={
+                  bulkAssign.running || ytDlpBusy || !ytDlpStatus.installed
+                }
+                style={{
+                  textAlign: "left",
+                  fontSize: "0.92rem",
+                  paddingRight: "0.65rem",
+                  paddingLeft: "0.65rem",
+                }}
+              >
+                {bulkAssign.running ? "Running..." : "Auto-assign missing"}
+              </button>
+              <button
+                className="DialogButton themedeck-fit themedeck-wrap"
+                onClick={handleStopBulkAssign}
+                disabled={!bulkAssign.running}
+                style={{
+                  fontSize: "0.92rem",
+                  paddingRight: "0.65rem",
+                  paddingLeft: "0.65rem",
+                }}
+              >
+                STOP
+              </button>
+            </div>
+            {(bulkAssign.running || bulkAssign.message) && (
+              <div style={{ marginTop: "0.55rem" }}>
+                <div
+                  style={{
+                    width: "100%",
+                    height: "0.55rem",
+                    borderRadius: "0.35rem",
+                    background: "rgba(255,255,255,0.18)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      width: `${
+                        bulkAssign.total > 0
+                          ? Math.min(
+                              100,
+                              Math.round((bulkAssign.completed / bulkAssign.total) * 100)
+                            )
+                          : 0
+                      }%`,
+                      height: "100%",
+                      background: "rgba(98, 168, 255, 0.95)",
+                      transition: "width 0.2s ease",
+                    }}
+                  />
+                </div>
+                <div style={{ marginTop: "0.35rem", fontSize: "0.82rem", opacity: 0.85 }}>
+                  {bulkAssign.completed}/{bulkAssign.total} completed
+                  {" • "}assigned {bulkAssign.assigned}
+                </div>
+                <div style={{ marginTop: "0.15rem", fontSize: "0.82rem", opacity: 0.85 }}>
+                  skipped {bulkAssign.skipped}
+                  {" • "}failed {bulkAssign.failed}
+                </div>
+                {bulkAssign.currentGame && (
+                  <div style={{ marginTop: "0.2rem", fontSize: "0.82rem", opacity: 0.85 }}>
+                    Current game: {bulkAssign.currentGame}
+                    {bulkAssign.stopRequested ? " (stopping...)" : ""}
+                  </div>
+                )}
+                {!!bulkAssign.message && (
+                  <div style={{ marginTop: "0.2rem", fontSize: "0.82rem", opacity: 0.85 }}>
+                    {bulkAssign.message}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div
+            style={{
+              width: "100%",
+              display: "flex",
+              flexDirection: "column",
+              gap: "0.45rem",
+            }}
+          >
+            <button
+              className="DialogButton themedeck-fit themedeck-wrap"
+              onClick={() => setShowMissingGames((prev) => !prev)}
+              style={{
+                textAlign: "left",
+                fontSize: "0.92rem",
+                paddingRight: "0.65rem",
+                paddingLeft: "0.65rem",
+              }}
+            >
+              {showMissingGames ? "Hide games without music" : "Show games without music"}
+            </button>
+            {showMissingGames ? (
+              <div
+                style={{
+                  width: "100%",
+                  borderRadius: "0.4rem",
+                  background: "rgba(255,255,255,0.05)",
+                  padding: "0.55rem 0.65rem",
+                  maxHeight: "16rem",
+                  overflowY: "auto",
+                  overflowX: "hidden",
+                }}
+              >
+                {missingGameNameStats.total > 0 ? (
+                  <>
+                    <div style={{ fontSize: "0.82rem", opacity: 0.9, marginBottom: "0.35rem" }}>
+                      {missingGameNameStats.resolved}/{missingGameNameStats.total} names resolved
+                      {" • "}pending {missingGameNameStats.pending}
+                      {" • "}unavailable {missingGameNameStats.failed}
+                      {missingResolveInFlightCount > 0
+                        ? ` • checking ${missingResolveInFlightCount}`
+                        : ""}
+                    </div>
+                    <div
+                      style={{
+                        width: "100%",
+                        height: "0.5rem",
+                        borderRadius: "0.35rem",
+                        background: "rgba(255,255,255,0.16)",
+                        overflow: "hidden",
+                        marginBottom: "0.45rem",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${missingGameNameStats.percent}%`,
+                          height: "100%",
+                          background: "rgba(98, 168, 255, 0.95)",
+                          transition: "width 0.25s ease",
+                        }}
+                      />
+                    </div>
+                    {missingGameNameStats.pending > 0 && missingGamesList.length === 0 ? (
+                      <div style={{ opacity: 0.8, fontSize: "0.86rem", marginBottom: "0.25rem" }}>
+                        Resolving game names...
+                      </div>
+                    ) : null}
+                    {missingGamesList.map((game) => (
+                      <div
+                        key={game.appid}
+                        style={{
+                          padding: "0.22rem 0",
+                          fontSize: "0.86rem",
+                          overflowWrap: "anywhere",
+                          wordBreak: "break-word",
+                          color:
+                            game.status === "failed"
+                              ? "rgba(255, 200, 200, 0.92)"
+                              : "inherit",
+                        }}
+                      >
+                        {game.name} ({game.appid})
+                      </div>
+                    ))}
+                  </>
+                ) : (
+                  <div style={{ opacity: 0.8, fontSize: "0.86rem" }}>
+                    No games are missing music.
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        </PanelSectionRow>
+      </PanelSection>
       <PanelSection title="Global / ambient track">
         {!globalTrack ? (
           <PanelSectionRow>

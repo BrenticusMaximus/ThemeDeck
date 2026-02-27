@@ -1,5 +1,41 @@
 # ThemeDeck Documentation
 
+<a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
+## Overview
+
+ThemeDeck lets you add and manage custom music across your Steam library and key Steam UI pages.
+
+## Main Features
+
+- Add custom music to any game page in your library.
+- Use either local music files or YouTube search to find tracks.
+- Preview tracks before assigning them.
+- One-tap "Download & Assign" from YouTube results.
+- Auto-fill search terms based on the game you selected.
+- Highlight which YouTube result is already assigned.
+- Set per-game volume.
+- Skip silent intros with per-game "truncate start" timing.
+- Remove or change a game's assigned track at any time.
+- Auto-play music when opening game pages.
+- Assign a global/ambient track for non-game areas.
+- Assign a separate store-only track for Steam Store pages.
+- Choose how ambient music behaves when interrupted (stop, pause, or mute until return).
+- Optionally disable ambient music while in the Steam Store.
+- Prevent all plugin music from playing in Desktop Mode.
+- Prevent all plugin music from playing while a game is launched/running.
+- Bulk auto-assign music to games that don’t have tracks yet.
+- See live bulk progress and stop the process anytime.
+- View a list of games still missing music.
+- See live name-loading progress while that missing-games list is built.
+- Works with both installed and uninstalled games in your library.
+
+## Release Updates
+
+## February 27, 2026 Update (v2.5.2)
+
+This update finalizes v2.5.2 with UI refinements, including a dedicated store-track enable control in settings and updated in-plugin version labeling.
+
 ## February 25, 2026 Update (v2.5.1)
 
 This update fixes a critical launch-state issue by ensuring ThemeDeck never plays global/ambient music or game-page theme music while a game is running.
@@ -37,35 +73,5 @@ This update adds a per-game **Truncate beginning of song** setting (0-30 seconds
 This update adds **YouTube search/download support powered by `yt-dlp`** so users can search game music, preview tracks, download locally, and assign directly from ThemeDeck. You still have the option to manually assign local music tracks.
 
 ![ThemeDeck February 19 2026 update thumbnail](https://images.steamusercontent.com/ugc/10217922894651388729/0056712F90842A587703E222C9AD211D53B2344E/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
-
-<a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
-
-## Overview
-
-ThemeDeck lets you add and manage custom music across your Steam library and key Steam UI pages.
-
-## Main Features
-
-- Add custom music to any game page in your library.
-- Use either local music files or YouTube search to find tracks.
-- Preview tracks before assigning them.
-- One-tap "Download & Assign" from YouTube results.
-- Auto-fill search terms based on the game you selected.
-- Highlight which YouTube result is already assigned.
-- Set per-game volume.
-- Skip silent intros with per-game "truncate start" timing.
-- Remove or change a game's assigned track at any time.
-- Auto-play music when opening game pages.
-- Assign a global/ambient track for non-game areas.
-- Assign a separate store-only track for Steam Store pages.
-- Choose how ambient music behaves when interrupted (stop, pause, or mute until return).
-- Optionally disable ambient music while in the Steam Store.
-- Prevent all plugin music from playing in Desktop Mode.
-- Prevent all plugin music from playing while a game is launched/running.
-- Bulk auto-assign music to games that don’t have tracks yet.
-- See live bulk progress and stop the process anytime.
-- View a list of games still missing music.
-- See live name-loading progress while that missing-games list is built.
-- Works with both installed and uninstalled games in your library.
 
 <a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
