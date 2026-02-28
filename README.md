@@ -34,6 +34,10 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Release Updates
 
+## February 28, 2026 Update (v2.5.3)
+
+This update improves playback stability so global/ambient audio no longer conflicts with per-game playback during navigation/launch transitions, and adds per-track loop control (game, global, and store tracks) so each assigned track can loop or play once.
+
 ## February 27, 2026 Update (v2.5.2)
 
 This update gives users finer control over when game music stops playing: at launch start or at launch finish. It also adds a dedicated store-track enable/disable control.

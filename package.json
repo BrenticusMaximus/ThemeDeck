@@ -1,6 +1,6 @@
 {
   "name": "themedeck",
-  "version": "2.5.2",
+  "version": "2.5.3",
   "description": "ThemeDeck plays game, global, and store-specific music tracks based on where you are in Gaming Mode.",
   "type": "module",
   "scripts": {

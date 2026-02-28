@@ -49,6 +49,7 @@ type BackendTrack = {
   filename?: string;
   volume?: number;
   start_offset?: number;
+  loop?: boolean;
 };
 
 type RawTrackMap = Record<string, BackendTrack>;
@@ -59,6 +60,7 @@ type GameTrack = {
   filename: string;
   volume: number;
   startOffset: number;
+  loop: boolean;
   resumeTime?: number;
 };
 
@@ -115,6 +117,7 @@ type GlobalTrack = {
   filename: string;
   volume: number;
   startOffset: number;
+  loop: boolean;
 };
 type StoreTrack = GlobalTrack;
 type AmbientInterruptionMode = "stop" | "pause" | "mute";
@@ -189,11 +192,20 @@ const updateTrackStartOffset = callable<
   [appId: number, startOffset: number],
   RawTrackMap
 >("set_start_offset");
+const updateTrackLoop = callable<[appId: number, loop: boolean], RawTrackMap>(
+  "set_loop"
+);
 const updateGlobalStartOffset = callable<[startOffset: number], BackendTrack>(
   "set_global_start_offset"
 );
+const updateGlobalLoop = callable<[loop: boolean], BackendTrack>(
+  "set_global_loop"
+);
 const updateStoreStartOffset = callable<[startOffset: number], BackendTrack>(
   "set_store_start_offset"
+);
+const updateStoreLoop = callable<[loop: boolean], BackendTrack>(
+  "set_store_loop"
 );
 const listDirectory = callable<[path?: string], DirectoryListing>("list_directory");
 const loadTrackAudio = callable<[path: string], AudioPayload>("load_track_audio");
@@ -235,6 +247,7 @@ const UI_MODE_DESKTOP = 7;
 const UI_MODE_POLL_MS = 2000;
 const UI_MODE_CACHE_MS = 1000;
 const RUNNING_APP_POLL_MS = 1250;
+const LAUNCH_FINISH_FALLBACK_MS = 8000;
 const SP_TAB_CANDIDATES = [
   "SP",
   "sp",
@@ -292,10 +305,12 @@ let desktopModeRefreshInFlight: Promise<boolean> | null = null;
 let uiModePollInterval: number | null = null;
 let stopUIModeSubscription: (() => void) | null = null;
 let runningGameAppId: number | null = null;
+let launchActivityAppId: number | null = null;
 let runningAppPollInterval: number | null = null;
 let runningAppRetry: number | null = null;
 let runningAppRefreshInFlight = false;
 const runningAppSubscriptions: Array<() => void> = [];
+const launchingAppFirstSeenAtMs = new Map<number, number>();
 let launchStopModeRuntime: LaunchStopMode = "launch_start";
 let globalAmbientResumeSnapshot: {
   path: string;
@@ -460,10 +475,17 @@ const notifyPlayback = (next: PlaybackState) => {
 };
 
 const ensureAudio = () => {
+  const sharedFromWindow = (window as any).__themedeckSharedAudio as
+    | HTMLAudioElement
+    | undefined;
+  if (sharedFromWindow && sharedAudio !== sharedFromWindow) {
+    sharedAudio = sharedFromWindow;
+  }
   if (!sharedAudio) {
     sharedAudio = new Audio();
     sharedAudio.loop = true;
     sharedAudio.preload = "auto";
+    (window as any).__themedeckSharedAudio = sharedAudio;
   }
   return sharedAudio;
 };
@@ -769,6 +791,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       audio.src = nextUrl;
     }
 
+    audio.loop = track.loop !== false;
     audio.volume = clamp(track.volume ?? 1);
     const configuredOffset = clamp(track.startOffset ?? 0, 0, 30);
     const offset =
@@ -856,6 +879,16 @@ const applyStartOffsetToActiveTrack = (appId: number, startOffset: number) => {
   } catch (_ignored) {
     // no-op
   }
+};
+
+const applyLoopToActiveTrack = (appId: number, loop: boolean) => {
+  if (!sharedAudio) {
+    return;
+  }
+  if (playbackState.appId !== appId || playbackState.status !== "playing") {
+    return;
+  }
+  sharedAudio.loop = loop;
 };
 
 const notifyFocus = (appId: number | null) => {
@@ -1400,14 +1433,71 @@ const readRunningGameAppId = async (): Promise<number | null> => {
   ].forEach((value) => collectRunningAppStates(value, snapshot, true));
 
   const mode = getLaunchStopModeRuntime();
-  const ids =
-    mode === "game_started"
-      ? snapshot.started
-      : new Set<number>([...snapshot.started, ...snapshot.launching]);
+  if (mode === "game_started") {
+    const startedOnlyMethods: Array<{ owner: any; method: string }> = [
+      { owner: steamApps, method: "GetCurrentGameID" },
+      { owner: steamApps, method: "GetRunningGameID" },
+      { owner: appStore, method: "GetCurrentGameID" },
+      { owner: appStore, method: "GetRunningGameID" },
+    ];
+    for (const source of startedOnlyMethods) {
+      const fn = source.owner?.[source.method];
+      if (typeof fn !== "function") {
+        continue;
+      }
+      try {
+        const directAppId = extractAppId(await Promise.resolve(fn.call(source.owner)));
+        if (directAppId && isEligibleRunningAppId(directAppId)) {
+          snapshot.started.add(directAppId);
+        }
+      } catch (_ignored) {
+        // no-op
+      }
+    }
+  }
 
+  const now = Date.now();
+  for (const appId of Array.from(launchingAppFirstSeenAtMs.keys())) {
+    if (!snapshot.launching.has(appId)) {
+      launchingAppFirstSeenAtMs.delete(appId);
+    }
+  }
+  for (const appId of snapshot.launching.values()) {
+    if (!launchingAppFirstSeenAtMs.has(appId)) {
+      launchingAppFirstSeenAtMs.set(appId, now);
+    }
+  }
+
+  const ids = new Set<number>(snapshot.started);
+  if (mode !== "game_started") {
+    for (const appId of snapshot.launching.values()) {
+      ids.add(appId);
+    }
+  } else {
+    for (const appId of snapshot.launching.values()) {
+      const firstSeen = launchingAppFirstSeenAtMs.get(appId) ?? now;
+      if (now - firstSeen >= LAUNCH_FINISH_FALLBACK_MS) {
+        ids.add(appId);
+      }
+    }
+  }
+
+  const launchOrRunIds = new Set<number>([
+    ...snapshot.started.values(),
+    ...snapshot.launching.values(),
+  ]);
   const routeAppId = readAppIdFromLocation();
-  if (routeAppId && ids.has(routeAppId)) {
-    return routeAppId;
+  if (routeAppId && launchOrRunIds.has(routeAppId)) {
+    launchActivityAppId = routeAppId;
+  } else if (focusedAppId && launchOrRunIds.has(focusedAppId)) {
+    launchActivityAppId = focusedAppId;
+  } else {
+    launchActivityAppId = Array.from(launchOrRunIds.values()).sort((a, b) => a - b)[0] ?? null;
+  }
+
+  const routeCheckAppId = routeAppId;
+  if (routeCheckAppId && ids.has(routeCheckAppId)) {
+    return routeCheckAppId;
   }
   if (focusedAppId && ids.has(focusedAppId)) {
     return focusedAppId;
@@ -1522,6 +1612,8 @@ const stopRunningGameWatcher = () => {
   }
   runningAppRefreshInFlight = false;
   runningGameAppId = null;
+  launchActivityAppId = null;
+  launchingAppFirstSeenAtMs.clear();
 };
 
 const resolveLibraryContextMenu = () => {
@@ -1952,6 +2044,7 @@ const normalizeGlobalTrack = (
       typeof raw.start_offset === "number"
         ? clamp(raw.start_offset, 0, 30)
         : 0,
+    loop: raw.loop !== false,
   };
 };
 
@@ -1980,6 +2073,7 @@ const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
         typeof track.start_offset === "number"
           ? clamp(track.start_offset, 0, 30)
           : 0,
+      loop: track.loop !== false,
     };
   }
 
@@ -2253,7 +2347,19 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
     }
   }
 
+  if (launchActivityAppId && readAutoPlaySetting()) {
+    const launchedTrack = latestTracksForAutoPlay[launchActivityAppId];
+    if (launchedTrack) {
+      return launchedTrack;
+    }
+  }
+
   if (effectiveAppId) {
+    return null;
+  }
+
+  // Never promote global/store ambient while an app launch/run is in progress.
+  if (launchActivityAppId !== null) {
     return null;
   }
 
@@ -2265,6 +2371,7 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
       filename: latestStoreTrackForAutoPlay.filename,
       volume: latestStoreTrackForAutoPlay.volume,
       startOffset: latestStoreTrackForAutoPlay.startOffset,
+      loop: latestStoreTrackForAutoPlay.loop,
     };
   }
   if (inStore && readAmbientDisableStoreSetting()) {
@@ -2292,6 +2399,7 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
         filename: latestStoreTrackForAutoPlay.filename,
         volume: latestStoreTrackForAutoPlay.volume,
         startOffset: latestStoreTrackForAutoPlay.startOffset,
+        loop: latestStoreTrackForAutoPlay.loop,
       };
     }
     if (playbackState.appId === GLOBAL_AMBIENT_APP_ID && latestGlobalTrackForAutoPlay) {
@@ -2302,6 +2410,7 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
         filename: latestGlobalTrackForAutoPlay.filename,
         volume: latestGlobalTrackForAutoPlay.volume,
         startOffset: latestGlobalTrackForAutoPlay.startOffset,
+        loop: latestGlobalTrackForAutoPlay.loop,
         resumeTime,
       };
     }
@@ -2324,6 +2433,7 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
     filename: latestGlobalTrackForAutoPlay.filename,
     volume: latestGlobalTrackForAutoPlay.volume,
     startOffset: latestGlobalTrackForAutoPlay.startOffset,
+    loop: latestGlobalTrackForAutoPlay.loop,
     resumeTime,
   };
 };
@@ -2343,6 +2453,19 @@ const applyAutoPlaybackFromContext = () => {
       }
       stopPlayback(true);
     }
+    return;
+  }
+
+  if (
+    launchActivityAppId !== null &&
+    playbackState.status === "playing" &&
+    (playbackState.appId === GLOBAL_AMBIENT_APP_ID ||
+      playbackState.appId === STORE_TRACK_APP_ID)
+  ) {
+    if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
+      captureGlobalAmbientResumeSnapshot();
+    }
+    stopPlayback(true);
     return;
   }
 
@@ -3592,6 +3715,7 @@ const Content = () => {
         filename: globalTrack.filename,
         volume: globalTrack.volume,
         startOffset: globalTrack.startOffset,
+        loop: globalTrack.loop,
       },
       "manual"
     );
@@ -3643,6 +3767,28 @@ const Content = () => {
     }
   };
 
+  const handleGlobalLoopChange = async (value: boolean) => {
+    if (!globalTrack) return;
+    const nextGlobal = { ...globalTrack, loop: value };
+    setGlobalTrack(nextGlobal);
+    latestGlobalTrackForAutoPlay = nextGlobal;
+    applyLoopToActiveTrack(GLOBAL_AMBIENT_APP_ID, value);
+    try {
+      const updated = await updateGlobalLoop(value);
+      const normalized = normalizeGlobalTrack(updated);
+      setGlobalTrack(normalized);
+      latestGlobalTrackForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+    } catch (error) {
+      console.error("[ThemeDeck] global loop update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save global track loop setting",
+      });
+    }
+  };
+
   const handleRemoveGlobalTrack = async () => {
     if (!globalTrack) return;
     try {
@@ -3682,6 +3828,7 @@ const Content = () => {
         filename: storeTrack.filename,
         volume: storeTrack.volume,
         startOffset: storeTrack.startOffset,
+        loop: storeTrack.loop,
       },
       "manual"
     );
@@ -3729,6 +3876,28 @@ const Content = () => {
       toaster.toast({
         title: "ThemeDeck",
         body: "Couldn't save store song start truncation",
+      });
+    }
+  };
+
+  const handleStoreLoopChange = async (value: boolean) => {
+    if (!storeTrack) return;
+    const nextStore = { ...storeTrack, loop: value };
+    setStoreTrack(nextStore);
+    latestStoreTrackForAutoPlay = nextStore;
+    applyLoopToActiveTrack(STORE_TRACK_APP_ID, value);
+    try {
+      const updated = await updateStoreLoop(value);
+      const normalized = normalizeGlobalTrack(updated);
+      setStoreTrack(normalized);
+      latestStoreTrackForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      scheduleAutoPlaybackFromContext();
+    } catch (error) {
+      console.error("[ThemeDeck] store loop update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save store track loop setting",
       });
     }
   };
@@ -3814,6 +3983,28 @@ const Content = () => {
     }
   };
 
+  const handleLoopChange = async (appId: number, value: boolean) => {
+    setTracks((prev) => ({
+      ...prev,
+      [appId]: {
+        ...prev[appId],
+        loop: value,
+      },
+    }));
+    applyLoopToActiveTrack(appId, value);
+    try {
+      const updated = await updateTrackLoop(appId, value);
+      setTracks(normalizeTracks(updated));
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+    } catch (error) {
+      console.error("[ThemeDeck] loop update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save loop setting",
+      });
+    }
+  };
+
   useEffect(() => {
     topFocusRef.current?.focus();
   }, []);
@@ -3877,7 +4068,7 @@ const Content = () => {
         <PanelSectionRow>
           <div style={{ width: "100%", paddingTop: "0.2rem" }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>
-              February 25, 2026 (v2.5.2)
+              February 25, 2026 (v2.5.3)
             </div>
             <div style={{ fontSize: "0.86rem", opacity: 0.88, marginTop: "0.25rem" }}>
               To assign music tracks, go to a game's page, select the "gear" icon, then "Choose ThemeDeck music..."
@@ -4405,6 +4596,14 @@ const Content = () => {
                   onChange={handleGlobalStartOffsetChange}
                 />
               </div>
+              <div style={{ marginTop: "0.35rem" }}>
+                <ToggleField
+                  checked={globalTrack.loop}
+                  label="Loop track"
+                  description="Play continuously when this track is active."
+                  onChange={handleGlobalLoopChange}
+                />
+              </div>
             </Focusable>
           </PanelSectionRow>
         )}
@@ -4494,6 +4693,14 @@ const Content = () => {
                   valueSuffix="s"
                   showValue
                   onChange={handleStoreStartOffsetChange}
+                />
+              </div>
+              <div style={{ marginTop: "0.35rem" }}>
+                <ToggleField
+                  checked={storeTrack.loop}
+                  label="Loop track"
+                  description="Play continuously when this track is active."
+                  onChange={handleStoreLoopChange}
                 />
               </div>
             </Focusable>
@@ -4633,6 +4840,14 @@ const Content = () => {
                     onChange={(value) =>
                       handleStartOffsetChange(track.appId, value)
                     }
+                  />
+                </div>
+                <div style={{ marginTop: "0.35rem" }}>
+                  <ToggleField
+                    checked={track.loop}
+                    label="Loop track"
+                    description="Play continuously when this track is active."
+                    onChange={(value) => handleLoopChange(track.appId, value)}
                   />
                 </div>
               </Focusable>

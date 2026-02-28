@@ -145,6 +145,7 @@ class Plugin:
                 "filename": filename,
                 "volume": self._tracks.get(key, {}).get("volume", 1.0),
                 "start_offset": self._tracks.get(key, {}).get("start_offset", 0.0),
+                "loop": bool(self._tracks.get(key, {}).get("loop", True)),
             }
             self._save_tracks()
             decky.logger.info(f"set_track stored app={app_id} path={resolved}")
@@ -203,6 +204,14 @@ class Plugin:
         self._save_tracks()
         return self._tracks
 
+    async def set_loop(self, app_id: int, loop: bool) -> dict[str, dict[str, Any]]:
+        key = str(app_id)
+        if key not in self._tracks:
+            raise ValueError(f"No track found for app {app_id}")
+        self._tracks[key]["loop"] = bool(loop)
+        self._save_tracks()
+        return self._tracks
+
     async def remove_track(self, app_id: int) -> dict[str, dict[str, Any]]:
         self._tracks.pop(str(app_id), None)
         self._save_tracks()
@@ -231,6 +240,7 @@ class Plugin:
                 "filename": filename,
                 "volume": previous.get("volume", 1.0),
                 "start_offset": previous.get("start_offset", 0.0),
+                "loop": bool(previous.get("loop", True)),
             }
             self._save_tracks()
             return self._tracks[self._global_track_key]
@@ -251,6 +261,13 @@ class Plugin:
         self._tracks[self._global_track_key]["start_offset"] = clamp_seconds(
             start_offset
         )
+        self._save_tracks()
+        return self._tracks[self._global_track_key]
+
+    async def set_global_loop(self, loop: bool) -> dict[str, Any]:
+        if self._global_track_key not in self._tracks:
+            raise ValueError("No global track found")
+        self._tracks[self._global_track_key]["loop"] = bool(loop)
         self._save_tracks()
         return self._tracks[self._global_track_key]
 
@@ -279,6 +296,7 @@ class Plugin:
                 "filename": filename,
                 "volume": previous.get("volume", 1.0),
                 "start_offset": previous.get("start_offset", 0.0),
+                "loop": bool(previous.get("loop", True)),
             }
             self._save_tracks()
             return self._tracks[self._store_track_key]
@@ -299,6 +317,13 @@ class Plugin:
         self._tracks[self._store_track_key]["start_offset"] = clamp_seconds(
             start_offset
         )
+        self._save_tracks()
+        return self._tracks[self._store_track_key]
+
+    async def set_store_loop(self, loop: bool) -> dict[str, Any]:
+        if self._store_track_key not in self._tracks:
+            raise ValueError("No store track found")
+        self._tracks[self._store_track_key]["loop"] = bool(loop)
         self._save_tracks()
         return self._tracks[self._store_track_key]
 
@@ -566,6 +591,15 @@ class Plugin:
         try:
             with self._tracks_file.open("r", encoding="utf-8") as handle:
                 self._tracks = json.load(handle)
+            changed = False
+            for key, track in list(self._tracks.items()):
+                if not isinstance(track, dict):
+                    continue
+                if "loop" not in track:
+                    track["loop"] = True
+                    changed = True
+            if changed:
+                self._save_tracks()
         except Exception as error:
             decky.logger.error(f"Failed to read tracks.json: {error}")
             self._tracks = {}
