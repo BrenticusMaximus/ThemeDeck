@@ -15,6 +15,7 @@ import {
   findInReactTree,
   createReactTreePatcher,
   appDetailsClasses,
+  gamepadContextMenuClasses,
   fakeRenderComponent,
   findModuleChild,
   MenuItem,
@@ -290,6 +291,9 @@ const audioCache = new Map<string, AudioCacheEntry>();
 let latestTracksForAutoPlay: TrackMap = {};
 let latestGlobalTrackForAutoPlay: GlobalTrack | null = null;
 let latestStoreTrackForAutoPlay: StoreTrack | null = null;
+let activeDetailRouteAppId: number | null = null;
+let activeDetailBridgeCount = 0;
+let contextMenuActiveAppId: number | null = null;
 let autoPlaybackTick: number | null = null;
 let autoPlaybackStarted = false;
 let stopAutoPlaybackSubscription: (() => void) | null = null;
@@ -894,6 +898,15 @@ const applyLoopToActiveTrack = (appId: number, loop: boolean) => {
 const notifyFocus = (appId: number | null) => {
   focusedAppId = appId;
   focusListeners.forEach((listener) => listener(appId));
+  scheduleAutoPlaybackFromContext();
+};
+
+const setContextMenuActiveAppId = (appId: number | null) => {
+  const normalized = appId && appId > 0 ? appId : null;
+  if (contextMenuActiveAppId === normalized) {
+    return;
+  }
+  contextMenuActiveAppId = normalized;
   scheduleAutoPlaybackFromContext();
 };
 
@@ -1840,7 +1853,18 @@ const patchContextMenuFocus = () => {
   const patches: {
     outer?: Patch;
     inner?: Patch;
+    unmount?: Patch;
   } = {};
+
+  if (typeof MenuComponent.prototype.componentWillUnmount === "function") {
+    patches.unmount = afterPatch(
+      MenuComponent.prototype,
+      "componentWillUnmount",
+      () => {
+        setContextMenuActiveAppId(null);
+      }
+    );
+  }
 
   patches.outer = afterPatch(
     MenuComponent.prototype,
@@ -1860,7 +1884,9 @@ const patchContextMenuFocus = () => {
       }
       if (appId) {
         state.appId = appId;
-        notifyFocus(appId);
+        setContextMenuActiveAppId(appId);
+        // Do not broadcast context-menu app focus into playback state.
+        // Autoplay should react only to actual game detail routes.
       }
 
       if (!patches.inner) {
@@ -1879,7 +1905,7 @@ const patchContextMenuFocus = () => {
                 const patched = patchMenuItems(menuItems, fallbackAppId);
                 if (patched) {
                   state.appId = patched;
-                  notifyFocus(patched);
+                  setContextMenuActiveAppId(patched);
                 }
                 return node;
               }
@@ -1897,7 +1923,7 @@ const patchContextMenuFocus = () => {
                   );
                   if (patched) {
                     state.appId = patched;
-                    notifyFocus(patched);
+                    setContextMenuActiveAppId(patched);
                   }
                 }
                 return shouldUpdate;
@@ -1910,7 +1936,7 @@ const patchContextMenuFocus = () => {
         const patched = patchMenuItems(component?.props?.children, appId);
         if (patched) {
           state.appId = patched;
-          notifyFocus(patched);
+          setContextMenuActiveAppId(patched);
         }
       }
 
@@ -1921,6 +1947,8 @@ const patchContextMenuFocus = () => {
   return () => {
     patches.outer?.unpatch();
     patches.inner?.unpatch();
+    patches.unmount?.unpatch();
+    setContextMenuActiveAppId(null);
   };
 };
 
@@ -1977,12 +2005,16 @@ const GameFocusBridge = () => {
   const appId = Number.isNaN(parsed) ? null : parsed;
 
   useEffect(() => {
+    activeDetailBridgeCount += 1;
+    activeDetailRouteAppId = appId;
     notifyFocus(appId);
     return () => {
-      // Route transitions can briefly unmount/remount detail pages; avoid pushing
-      // transient null focus that can cause ambient restart jitter.
+      activeDetailBridgeCount = Math.max(0, activeDetailBridgeCount - 1);
+      // Route transitions can briefly unmount/remount detail pages; delay clear
+      // so a replacement bridge can mount first.
       window.setTimeout(() => {
-        if (readAppIdFromLocation() === null) {
+        if (activeDetailBridgeCount === 0) {
+          activeDetailRouteAppId = null;
           notifyFocus(null);
         }
       }, 120);
@@ -2245,6 +2277,46 @@ const isThemeDeckRouteActive = (): boolean => {
   return false;
 };
 
+const isGamepadContextMenuVisible = (): boolean => {
+  try {
+    const modalClassName = String(
+      gamepadContextMenuClasses?.BasicContextMenuModal || ""
+    ).trim();
+    const activeClassName = String(gamepadContextMenuClasses?.active || "").trim();
+    if (!modalClassName) {
+      return false;
+    }
+    const nodes = Array.from(
+      document.getElementsByClassName(modalClassName)
+    ) as HTMLElement[];
+    for (const node of nodes) {
+      const style = window.getComputedStyle(node);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        Number(style.opacity || "1") === 0
+      ) {
+        continue;
+      }
+      const isMarkedActive =
+        (!!activeClassName &&
+          (node.classList.contains(activeClassName) ||
+            !!node.closest(`.${activeClassName}`))) ||
+        node.getAttribute("aria-hidden") === "false";
+      if (!isMarkedActive) {
+        continue;
+      }
+      const rect = node.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return true;
+      }
+    }
+  } catch (error) {
+    console.error("[ThemeDeck] context menu visibility probe failed", error);
+  }
+  return false;
+};
+
 const isStorePathSync = (): boolean => {
   if (getStoreRouteCandidates().some((route) => isStoreRoute(route))) {
     return true;
@@ -2337,25 +2409,16 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
     return null;
   }
 
-  const routeAppId = readAppIdFromLocation();
-  const effectiveAppId = routeAppId ?? focusedAppId;
+  // Treat only an actively mounted game-details bridge as valid per-game context.
+  // This keeps tile/context-menu focus from triggering game playback.
+  const effectiveAppId =
+    activeDetailBridgeCount > 0 ? activeDetailRouteAppId : null;
 
   if (effectiveAppId && readAutoPlaySetting()) {
     const gameTrack = latestTracksForAutoPlay[effectiveAppId];
     if (gameTrack) {
       return gameTrack;
     }
-  }
-
-  if (launchActivityAppId && readAutoPlaySetting()) {
-    const launchedTrack = latestTracksForAutoPlay[launchActivityAppId];
-    if (launchedTrack) {
-      return launchedTrack;
-    }
-  }
-
-  if (effectiveAppId) {
-    return null;
   }
 
   // Never promote global/store ambient while an app launch/run is in progress.
@@ -2414,7 +2477,12 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
         resumeTime,
       };
     }
-    if (playbackState.appId && playbackState.appId > 0) {
+    if (
+      playbackState.appId &&
+      playbackState.appId > 0 &&
+      (playbackState.appId === activeDetailRouteAppId ||
+        playbackState.appId === launchActivityAppId)
+    ) {
       const currentGameTrack = latestTracksForAutoPlay[playbackState.appId];
       if (currentGameTrack) {
         return currentGameTrack;
@@ -2456,8 +2524,19 @@ const applyAutoPlaybackFromContext = () => {
     return;
   }
 
-  if (
+  if (isGamepadContextMenuVisible()) {
+    // Do not change autoplay track selection while a context menu is open.
+    return;
+  }
+
+  const launchSuppressionActive =
     launchActivityAppId !== null &&
+    (activeDetailRouteAppId === launchActivityAppId ||
+      playbackState.appId === launchActivityAppId ||
+      runningGameAppId === launchActivityAppId);
+
+  if (
+    launchSuppressionActive &&
     playbackState.status === "playing" &&
     (playbackState.appId === GLOBAL_AMBIENT_APP_ID ||
       playbackState.appId === STORE_TRACK_APP_ID)
@@ -2492,6 +2571,17 @@ const applyAutoPlaybackFromContext = () => {
     return;
   }
   if (playbackState.reason === "manual") {
+    return;
+  }
+
+  if (
+    launchActivityAppId !== null &&
+    playbackState.reason === "auto" &&
+    playbackState.status === "playing" &&
+    playbackState.appId === launchActivityAppId &&
+    playbackState.appId > 0
+  ) {
+    // During launch transition, keep the currently-playing game track alive.
     return;
   }
 
@@ -2643,6 +2733,9 @@ const stopAutoPlaybackCoordinator = () => {
     window.clearInterval(autoPlaybackRouteInterval);
     autoPlaybackRouteInterval = null;
   }
+  activeDetailRouteAppId = null;
+  activeDetailBridgeCount = 0;
+  contextMenuActiveAppId = null;
   storeContextActive = false;
 };
 
@@ -2866,7 +2959,6 @@ const Content = () => {
     setGlobalTrack,
     storeTrack,
     setStoreTrack,
-    loadingTracks,
   } = useTrackState();
   const [library, setLibrary] = useState<GameOption[]>([]);
   const [autoPlay, setAutoPlay] = useAutoPlaySetting();
@@ -2905,7 +2997,6 @@ const Content = () => {
   const missingNameAttemptsRef = useRef<Map<number, number>>(new Map());
   const resolvingMissingNameIdsRef = useRef<Set<number>>(new Set());
   const [missingResolveInFlightCount, setMissingResolveInFlightCount] = useState(0);
-  const [pendingRemoval, setPendingRemoval] = useState<number | null>(null);
   const playback = usePlaybackStateValue();
   const topFocusRef = useRef<HTMLDivElement | null>(null);
   const getGameName = useCallback(
@@ -2922,12 +3013,6 @@ const Content = () => {
       );
     },
     [tracks, library]
-  );
-  const gameTracks = useMemo(
-    () =>
-      Object.values(tracks)
-        .sort((a, b) => getGameName(a.appId).localeCompare(getGameName(b.appId))),
-    [tracks, getGameName]
   );
   const libraryGames = useMemo(() => {
     const seen = new Set<number>();
@@ -3665,40 +3750,6 @@ const Content = () => {
     setTracks,
   ]);
 
-  const removeTrack = async (appId: number) => {
-    try {
-      const removedPath = tracks[appId]?.path;
-      const updated = await deleteTrack(appId);
-      setTracks(normalizeTracks(updated));
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-      if (removedPath) {
-        clearAudioCache(removedPath);
-      }
-      if (playback.appId === appId) {
-        stopPlayback(true);
-      }
-    } catch (error) {
-      console.error("[ThemeDeck] remove failed", error);
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "Failed to remove track",
-      });
-    }
-  };
-  const requestRemove = (track: GameTrack) => {
-    setPendingRemoval(track.appId);
-  };
-
-  const cancelRemove = () => setPendingRemoval(null);
-
-  const confirmRemove = async (appId: number) => {
-    try {
-      await removeTrack(appId);
-    } finally {
-      setPendingRemoval(null);
-    }
-  };
-
   const handleGlobalPreviewToggle = () => {
     if (!globalTrack) return;
     if (
@@ -3927,84 +3978,6 @@ const Content = () => {
     }
   };
 
-  const handlePreviewToggle = (track: GameTrack) => {
-    if (playback.appId === track.appId && playback.status === "playing") {
-      stopPlayback(false);
-      return;
-    }
-    playTrack(track, "manual");
-  };
-
-  const handleVolumeChange = async (appId: number, value: number) => {
-    const normalizedVolume = clamp(value / 100);
-    setTracks((prev) => ({
-      ...prev,
-      [appId]: {
-        ...prev[appId],
-        volume: normalizedVolume,
-      },
-    }));
-    applyVolumeToActiveTrack(appId, normalizedVolume);
-
-    try {
-      const updated = await updateTrackVolume(appId, normalizedVolume);
-      setTracks(normalizeTracks(updated));
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-    } catch (error) {
-      console.error("[ThemeDeck] volume update failed", error);
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "Couldn't save volume",
-      });
-    }
-  };
-
-  const handleStartOffsetChange = async (appId: number, value: number) => {
-    const normalizedOffset = clamp(value, 0, 30);
-    setTracks((prev) => ({
-      ...prev,
-      [appId]: {
-        ...prev[appId],
-        startOffset: normalizedOffset,
-      },
-    }));
-    applyStartOffsetToActiveTrack(appId, normalizedOffset);
-
-    try {
-      const updated = await updateTrackStartOffset(appId, normalizedOffset);
-      setTracks(normalizeTracks(updated));
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-    } catch (error) {
-      console.error("[ThemeDeck] start offset update failed", error);
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "Couldn't save song start truncation",
-      });
-    }
-  };
-
-  const handleLoopChange = async (appId: number, value: boolean) => {
-    setTracks((prev) => ({
-      ...prev,
-      [appId]: {
-        ...prev[appId],
-        loop: value,
-      },
-    }));
-    applyLoopToActiveTrack(appId, value);
-    try {
-      const updated = await updateTrackLoop(appId, value);
-      setTracks(normalizeTracks(updated));
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-    } catch (error) {
-      console.error("[ThemeDeck] loop update failed", error);
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "Couldn't save loop setting",
-      });
-    }
-  };
-
   useEffect(() => {
     topFocusRef.current?.focus();
   }, []);
@@ -4068,7 +4041,7 @@ const Content = () => {
         <PanelSectionRow>
           <div style={{ width: "100%", paddingTop: "0.2rem" }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>
-              February 25, 2026 (v2.5.3)
+              March 3, 2026 (v2.5.4)
             </div>
             <div style={{ fontSize: "0.86rem", opacity: 0.88, marginTop: "0.25rem" }}>
               To assign music tracks, go to a game's page, select the "gear" icon, then "Choose ThemeDeck music..."
@@ -4707,154 +4680,6 @@ const Content = () => {
           </PanelSectionRow>
         )}
       </PanelSection>
-      <PanelSection title="Assigned tracks">
-        {loadingTracks ? (
-          <PanelSectionRow>
-            <Spinner />
-          </PanelSectionRow>
-        ) : gameTracks.length === 0 ? (
-          <PanelSectionRow>
-            <div>No games have music yet.</div>
-          </PanelSectionRow>
-        ) : (
-          gameTracks.map((track) => (
-            <PanelSectionRow key={track.appId}>
-              <Focusable style={{ width: "100%" }}>
-                <div style={{ fontWeight: 600, overflowWrap: "anywhere" }}>
-                  {getGameName(track.appId)}
-                </div>
-                <div style={{ opacity: 0.8, fontSize: "0.9rem", overflowWrap: "anywhere" }}>
-                  {track.filename}
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    gap: "0.5rem",
-                    marginTop: "0.5rem",
-                    flexWrap: "nowrap",
-                  }}
-                >
-                  <button
-                    className="DialogButton"
-                    style={{
-                      width: "3rem",
-                      height: "2.6rem",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      padding: 0,
-                    }}
-                    title={
-                      playback.appId === track.appId &&
-                      playback.status === "playing"
-                        ? "Pause preview"
-                        : "Preview track"
-                    }
-                    onClick={() => handlePreviewToggle(track)}
-                  >
-                    {playback.appId === track.appId &&
-                    playback.status === "playing" ? (
-                      <FaPause />
-                    ) : (
-                      <FaPlay />
-                    )}
-                  </button>
-                  <button
-                    className="DialogButton"
-                    style={{
-                      width: "3rem",
-                      height: "2.6rem",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      padding: 0,
-                    }}
-                    title={`Remove music from ${getGameName(track.appId)}`}
-                    onClick={() => requestRemove(track)}
-                  >
-                    <FaTrash />
-                  </button>
-                </div>
-                {pendingRemoval === track.appId && (
-                  <div
-                    style={{
-                      marginTop: "0.5rem",
-                      padding: "0.6rem",
-                      borderRadius: "0.4rem",
-                      background: "rgba(255,255,255,0.05)",
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: "0.45rem",
-                    }}
-                  >
-                    <div style={{ fontWeight: 600 }}>
-                      Remove "{track.filename}"?
-                    </div>
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: "0.6rem",
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <button
-                        className="DialogButton"
-                        onClick={() => confirmRemove(track.appId)}
-                        style={{ flex: "0 0 5.5rem" }}
-                      >
-                        Confirm
-                      </button>
-                      <button
-                        className="DialogButton"
-                        onClick={cancelRemove}
-                        style={{ flex: "0 0 5.5rem" }}
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  </div>
-                )}
-                <div style={{ marginTop: "0.5rem" }}>
-                  <SliderField
-                    value={Math.round(track.volume * 100)}
-                    label="Volume"
-                    min={0}
-                    max={100}
-                    step={5}
-                    valueSuffix="%"
-                    showValue
-                    onChange={(value) =>
-                      handleVolumeChange(track.appId, value)
-                    }
-                  />
-                </div>
-                <div style={{ marginTop: "0.35rem" }}>
-                  <SliderField
-                    value={Math.round(track.startOffset)}
-                    label="Start skip"
-                    min={0}
-                    max={30}
-                    step={1}
-                    valueSuffix="s"
-                    showValue
-                    onChange={(value) =>
-                      handleStartOffsetChange(track.appId, value)
-                    }
-                  />
-                </div>
-                <div style={{ marginTop: "0.35rem" }}>
-                  <ToggleField
-                    checked={track.loop}
-                    label="Loop track"
-                    description="Play continuously when this track is active."
-                    onChange={(value) => handleLoopChange(track.appId, value)}
-                  />
-                </div>
-              </Focusable>
-            </PanelSectionRow>
-          ))
-        )}
-      </PanelSection>
       </div>
     </ScrollPanel>
   );
@@ -4897,6 +4722,7 @@ const ChangeTheme = () => {
   );
   const [previewingVideoId, setPreviewingVideoId] = useState<string | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const playback = usePlaybackStateValue();
 
   const loadTrack = useCallback(async () => {
     if (!appId) return;
@@ -5204,6 +5030,74 @@ const ChangeTheme = () => {
     }
   };
 
+  const handleTrackVolumeChange = async (value: number) => {
+    if (!track || !appId) return;
+    const normalizedVolume = clamp(value / 100);
+    const nextTrack = { ...track, volume: normalizedVolume };
+    setTrack(nextTrack);
+    applyVolumeToActiveTrack(appId, normalizedVolume);
+    try {
+      const updated = await updateTrackVolume(appId, normalizedVolume);
+      const normalizedTracks = normalizeTracks(updated);
+      setTrack(normalizedTracks[appId] ?? nextTrack);
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+    } catch (error) {
+      console.error("[ThemeDeck] route volume update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save volume",
+      });
+    }
+  };
+
+  const handleTrackStartOffsetChange = async (value: number) => {
+    if (!track || !appId) return;
+    const normalizedOffset = clamp(value, 0, 30);
+    const nextTrack = { ...track, startOffset: normalizedOffset };
+    setTrack(nextTrack);
+    applyStartOffsetToActiveTrack(appId, normalizedOffset);
+    try {
+      const updated = await updateTrackStartOffset(appId, normalizedOffset);
+      const normalizedTracks = normalizeTracks(updated);
+      setTrack(normalizedTracks[appId] ?? nextTrack);
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+    } catch (error) {
+      console.error("[ThemeDeck] route start offset update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save song start truncation",
+      });
+    }
+  };
+
+  const handleTrackLoopChange = async (value: boolean) => {
+    if (!track || !appId) return;
+    const nextTrack = { ...track, loop: value };
+    setTrack(nextTrack);
+    applyLoopToActiveTrack(appId, value);
+    try {
+      const updated = await updateTrackLoop(appId, value);
+      const normalizedTracks = normalizeTracks(updated);
+      setTrack(normalizedTracks[appId] ?? nextTrack);
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+    } catch (error) {
+      console.error("[ThemeDeck] route loop update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save loop setting",
+      });
+    }
+  };
+
+  const handleTrackPreviewToggle = () => {
+    if (!track || !appId) return;
+    if (playback.appId === appId && playback.status === "playing") {
+      stopPlayback(false);
+      return;
+    }
+    playTrack(track, "manual");
+  };
+
   if (!appId) {
     return (
       <ScrollPanel>
@@ -5258,6 +5152,17 @@ const ChangeTheme = () => {
             {track ? (
               <button
                 className="DialogButton"
+                onClick={handleTrackPreviewToggle}
+                style={{ minWidth: "6.5rem", whiteSpace: "nowrap" }}
+              >
+                {playback.appId === appId && playback.status === "playing"
+                  ? "Pause"
+                  : "Play"}
+              </button>
+            ) : null}
+            {track ? (
+              <button
+                className="DialogButton"
                 onClick={handleRemove}
                 style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
               >
@@ -5273,6 +5178,44 @@ const ChangeTheme = () => {
             </button>
           </div>
         </PanelSectionRow>
+        {track ? (
+          <PanelSectionRow>
+            <div style={{ width: "100%" }}>
+              <div style={{ marginTop: "0.25rem" }}>
+                <SliderField
+                  value={Math.round(track.volume * 100)}
+                  label="Volume"
+                  min={0}
+                  max={100}
+                  step={5}
+                  valueSuffix="%"
+                  showValue
+                  onChange={handleTrackVolumeChange}
+                />
+              </div>
+              <div style={{ marginTop: "0.35rem" }}>
+                <SliderField
+                  value={Math.round(track.startOffset)}
+                  label="Start skip"
+                  min={0}
+                  max={30}
+                  step={1}
+                  valueSuffix="s"
+                  showValue
+                  onChange={handleTrackStartOffsetChange}
+                />
+              </div>
+              <div style={{ marginTop: "0.35rem" }}>
+                <ToggleField
+                  checked={track.loop}
+                  label="Loop track"
+                  description="Play continuously when this track is active."
+                  onChange={handleTrackLoopChange}
+                />
+              </div>
+            </div>
+          </PanelSectionRow>
+        ) : null}
       </PanelSection>
 
       <PanelSection title="YouTube search (yt-dlp)">
