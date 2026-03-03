@@ -45,46 +45,53 @@ This update includes UI and playback behavior improvements:
 
 ## February 28, 2026 Update (v2.5.3)
 
-This update improves playback stability so global/ambient audio no longer conflicts with per-game playback during navigation/launch transitions, and adds per-track loop control (game, global, and store tracks) so each assigned track can loop or play once.
+- Improved playback stability so global/ambient audio no longer conflicts with per-game playback during navigation/launch transitions.
+- Added per-track loop control for game, global, and store tracks so each assignment can loop or play once.
 
 ## February 27, 2026 Update (v2.5.2)
 
-This update gives users finer control over when game music stops playing: at launch start or at launch finish. It also adds a dedicated store-track enable/disable control.
+- Added finer control for when game music stops: launch start or launch finish.
+- Added a dedicated store-track enable/disable control.
 
 ## February 25, 2026 Update (v2.5.1)
 
-This update fixes a critical launch-state issue by ensuring ThemeDeck never plays global/ambient music or game-page theme music while a game is running.
+- Fixed a critical launch-state issue so ThemeDeck does not play global/ambient or game-page music while a game is running.
 
 ## February 25, 2026 Update (v2.5.0)
 
-This update adds bulk auto-assign for games without music, a "Show games without music" list with live name-resolution progress, and improved game ID handling to reduce duplicate/alias entries.
+- Added bulk auto-assign for games without music.
+- Added a "Show games without music" list with live name-resolution progress.
+- Improved game ID handling to reduce duplicate/alias entries.
 
 ## February 25, 2026 Update (v2.4.2)
 
-This update prevents global/ambient auto-play while you are inside ThemeDeck assignment pages, so global music no longer plays when selecting or assigning per-game tracks.
+- Prevented global/ambient auto-play inside ThemeDeck assignment pages, so global music does not play while selecting or assigning per-game tracks.
 
 ## February 24, 2026 Update (v2.4.1)
 
-This update ensures ThemeDeck never plays any music tracks while Steam is in Desktop Mode.
+- Ensured ThemeDeck does not play any music tracks while Steam is in Desktop Mode.
 
 ## February 24, 2026 Update (v2.4.0)
 
-This update adds an optional **store-only music track** that plays only on Steam Store pages, with independent preview, volume, remove, and truncate-start controls.
+- Added an optional **store-only music track** that plays only on Steam Store pages.
+- Included independent preview, volume, remove, and truncate-start controls for the store track.
 
 ## February 23, 2026 Update (v2.3.0)
 
-This update adds an optional **global/ambient music track** for non-game pages, including its own individual volume setting and playback controls.
+- Added an optional **global/ambient music track** for non-game pages.
+- Included separate volume and playback controls for the ambient track.
 
 ## February 21, 2026 Update (v2.2.0)
 
-This update allows users to attach ThemeDeck music for games that are not installed yet. If a game has a Steam game page, users can now assign music and have it play there.
+- Added support for assigning ThemeDeck music to games that are not installed yet, as long as the game has a Steam game page.
 
 ## February 21, 2026 Update (v2.1.0)
 
-This update adds a per-game **Truncate beginning of song** setting (0-30 seconds) in ThemeDeck settings. This lets users skip silent intros by starting each assigned track at a custom offset.
+- Added per-game **Truncate beginning of song** (0-30 seconds) so users can skip silent intros with a custom start offset.
 
 ## February 19, 2026 Update (v2.0.0)
 
-This update adds **YouTube search/download support powered by `yt-dlp`** so users can search game music, preview tracks, download locally, and assign directly from ThemeDeck. You still have the option to manually assign local music tracks.
+- Added **YouTube search/download support powered by `yt-dlp`** for searching, previewing, downloading, and assigning game music directly in ThemeDeck.
+- Kept support for manually assigning local music tracks.
 
 <a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
