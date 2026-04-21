@@ -12,9 +12,7 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 That archive is source code only and is not a Decky-installable plugin package.
 
 Use the latest packaged release zip instead:  
-[ThemeDeck v2.5.5 Release Assets](https://github.com/BrenticusMaximus/ThemeDeck/releases/tag/v2.5.5)  
-Direct plugin zip:  
-[ThemeDeck-build-2026-04-21-154832-EDT.zip](https://github.com/BrenticusMaximus/ThemeDeck/releases/download/v2.5.5/ThemeDeck-build-2026-04-21-154832-EDT.zip)
+[ThemeDeck Releases](https://github.com/BrenticusMaximus/ThemeDeck/releases)
 
 ![ThemeDeck February 19 2026 update thumbnail](https://images.steamusercontent.com/ugc/10217922894651388729/0056712F90842A587703E222C9AD211D53B2344E/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
