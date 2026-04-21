@@ -20,6 +20,8 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 - Skip silent intros with per-game "truncate start" timing.
 - Remove or change a game's assigned track at any time.
 - Auto-play music when opening game pages.
+- Displays a live "Now Playing" card overlay on game pages.
+- Includes a real, beat-reactive audio visualizer in the "Now Playing" card.
 - Assign a global/ambient track for non-game areas.
 - Assign a separate store-only track for Steam Store pages.
 - Choose how ambient music behaves when interrupted (stop, pause, or mute until return).
@@ -33,6 +35,12 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 - Works with both installed and uninstalled games in your library.
 
 ## Release Updates
+
+## April 21, 2026 Update (v2.5.5)
+
+- Added a "Now Playing" overlay card that shows the current track and source context.
+- Added a real audio-reactive visualizer tied to the active music playback.
+- Improved visualizer reliability across game-to-game navigation by rebuilding audio analysis when track sources change.
 
 ## March 3, 2026 Update (v2.5.4)
 

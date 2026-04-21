@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.5.5 - 2026-04-21
+- Adds a "Now Playing" overlay card that displays the active track while browsing game pages.
+- Adds a real audio-reactive visualizer synced to active playback.
+- Fixes visualizer reliability across game-to-game transitions by rebuilding analysis bindings when sources change.
+
 ## 2.4.2 - 2026-02-25
 - Prevents global/ambient auto-play while inside ThemeDeck track-assignment screens.
 - Stops global ambient playback when entering ThemeDeck assignment routes to avoid overlap during per-game selection.

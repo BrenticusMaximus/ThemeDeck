@@ -43,6 +43,7 @@ import {
   FaPlay,
   FaTrash,
 } from "react-icons/fa";
+import { BUILD_ID, BUILD_LABEL } from "./build-info";
 
 type BackendTrack = {
   app_id?: number;
@@ -123,6 +124,18 @@ type GlobalTrack = {
 type StoreTrack = GlobalTrack;
 type AmbientInterruptionMode = "stop" | "pause" | "mute";
 type LaunchStopMode = "launch_start" | "game_started";
+type NowPlayingCardAnchor =
+  | "top_left"
+  | "top_right"
+  | "bottom_left"
+  | "bottom_right";
+type NowPlayingCardSettings = {
+  enabled: boolean;
+  anchor: NowPlayingCardAnchor;
+  offsetX: number;
+  offsetY: number;
+  width: number;
+};
 
 type YtDlpStatus = {
   installed: boolean;
@@ -241,6 +254,16 @@ const AMBIENT_INTERRUPTION_MODE_EVENT =
   "themedeck:ambient-interruption-mode-changed";
 const LAUNCH_STOP_MODE_STORAGE_KEY = "themedeck:launchStopMode";
 const LAUNCH_STOP_MODE_EVENT = "themedeck:launch-stop-mode-changed";
+const NOW_PLAYING_CARD_ENABLED_STORAGE_KEY = "themedeck:nowPlayingCardEnabled";
+const NOW_PLAYING_CARD_ENABLED_EVENT = "themedeck:now-playing-card-enabled-changed";
+const NOW_PLAYING_CARD_ANCHOR_STORAGE_KEY = "themedeck:nowPlayingCardAnchor";
+const NOW_PLAYING_CARD_ANCHOR_EVENT = "themedeck:now-playing-card-anchor-changed";
+const NOW_PLAYING_CARD_OFFSET_X_STORAGE_KEY = "themedeck:nowPlayingCardOffsetX";
+const NOW_PLAYING_CARD_OFFSET_X_EVENT = "themedeck:now-playing-card-offsetx-changed";
+const NOW_PLAYING_CARD_OFFSET_Y_STORAGE_KEY = "themedeck:nowPlayingCardOffsetY";
+const NOW_PLAYING_CARD_OFFSET_Y_EVENT = "themedeck:now-playing-card-offsety-changed";
+const NOW_PLAYING_CARD_WIDTH_STORAGE_KEY = "themedeck:nowPlayingCardWidth";
+const NOW_PLAYING_CARD_WIDTH_EVENT = "themedeck:now-playing-card-width-changed";
 const GLOBAL_AMBIENT_APP_ID = -1;
 const STORE_TRACK_APP_ID = -2;
 const UI_MODE_GAMEPAD = 4;
@@ -287,6 +310,16 @@ let playbackState: PlaybackState = {
   status: "stopped",
 };
 let sharedAudio: HTMLAudioElement | null = null;
+let visualizerAudioContext: AudioContext | null = null;
+let visualizerAnalyser: AnalyserNode | null = null;
+let visualizerSourceNode: MediaElementAudioSourceNode | null = null;
+let visualizerSourceAudio: HTMLAudioElement | null = null;
+let visualizerStreamSourceNode: MediaStreamAudioSourceNode | null = null;
+let visualizerSilentGain: GainNode | null = null;
+let visualizerDataArray: Uint8Array | null = null;
+let visualizerTimeDataArray: Uint8Array | null = null;
+let visualizerRetryAfterMs = 0;
+let visualizerBoundSrc: string | null = null;
 const audioCache = new Map<string, AudioCacheEntry>();
 let latestTracksForAutoPlay: TrackMap = {};
 let latestGlobalTrackForAutoPlay: GlobalTrack | null = null;
@@ -460,6 +493,101 @@ const persistAmbientInterruptionModeSetting = (value: AmbientInterruptionMode) =
 const getAmbientInterruptionModeRuntime = (): AmbientInterruptionMode =>
   ambientInterruptionModeRuntime;
 
+const parseNowPlayingCardAnchor = (value: unknown): NowPlayingCardAnchor => {
+  if (
+    value === "top_left" ||
+    value === "top_right" ||
+    value === "bottom_left" ||
+    value === "bottom_right"
+  ) {
+    return value;
+  }
+  return "bottom_right";
+};
+
+const readNumericPreference = (key: string, fallback: number): number => {
+  try {
+    const raw = window.localStorage?.getItem(key);
+    if (raw === null) {
+      return fallback;
+    }
+    const parsed = Number.parseFloat(raw);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  } catch (error) {
+    console.error("[ThemeDeck] unable to read numeric preference", { key, error });
+    return fallback;
+  }
+};
+
+const persistNumericPreference = (key: string, event: string, value: number) => {
+  try {
+    window.localStorage?.setItem(key, String(value));
+  } catch (error) {
+    console.error("[ThemeDeck] unable to store numeric preference", { key, error });
+  }
+  window.dispatchEvent(new CustomEvent<number>(event, { detail: value }));
+};
+
+const readNowPlayingCardEnabledSetting = (): boolean =>
+  readPreference(NOW_PLAYING_CARD_ENABLED_STORAGE_KEY, true);
+
+const persistNowPlayingCardEnabledSetting = (value: boolean) =>
+  persistPreference(
+    NOW_PLAYING_CARD_ENABLED_STORAGE_KEY,
+    NOW_PLAYING_CARD_ENABLED_EVENT,
+    value
+  );
+
+const readNowPlayingCardAnchorSetting = (): NowPlayingCardAnchor => {
+  try {
+    const raw = window.localStorage?.getItem(NOW_PLAYING_CARD_ANCHOR_STORAGE_KEY);
+    return parseNowPlayingCardAnchor(raw);
+  } catch (error) {
+    console.error("[ThemeDeck] unable to read now playing anchor", error);
+    return "bottom_right";
+  }
+};
+
+const persistNowPlayingCardAnchorSetting = (value: NowPlayingCardAnchor) => {
+  const normalized = parseNowPlayingCardAnchor(value);
+  try {
+    window.localStorage?.setItem(NOW_PLAYING_CARD_ANCHOR_STORAGE_KEY, normalized);
+  } catch (error) {
+    console.error("[ThemeDeck] unable to store now playing anchor", error);
+  }
+  window.dispatchEvent(
+    new CustomEvent<NowPlayingCardAnchor>(NOW_PLAYING_CARD_ANCHOR_EVENT, {
+      detail: normalized,
+    })
+  );
+};
+
+const readNowPlayingCardOffsetXSetting = (): number =>
+  clamp(readNumericPreference(NOW_PLAYING_CARD_OFFSET_X_STORAGE_KEY, 0), -300, 300);
+const readNowPlayingCardOffsetYSetting = (): number =>
+  clamp(readNumericPreference(NOW_PLAYING_CARD_OFFSET_Y_STORAGE_KEY, 0), -300, 300);
+const readNowPlayingCardWidthSetting = (): number =>
+  clamp(readNumericPreference(NOW_PLAYING_CARD_WIDTH_STORAGE_KEY, 340), 220, 620);
+
+const persistNowPlayingCardOffsetXSetting = (value: number) =>
+  persistNumericPreference(
+    NOW_PLAYING_CARD_OFFSET_X_STORAGE_KEY,
+    NOW_PLAYING_CARD_OFFSET_X_EVENT,
+    clamp(value, -300, 300)
+  );
+const persistNowPlayingCardOffsetYSetting = (value: number) =>
+  persistNumericPreference(
+    NOW_PLAYING_CARD_OFFSET_Y_STORAGE_KEY,
+    NOW_PLAYING_CARD_OFFSET_Y_EVENT,
+    clamp(value, -300, 300)
+  );
+const persistNowPlayingCardWidthSetting = (value: number) =>
+  persistNumericPreference(
+    NOW_PLAYING_CARD_WIDTH_STORAGE_KEY,
+    NOW_PLAYING_CARD_WIDTH_EVENT,
+    clamp(value, 220, 620)
+  );
+
 const subscribePlayback = (listener: (state: PlaybackState) => void) => {
   playbackListeners.add(listener);
   return () => {
@@ -492,6 +620,146 @@ const ensureAudio = () => {
     (window as any).__themedeckSharedAudio = sharedAudio;
   }
   return sharedAudio;
+};
+
+const resetVisualizerGraph = (closeContext = false) => {
+  try {
+    visualizerSourceNode?.disconnect();
+  } catch {
+    // ignore
+  }
+  try {
+    visualizerStreamSourceNode?.disconnect();
+  } catch {
+    // ignore
+  }
+  try {
+    visualizerAnalyser?.disconnect();
+  } catch {
+    // ignore
+  }
+  try {
+    visualizerSilentGain?.disconnect();
+  } catch {
+    // ignore
+  }
+  if (closeContext && visualizerAudioContext) {
+    void visualizerAudioContext.close().catch(() => {});
+    visualizerAudioContext = null;
+  }
+  visualizerAnalyser = null;
+  visualizerSourceNode = null;
+  visualizerSourceAudio = null;
+  visualizerStreamSourceNode = null;
+  visualizerSilentGain = null;
+  visualizerDataArray = null;
+  visualizerTimeDataArray = null;
+  visualizerBoundSrc = null;
+};
+
+const ensureVisualizerAnalyser = (audio: HTMLAudioElement) => {
+  if (!audio.src) {
+    return null;
+  }
+  const activeSrc = audio.currentSrc || audio.src;
+  if (visualizerBoundSrc && activeSrc && visualizerBoundSrc !== activeSrc) {
+    resetVisualizerGraph(false);
+  }
+  const nowMs = Date.now();
+  if (nowMs < visualizerRetryAfterMs) {
+    return null;
+  }
+  try {
+    if (!visualizerAudioContext) {
+      const AudioContextCtor =
+        (window as typeof window & {
+          webkitAudioContext?: typeof AudioContext;
+        }).AudioContext ||
+        (window as typeof window & {
+          webkitAudioContext?: typeof AudioContext;
+        }).webkitAudioContext;
+      if (!AudioContextCtor) {
+        return null;
+      }
+      visualizerAudioContext = new AudioContextCtor();
+    }
+    const context = visualizerAudioContext;
+    if (!context) {
+      return null;
+    }
+    if (context.state === "closed") {
+      resetVisualizerGraph(true);
+      visualizerAudioContext = null;
+      return null;
+    }
+    if (!visualizerAnalyser) {
+      visualizerAnalyser = context.createAnalyser();
+      visualizerAnalyser.fftSize = 128;
+      visualizerAnalyser.smoothingTimeConstant = 0.76;
+    }
+    if (!visualizerSilentGain) {
+      visualizerSilentGain = context.createGain();
+      visualizerSilentGain.gain.value = 0;
+      visualizerAnalyser.connect(visualizerSilentGain);
+      visualizerSilentGain.connect(context.destination);
+    }
+    if (visualizerSourceAudio && visualizerSourceAudio !== audio) {
+      try {
+        visualizerSourceNode?.disconnect();
+      } catch {
+        // ignore
+      }
+      try {
+        visualizerStreamSourceNode?.disconnect();
+      } catch {
+        // ignore
+      }
+      visualizerSourceNode = null;
+      visualizerStreamSourceNode = null;
+      visualizerSourceAudio = null;
+    }
+    if (!visualizerSourceNode && !visualizerStreamSourceNode) {
+      try {
+        visualizerSourceNode = context.createMediaElementSource(audio);
+        visualizerSourceAudio = audio;
+        visualizerBoundSrc = activeSrc;
+        visualizerSourceNode.connect(visualizerAnalyser);
+      } catch (sourceError) {
+        const capture =
+          (audio as HTMLAudioElement & {
+            captureStream?: () => MediaStream;
+            mozCaptureStream?: () => MediaStream;
+          }).captureStream?.() ??
+          (audio as HTMLAudioElement & {
+            captureStream?: () => MediaStream;
+            mozCaptureStream?: () => MediaStream;
+          }).mozCaptureStream?.();
+        if (!capture) {
+          throw sourceError;
+        }
+        visualizerStreamSourceNode = context.createMediaStreamSource(capture);
+        visualizerStreamSourceNode.connect(visualizerAnalyser);
+        visualizerSourceAudio = audio;
+        visualizerBoundSrc = activeSrc;
+      }
+    }
+    if (!visualizerDataArray) {
+      visualizerDataArray = new Uint8Array(visualizerAnalyser.frequencyBinCount);
+    }
+    if (!visualizerTimeDataArray) {
+      visualizerTimeDataArray = new Uint8Array(visualizerAnalyser.fftSize);
+    }
+    return {
+      context,
+      analyser: visualizerAnalyser,
+      data: visualizerDataArray,
+      timeData: visualizerTimeDataArray,
+    };
+  } catch (error) {
+    console.error("[ThemeDeck] visualizer init failed", error);
+    visualizerRetryAfterMs = Date.now() + 1500;
+    return null;
+  }
 };
 
 const revokeCacheEntry = (path: string) => {
@@ -2021,7 +2289,283 @@ const GameFocusBridge = () => {
     };
   }, [appId]);
 
-  return null;
+  const playback = usePlaybackStateValue();
+  const [cardSettings] = useNowPlayingCardSettings();
+
+  const playingTrack = useMemo(() => {
+    if (!appId || !cardSettings.enabled) {
+      return null;
+    }
+    if (playback.status !== "playing" || playback.appId !== appId) {
+      return null;
+    }
+    return latestTracksForAutoPlay[appId] ?? null;
+  }, [appId, cardSettings.enabled, playback.appId, playback.status]);
+
+  const parsedNowPlaying = useMemo(() => {
+    if (!playingTrack) {
+      return null;
+    }
+    const sourceName =
+      toHumanReadableTrackName(playingTrack.filename || "") ||
+      toHumanReadableTrackName(playingTrack.path.split("/").pop() || "");
+    const gameName = appId ? getDisplayName(appId) : "Unknown game";
+    const resolved = resolveNowPlayingText(sourceName, gameName);
+    return {
+      subtitle: resolved.line3,
+      title: resolved.line2,
+    };
+  }, [appId, playingTrack]);
+
+  const anchorStyle = useMemo(() => {
+    const baseMargin = 26;
+    const style: Record<string, string | number> = {
+      position: "fixed",
+      zIndex: 1001,
+      width: "max-content",
+      maxWidth: `${cardSettings.width}px`,
+      pointerEvents: "none",
+    };
+    if (cardSettings.anchor === "top_left") {
+      style.top = `${baseMargin + cardSettings.offsetY}px`;
+      style.left = `${baseMargin + cardSettings.offsetX}px`;
+    } else if (cardSettings.anchor === "top_right") {
+      style.top = `${baseMargin + cardSettings.offsetY}px`;
+      style.right = `${baseMargin - cardSettings.offsetX}px`;
+    } else if (cardSettings.anchor === "bottom_left") {
+      style.bottom = `${baseMargin - cardSettings.offsetY}px`;
+      style.left = `${baseMargin + cardSettings.offsetX}px`;
+    } else {
+      style.bottom = `${baseMargin - cardSettings.offsetY}px`;
+      style.right = `${baseMargin - cardSettings.offsetX}px`;
+    }
+    return style;
+  }, [cardSettings.anchor, cardSettings.offsetX, cardSettings.offsetY, cardSettings.width]);
+
+  const marqueeBaseStyle: Record<string, string | number> = {
+    width: "100%",
+    overflow: "hidden",
+    whiteSpace: "nowrap",
+    textOverflow: "ellipsis",
+  };
+
+  if (!parsedNowPlaying) {
+    return null;
+  }
+
+  return (
+    <div style={anchorStyle}>
+      <style>{`
+        @keyframes themedeck-nowplaying-marquee {
+          0% { transform: translateX(0); }
+          100% { transform: translateX(calc(-50% - 12px)); }
+        }
+      `}</style>
+      <div
+        style={{
+          padding: "0.62rem 0.8rem 0.66rem 0.8rem",
+          borderRadius: "0.75rem",
+          border: "1px solid rgba(140, 192, 255, 0.5)",
+          background:
+            "linear-gradient(150deg, rgba(27,34,47,0.92) 0%, rgba(18,23,32,0.9) 100%)",
+          boxShadow: "0 8px 26px rgba(0,0,0,0.44)",
+          backdropFilter: "blur(8px)",
+        }}
+      >
+        <div
+          style={{
+            fontSize: "0.66rem",
+            letterSpacing: "0.08em",
+            opacity: 0.75,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "0.5rem",
+          }}
+        >
+          <span>NOW PLAYING</span>
+          <NowPlayingVisualizer />
+        </div>
+        <div style={{ ...marqueeBaseStyle, marginTop: "0.14rem", fontSize: "0.96rem", fontWeight: 700 }}>
+          <MarqueeText text={parsedNowPlaying.title} />
+        </div>
+        <div style={{ ...marqueeBaseStyle, marginTop: "0.1rem", fontSize: "0.77rem", opacity: 0.84 }}>
+          <MarqueeText text={parsedNowPlaying.subtitle} />
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const NowPlayingVisualizer = () => {
+  const BAR_COUNT = 16;
+  const playback = usePlaybackStateValue();
+  const [barHeights, setBarHeights] = useState<number[]>(
+    () => new Array(BAR_COUNT).fill(0.25)
+  );
+  const silentTickCountRef = useRef(0);
+
+  useEffect(() => {
+    const tick = () => {
+      const audio = sharedAudio;
+      const shouldAnimate =
+        playback.status === "playing" && !!audio && !audio.paused;
+      if (!shouldAnimate) {
+        setBarHeights(
+          Array.from({ length: BAR_COUNT }, (_, i) => 0.2 + ((i % 3) * 0.08))
+        );
+        return;
+      }
+      try {
+        const analyserBundle = ensureVisualizerAnalyser(audio);
+        if (!analyserBundle) {
+          setBarHeights(
+            Array.from({ length: BAR_COUNT }, (_, i) => 0.2 + ((i % 3) * 0.08))
+          );
+          return;
+        }
+        if (analyserBundle.context.state === "suspended") {
+          void analyserBundle.context.resume().catch(() => {});
+        }
+        analyserBundle.analyser.getByteFrequencyData(analyserBundle.data);
+        analyserBundle.analyser.getByteTimeDomainData(analyserBundle.timeData);
+        const step = Math.max(1, Math.floor(analyserBundle.data.length / BAR_COUNT));
+        let waveformEnergy = 0;
+        for (let i = 0; i < analyserBundle.timeData.length; i += 1) {
+          waveformEnergy += Math.abs(analyserBundle.timeData[i] - 128);
+        }
+        const normalizedWaveform =
+          analyserBundle.timeData.length > 0
+            ? waveformEnergy / analyserBundle.timeData.length / 128
+            : 0;
+        let peakSample = 0;
+        setBarHeights(
+          Array.from({ length: BAR_COUNT }, (_, i) => {
+            const sample = analyserBundle.data[i * step] ?? 0;
+            if (sample > peakSample) peakSample = sample;
+            const normalizedSample = sample / 255;
+            const blended = normalizedSample * 0.82 + normalizedWaveform * 0.5;
+            return 0.18 + Math.min(1, blended) * 0.82;
+          })
+        );
+        if (peakSample <= 2 && normalizedWaveform < 0.01) {
+          silentTickCountRef.current += 1;
+          if (silentTickCountRef.current >= 20) {
+            resetVisualizerGraph(true);
+            visualizerRetryAfterMs = 0;
+            silentTickCountRef.current = 0;
+          }
+        } else {
+          silentTickCountRef.current = 0;
+        }
+      } catch (error) {
+        console.error("[ThemeDeck] visualizer sampling failed", error);
+        silentTickCountRef.current += 1;
+        if (silentTickCountRef.current >= 6) {
+          resetVisualizerGraph(true);
+          visualizerRetryAfterMs = Date.now() + 600;
+          silentTickCountRef.current = 0;
+        }
+        setBarHeights(
+          Array.from({ length: BAR_COUNT }, (_, i) => 0.2 + ((i % 3) * 0.08))
+        );
+      }
+    };
+
+    tick();
+    const intervalId = window.setInterval(tick, 90);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [playback.status]);
+
+  return (
+    <div
+      style={{
+        width: "56px",
+        height: "12px",
+        display: "flex",
+        alignItems: "flex-end",
+        gap: "1px",
+      }}
+    >
+      {barHeights.map((heightRatio, i) => (
+        <div
+          key={i}
+          style={{
+            width: "2px",
+            height: "12px",
+            background: `hsla(${Math.round((i / Math.max(1, BAR_COUNT - 1)) * 300)}, 84%, 60%, 0.95)`,
+            borderRadius: "1px",
+            transform: `scaleY(${Math.max(0.18, Math.min(1, heightRatio))})`,
+            transformOrigin: "bottom center",
+            transition: "transform 80ms linear",
+          }}
+        />
+      ))}
+    </div>
+  );
+};
+
+const MarqueeText = ({ text }: { text: string }) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLSpanElement | null>(null);
+  const [shouldScroll, setShouldScroll] = useState(false);
+
+  useEffect(() => {
+    const measure = () => {
+      const container = containerRef.current;
+      const content = contentRef.current;
+      if (!container || !content) {
+        return;
+      }
+      const measuredOverflow = content.scrollWidth > container.clientWidth + 4;
+      const heuristicOverflow = text.length > 34;
+      setShouldScroll(measuredOverflow || heuristicOverflow);
+    };
+    measure();
+    const timeoutId = window.setTimeout(measure, 30);
+    window.addEventListener("resize", measure);
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined" && containerRef.current) {
+      observer = new ResizeObserver(() => {
+        measure();
+      });
+      observer.observe(containerRef.current);
+    }
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.removeEventListener("resize", measure);
+      observer?.disconnect();
+    };
+  }, [text]);
+
+  if (!shouldScroll) {
+    return (
+      <div ref={containerRef} style={{ overflow: "hidden", whiteSpace: "nowrap" }}>
+        <span ref={contentRef}>{text}</span>
+      </div>
+    );
+  }
+
+  const durationSeconds = clamp(text.length * 0.28, 8, 22);
+  return (
+    <div ref={containerRef} style={{ overflow: "hidden", whiteSpace: "nowrap" }}>
+      <div
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "12px",
+          minWidth: "max-content",
+          animation: `themedeck-nowplaying-marquee ${durationSeconds}s linear infinite`,
+          willChange: "transform",
+        }}
+      >
+        <span ref={contentRef}>{text}</span>
+        <span>{text}</span>
+      </div>
+    </div>
+  );
 };
 
 const clamp = (value: number, min = 0, max = 1) =>
@@ -2060,6 +2604,50 @@ const formatDuration = (seconds?: number | null) => {
   const mins = Math.floor(total / 60);
   const secs = total % 60;
   return `${mins}:${secs.toString().padStart(2, "0")}`;
+};
+
+const toHumanReadableTrackName = (value: string): string => {
+  let text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  text = text.replace(/\.[a-z0-9]{2,5}$/i, "");
+  text = text.replace(/\s*\[[A-Za-z0-9_-]{6,}\]?$/, "");
+  text = text.replace(/\s*\((official|audio|lyrics?|music video|video)\)\s*$/i, "");
+  text = text.replace(/_/g, " ");
+  text = text.replace(/\s+/g, " ").trim();
+  return text;
+};
+
+const resolveNowPlayingText = (
+  sourceName: string,
+  gameName: string
+): { line2: string; line3: string } => {
+  const cleaned = toHumanReadableTrackName(sourceName);
+  const defaultGame = toHumanReadableTrackName(gameName) || "Unknown game";
+  if (!cleaned) {
+    return { line2: "Unknown track", line3: defaultGame };
+  }
+  const parts = cleaned
+    .split(/\s+[-–—]\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length >= 2) {
+    const first = parts[0];
+    const rest = parts.slice(1).join(" - ");
+    const restLooksAlbum = /(ost|soundtrack|album|score)/i.test(rest);
+    if (restLooksAlbum) {
+      return {
+        line2: first || cleaned,
+        line3: rest || defaultGame,
+      };
+    }
+    return {
+      line2: rest || first || cleaned,
+      line3: first || defaultGame,
+    };
+  }
+  return { line2: cleaned, line3: defaultGame };
 };
 
 const normalizeGlobalTrack = (
@@ -2950,6 +3538,86 @@ const useLaunchStopModeSetting = (): [
   return [mode, update];
 };
 
+const useNowPlayingCardSettings = (): [
+  NowPlayingCardSettings,
+  (next: Partial<NowPlayingCardSettings>) => void
+] => {
+  const [settings, setSettings] = useState<NowPlayingCardSettings>({
+    enabled: readNowPlayingCardEnabledSetting(),
+    anchor: readNowPlayingCardAnchorSetting(),
+    offsetX: readNowPlayingCardOffsetXSetting(),
+    offsetY: readNowPlayingCardOffsetYSetting(),
+    width: readNowPlayingCardWidthSetting(),
+  });
+
+  useEffect(() => {
+    const onEnabled = (event: Event) => {
+      const detail = (event as CustomEvent<boolean>).detail;
+      setSettings((prev) => ({ ...prev, enabled: typeof detail === "boolean" ? detail : readNowPlayingCardEnabledSetting() }));
+    };
+    const onAnchor = (event: Event) => {
+      const detail = (event as CustomEvent<NowPlayingCardAnchor>).detail;
+      setSettings((prev) => ({ ...prev, anchor: parseNowPlayingCardAnchor(detail) }));
+    };
+    const onOffsetX = (event: Event) => {
+      const detail = (event as CustomEvent<number>).detail;
+      const parsed = Number(detail);
+      setSettings((prev) => ({
+        ...prev,
+        offsetX: Number.isFinite(parsed) ? clamp(parsed, -300, 300) : prev.offsetX,
+      }));
+    };
+    const onOffsetY = (event: Event) => {
+      const detail = (event as CustomEvent<number>).detail;
+      const parsed = Number(detail);
+      setSettings((prev) => ({
+        ...prev,
+        offsetY: Number.isFinite(parsed) ? clamp(parsed, -300, 300) : prev.offsetY,
+      }));
+    };
+    const onWidth = (event: Event) => {
+      const detail = (event as CustomEvent<number>).detail;
+      const parsed = Number(detail);
+      setSettings((prev) => ({
+        ...prev,
+        width: Number.isFinite(parsed) ? clamp(parsed, 220, 620) : prev.width,
+      }));
+    };
+    window.addEventListener(NOW_PLAYING_CARD_ENABLED_EVENT, onEnabled as EventListener);
+    window.addEventListener(NOW_PLAYING_CARD_ANCHOR_EVENT, onAnchor as EventListener);
+    window.addEventListener(NOW_PLAYING_CARD_OFFSET_X_EVENT, onOffsetX as EventListener);
+    window.addEventListener(NOW_PLAYING_CARD_OFFSET_Y_EVENT, onOffsetY as EventListener);
+    window.addEventListener(NOW_PLAYING_CARD_WIDTH_EVENT, onWidth as EventListener);
+    return () => {
+      window.removeEventListener(NOW_PLAYING_CARD_ENABLED_EVENT, onEnabled as EventListener);
+      window.removeEventListener(NOW_PLAYING_CARD_ANCHOR_EVENT, onAnchor as EventListener);
+      window.removeEventListener(NOW_PLAYING_CARD_OFFSET_X_EVENT, onOffsetX as EventListener);
+      window.removeEventListener(NOW_PLAYING_CARD_OFFSET_Y_EVENT, onOffsetY as EventListener);
+      window.removeEventListener(NOW_PLAYING_CARD_WIDTH_EVENT, onWidth as EventListener);
+    };
+  }, []);
+
+  const update = useCallback((next: Partial<NowPlayingCardSettings>) => {
+    if (typeof next.enabled === "boolean") {
+      persistNowPlayingCardEnabledSetting(next.enabled);
+    }
+    if (next.anchor) {
+      persistNowPlayingCardAnchorSetting(next.anchor);
+    }
+    if (typeof next.offsetX === "number" && Number.isFinite(next.offsetX)) {
+      persistNowPlayingCardOffsetXSetting(next.offsetX);
+    }
+    if (typeof next.offsetY === "number" && Number.isFinite(next.offsetY)) {
+      persistNowPlayingCardOffsetYSetting(next.offsetY);
+    }
+    if (typeof next.width === "number" && Number.isFinite(next.width)) {
+      persistNowPlayingCardWidthSetting(next.width);
+    }
+  }, []);
+
+  return [settings, update];
+};
+
 
 const Content = () => {
   const {
@@ -2970,6 +3638,8 @@ const Content = () => {
   const [ambientInterruptionMode, setAmbientInterruptionMode] =
     useAmbientInterruptionModeSetting();
   const [launchStopMode, setLaunchStopMode] = useLaunchStopModeSetting();
+  const [nowPlayingCardSettings, updateNowPlayingCardSettings] =
+    useNowPlayingCardSettings();
   const [ytDlpStatus, setYtDlpStatus] = useState<YtDlpStatus>({
     installed: false,
   });
@@ -4041,7 +4711,10 @@ const Content = () => {
         <PanelSectionRow>
           <div style={{ width: "100%", paddingTop: "0.2rem" }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>
-              March 3, 2026 (v2.5.4)
+              Latest change: {BUILD_LABEL.replace(/^ThemeDeck Build\s*/, "")}
+            </div>
+            <div style={{ fontSize: "0.8rem", opacity: 0.75, marginTop: "0.15rem" }}>
+              Build ID: {BUILD_ID}
             </div>
             <div style={{ fontSize: "0.86rem", opacity: 0.88, marginTop: "0.25rem" }}>
               To assign music tracks, go to a game's page, select the "gear" icon, then "Choose ThemeDeck music..."
@@ -4120,6 +4793,115 @@ const Content = () => {
                     <span>{option.label}</span>
                   </button>
                 ))}
+              </div>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              checked={nowPlayingCardSettings.enabled}
+              label="Show game-page now playing card"
+              description="Displays artist/track while game music is playing."
+              onChange={(value) => updateNowPlayingCardSettings({ enabled: value })}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ width: "100%" }}>
+              <div style={{ fontWeight: 600 }}>Now playing card anchor</div>
+              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
+                Choose where the card starts before fine-tuning offsets.
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.35rem",
+                  marginTop: "0.45rem",
+                }}
+                role="radiogroup"
+                aria-label="Now playing card anchor"
+              >
+                {(
+                  [
+                    { value: "top_left", label: "Top left" },
+                    { value: "top_right", label: "Top right" },
+                    { value: "bottom_left", label: "Bottom left" },
+                    { value: "bottom_right", label: "Bottom right" },
+                  ] as Array<{ value: NowPlayingCardAnchor; label: string }>
+                ).map((option) => (
+                  <button
+                    key={option.value}
+                    className="DialogButton themedeck-fit themedeck-wrap"
+                    onClick={() =>
+                      updateNowPlayingCardSettings({ anchor: option.value })
+                    }
+                    role="radio"
+                    aria-checked={nowPlayingCardSettings.anchor === option.value}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "0.5rem",
+                      justifyContent: "flex-start",
+                      width: "100%",
+                      boxSizing: "border-box",
+                      whiteSpace: "normal",
+                      textAlign: "left",
+                      fontSize: "0.92rem",
+                      paddingRight: "0.65rem",
+                      paddingLeft: "0.65rem",
+                      border:
+                        nowPlayingCardSettings.anchor === option.value
+                          ? "1px solid rgba(120, 180, 255, 0.85)"
+                          : undefined,
+                    }}
+                  >
+                    <span style={{ minWidth: "1.4rem", textAlign: "center" }}>
+                      {nowPlayingCardSettings.anchor === option.value ? "(x)" : "( )"}
+                    </span>
+                    <span>{option.label}</span>
+                  </button>
+                ))}
+              </div>
+              <div style={{ marginTop: "0.35rem" }}>
+                <SliderField
+                  value={Math.round(nowPlayingCardSettings.offsetX)}
+                  label="Horizontal offset"
+                  min={-300}
+                  max={300}
+                  step={1}
+                  valueSuffix="px"
+                  showValue
+                  onChange={(value) =>
+                    updateNowPlayingCardSettings({ offsetX: clamp(value, -300, 300) })
+                  }
+                />
+              </div>
+              <div style={{ marginTop: "0.35rem" }}>
+                <SliderField
+                  value={Math.round(nowPlayingCardSettings.offsetY)}
+                  label="Vertical offset"
+                  min={-300}
+                  max={300}
+                  step={1}
+                  valueSuffix="px"
+                  showValue
+                  onChange={(value) =>
+                    updateNowPlayingCardSettings({ offsetY: clamp(value, -300, 300) })
+                  }
+                />
+              </div>
+              <div style={{ marginTop: "0.35rem" }}>
+                <SliderField
+                  value={Math.round(nowPlayingCardSettings.width)}
+                  label="Card max width"
+                  min={220}
+                  max={620}
+                  step={5}
+                  valueSuffix="px"
+                  showValue
+                  onChange={(value) =>
+                    updateNowPlayingCardSettings({ width: clamp(value, 220, 620) })
+                  }
+                />
               </div>
             </div>
           </PanelSectionRow>
