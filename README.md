@@ -44,11 +44,6 @@ Use the latest packaged release zip instead:
 
 ## Release Updates
 
-## April 21, 2026 Update (Install package guidance)
-
-- Added clear install guidance to avoid using GitHub's green Code button ZIP (`main.zip`), which is source-only and not Decky-installable.
-- Added direct links to the correct packaged release ZIP for ThemeDeck v2.5.5.
-
 ## April 21, 2026 Update (v2.5.5)
 
 - Added a "Now Playing" overlay card that shows the current track and source context.
