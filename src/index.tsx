@@ -170,6 +170,15 @@ const DETAIL_PATTERNS = GAME_DETAIL_ROUTES.map((route) => {
   return new RegExp(`^${pattern}`);
 });
 
+const focusFirstInteractiveElement = (
+  root: HTMLDivElement | null,
+  selector = "button, input, textarea, select, [role='button'], [role='radio'], [tabindex]:not([tabindex='-1'])"
+) => {
+  if (!root) return;
+  const element = root.querySelector<HTMLElement>(selector);
+  element?.focus();
+};
+
 const fetchTracks = callable<[], RawTrackMap>("get_tracks");
 const fetchGlobalTrack = callable<[], BackendTrack | null>("get_global_track");
 const fetchStoreTrack = callable<[], BackendTrack | null>("get_store_track");
@@ -237,6 +246,17 @@ const getYouTubePreviewStream = callable<
 >("get_youtube_preview_stream");
 const getYtDlpStatus = callable<[], YtDlpStatus>("get_yt_dlp_status");
 const updateYtDlp = callable<[], YtDlpStatus>("update_yt_dlp");
+const playTrackBackend = callable<
+  [path: string, volume?: number, loop?: boolean, startOffset?: number],
+  { ok: boolean; pid?: number; player?: string }
+>("play_track_backend");
+const stopBackendPlayback = callable<[], { ok: boolean; stopped?: boolean }>(
+  "stop_backend_playback"
+);
+const logClientEvent = callable<
+  [level: string, message: string, payload?: Record<string, unknown>],
+  boolean
+>("log_client_event");
 
 const TRACKS_UPDATED_EVENT = "themedeck:tracks-updated";
 const AUDIO_EXTENSIONS = ["mp3", "aac", "flac", "ogg", "wav", "m4a"];
@@ -264,6 +284,8 @@ const NOW_PLAYING_CARD_OFFSET_Y_STORAGE_KEY = "themedeck:nowPlayingCardOffsetY";
 const NOW_PLAYING_CARD_OFFSET_Y_EVENT = "themedeck:now-playing-card-offsety-changed";
 const NOW_PLAYING_CARD_WIDTH_STORAGE_KEY = "themedeck:nowPlayingCardWidth";
 const NOW_PLAYING_CARD_WIDTH_EVENT = "themedeck:now-playing-card-width-changed";
+const MASTER_VOLUME_STORAGE_KEY = "themedeck:masterVolume";
+const MASTER_VOLUME_EVENT = "themedeck:master-volume-changed";
 const GLOBAL_AMBIENT_APP_ID = -1;
 const STORE_TRACK_APP_ID = -2;
 const UI_MODE_GAMEPAD = 4;
@@ -315,7 +337,7 @@ let visualizerAnalyser: AnalyserNode | null = null;
 let visualizerSourceNode: MediaElementAudioSourceNode | null = null;
 let visualizerSourceAudio: HTMLAudioElement | null = null;
 let visualizerStreamSourceNode: MediaStreamAudioSourceNode | null = null;
-let visualizerSilentGain: GainNode | null = null;
+let visualizerOutputGain: GainNode | null = null;
 let visualizerDataArray: Uint8Array | null = null;
 let visualizerTimeDataArray: Uint8Array | null = null;
 let visualizerRetryAfterMs = 0;
@@ -343,6 +365,7 @@ let uiModePollInterval: number | null = null;
 let stopUIModeSubscription: (() => void) | null = null;
 let runningGameAppId: number | null = null;
 let launchActivityAppId: number | null = null;
+let lastGameDetailContextSeenAtMs = 0;
 let runningAppPollInterval: number | null = null;
 let runningAppRetry: number | null = null;
 let runningAppRefreshInFlight = false;
@@ -357,8 +380,24 @@ let globalAmbientResumeSnapshot: {
   mode: AmbientInterruptionMode;
 } | null = null;
 let ambientInterruptionModeRuntime: AmbientInterruptionMode = "stop";
+let masterVolumeRuntime = 1;
 let stopPlaybackFadeInterval: number | null = null;
 let stopPlaybackToken = 0;
+const USE_BACKEND_PLAYBACK = false;
+
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function logClient(
+  level: "debug" | "info" | "warning" | "error",
+  message: string,
+  payload?: Record<string, unknown>
+) {
+  void logClientEvent(level, message, payload).catch(() => {
+    // no-op
+  });
+}
 
 const readPreference = (key: string, fallback = true): boolean => {
   try {
@@ -588,6 +627,29 @@ const persistNowPlayingCardWidthSetting = (value: number) =>
     clamp(value, 220, 620)
   );
 
+const readMasterVolumeSetting = (): number => {
+  const normalized = clamp(
+    readNumericPreference(MASTER_VOLUME_STORAGE_KEY, 100),
+    1,
+    100
+  );
+  masterVolumeRuntime = normalized / 100;
+  return normalized;
+};
+
+const persistMasterVolumeSetting = (value: number) => {
+  const normalized = Math.round(clamp(value, 1, 100));
+  masterVolumeRuntime = normalized / 100;
+  persistNumericPreference(MASTER_VOLUME_STORAGE_KEY, MASTER_VOLUME_EVENT, normalized);
+};
+
+const getEffectiveTrackVolume = (trackVolume: number | undefined): number => {
+  if (masterVolumeRuntime < 1) {
+    return masterVolumeRuntime;
+  }
+  return clamp(trackVolume ?? 1);
+};
+
 const subscribePlayback = (listener: (state: PlaybackState) => void) => {
   playbackListeners.add(listener);
   return () => {
@@ -614,11 +676,55 @@ const ensureAudio = () => {
     sharedAudio = sharedFromWindow;
   }
   if (!sharedAudio) {
-    sharedAudio = new Audio();
+    sharedAudio = document.createElement("audio");
     sharedAudio.loop = true;
     sharedAudio.preload = "auto";
+    sharedAudio.muted = false;
+    sharedAudio.style.position = "fixed";
+    sharedAudio.style.left = "-10000px";
+    sharedAudio.style.top = "-10000px";
+    sharedAudio.style.width = "1px";
+    sharedAudio.style.height = "1px";
+    sharedAudio.style.opacity = "0";
+    sharedAudio.style.pointerEvents = "none";
+    sharedAudio.setAttribute("playsinline", "true");
+    sharedAudio.setAttribute("webkit-playsinline", "true");
+    if (!sharedAudio.isConnected) {
+      document.body?.appendChild(sharedAudio);
+    }
+    const eventNames: Array<keyof HTMLMediaElementEventMap> = [
+      "play",
+      "playing",
+      "pause",
+      "ended",
+      "stalled",
+      "suspend",
+      "waiting",
+      "error",
+    ];
+    eventNames.forEach((eventName) => {
+      sharedAudio?.addEventListener(eventName, () => {
+        const audio = sharedAudio;
+        if (!audio) return;
+        logClient("info", "audio_event", {
+          event: eventName,
+          paused: audio.paused,
+          ended: audio.ended,
+          muted: audio.muted,
+          volume: audio.volume,
+          readyState: audio.readyState,
+          networkState: audio.networkState,
+          currentTime: Number.isFinite(audio.currentTime) ? audio.currentTime : null,
+          src: audio.currentSrc || audio.src,
+        });
+      });
+    });
     (window as any).__themedeckSharedAudio = sharedAudio;
   }
+  if (!sharedAudio.isConnected) {
+    document.body?.appendChild(sharedAudio);
+  }
+  sharedAudio.muted = false;
   return sharedAudio;
 };
 
@@ -639,7 +745,7 @@ const resetVisualizerGraph = (closeContext = false) => {
     // ignore
   }
   try {
-    visualizerSilentGain?.disconnect();
+    visualizerOutputGain?.disconnect();
   } catch {
     // ignore
   }
@@ -651,7 +757,7 @@ const resetVisualizerGraph = (closeContext = false) => {
   visualizerSourceNode = null;
   visualizerSourceAudio = null;
   visualizerStreamSourceNode = null;
-  visualizerSilentGain = null;
+  visualizerOutputGain = null;
   visualizerDataArray = null;
   visualizerTimeDataArray = null;
   visualizerBoundSrc = null;
@@ -682,10 +788,20 @@ const ensureVisualizerAnalyser = (audio: HTMLAudioElement) => {
         return null;
       }
       visualizerAudioContext = new AudioContextCtor();
+      logClient("info", "audio_context_created", {
+        state: visualizerAudioContext.state,
+      });
     }
     const context = visualizerAudioContext;
     if (!context) {
       return null;
+    }
+    if (context.state === "suspended") {
+      void context.resume().catch((error) => {
+        logClient("warning", "audio_context_resume_failed", {
+          error: toErrorMessage(error),
+        });
+      });
     }
     if (context.state === "closed") {
       resetVisualizerGraph(true);
@@ -697,11 +813,11 @@ const ensureVisualizerAnalyser = (audio: HTMLAudioElement) => {
       visualizerAnalyser.fftSize = 128;
       visualizerAnalyser.smoothingTimeConstant = 0.76;
     }
-    if (!visualizerSilentGain) {
-      visualizerSilentGain = context.createGain();
-      visualizerSilentGain.gain.value = 0;
-      visualizerAnalyser.connect(visualizerSilentGain);
-      visualizerSilentGain.connect(context.destination);
+    if (!visualizerOutputGain) {
+      visualizerOutputGain = context.createGain();
+      // Keep playback audible while visualizer taps the same source.
+      visualizerOutputGain.gain.value = 1;
+      visualizerOutputGain.connect(context.destination);
     }
     if (visualizerSourceAudio && visualizerSourceAudio !== audio) {
       try {
@@ -719,29 +835,31 @@ const ensureVisualizerAnalyser = (audio: HTMLAudioElement) => {
       visualizerSourceAudio = null;
     }
     if (!visualizerSourceNode && !visualizerStreamSourceNode) {
-      try {
-        visualizerSourceNode = context.createMediaElementSource(audio);
-        visualizerSourceAudio = audio;
-        visualizerBoundSrc = activeSrc;
-        visualizerSourceNode.connect(visualizerAnalyser);
-      } catch (sourceError) {
-        const capture =
-          (audio as HTMLAudioElement & {
-            captureStream?: () => MediaStream;
-            mozCaptureStream?: () => MediaStream;
-          }).captureStream?.() ??
-          (audio as HTMLAudioElement & {
-            captureStream?: () => MediaStream;
-            mozCaptureStream?: () => MediaStream;
-          }).mozCaptureStream?.();
-        if (!capture) {
-          throw sourceError;
-        }
-        visualizerStreamSourceNode = context.createMediaStreamSource(capture);
-        visualizerStreamSourceNode.connect(visualizerAnalyser);
-        visualizerSourceAudio = audio;
-        visualizerBoundSrc = activeSrc;
+      const capture =
+        (audio as HTMLAudioElement & {
+          captureStream?: () => MediaStream;
+          mozCaptureStream?: () => MediaStream;
+        }).captureStream?.() ??
+        (audio as HTMLAudioElement & {
+          captureStream?: () => MediaStream;
+          mozCaptureStream?: () => MediaStream;
+        }).mozCaptureStream?.();
+      if (!capture) {
+        logClient("warning", "visualizer_capture_unavailable", {
+          src: activeSrc,
+          contextState: context.state,
+        });
+        return null;
       }
+      visualizerStreamSourceNode = context.createMediaStreamSource(capture);
+      visualizerStreamSourceNode.connect(visualizerAnalyser);
+      visualizerSourceAudio = audio;
+      visualizerBoundSrc = activeSrc;
+      logClient("debug", "visualizer_source_bound", {
+        mode: "capture-stream",
+        src: activeSrc,
+        contextState: context.state,
+      });
     }
     if (!visualizerDataArray) {
       visualizerDataArray = new Uint8Array(visualizerAnalyser.frequencyBinCount);
@@ -757,6 +875,9 @@ const ensureVisualizerAnalyser = (audio: HTMLAudioElement) => {
     };
   } catch (error) {
     console.error("[ThemeDeck] visualizer init failed", error);
+    logClient("warning", "visualizer_init_failed", {
+      error: toErrorMessage(error),
+    });
     visualizerRetryAfterMs = Date.now() + 1500;
     return null;
   }
@@ -942,13 +1063,30 @@ const seekAudioToOffset = async (
   });
 };
 
-const stopPlayback = (fade: boolean) => {
+const stopPlayback = (fade: boolean, reason = "unspecified") => {
   const token = ++stopPlaybackToken;
   if (stopPlaybackFadeInterval) {
     window.clearInterval(stopPlaybackFadeInterval);
     stopPlaybackFadeInterval = null;
   }
   const audio = sharedAudio;
+  if (USE_BACKEND_PLAYBACK) {
+    void stopBackendPlayback().catch((error) => {
+      logClient("warning", "stop_backend_playback_failed", {
+        reason,
+        error: toErrorMessage(error),
+      });
+    });
+  }
+  logClient("info", "stop_playback_invoked", {
+    reason,
+    fade,
+    hasAudio: !!audio,
+    playbackAppId: playbackState.appId,
+    playbackReason: playbackState.reason,
+    playbackStatus: playbackState.status,
+    stack: (new Error().stack || "").split("\n").slice(1, 4).join(" | "),
+  });
   if (!audio) {
     notifyPlayback({
       appId: null,
@@ -1047,6 +1185,40 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
   const audio = ensureAudio();
 
   try {
+    if (USE_BACKEND_PLAYBACK) {
+      const sameTrack =
+        playbackState.appId === track.appId &&
+        playbackState.status === "playing" &&
+        playbackState.reason === reason;
+      if (sameTrack) {
+        return;
+      }
+      const configuredOffset = clamp(track.startOffset ?? 0, 0, 30);
+      const offset =
+        typeof track.resumeTime === "number" && Number.isFinite(track.resumeTime)
+          ? Math.max(0, track.resumeTime)
+          : configuredOffset;
+      const result = await playTrackBackend(
+        track.path,
+        getEffectiveTrackVolume(track.volume),
+        track.loop !== false,
+        offset
+      );
+      logClient("info", "backend_play_started", {
+        appId: track.appId,
+        reason,
+        path: track.path,
+        volume: getEffectiveTrackVolume(track.volume),
+        trackVolume: clamp(track.volume ?? 1),
+        masterVolume: masterVolumeRuntime,
+        loop: track.loop !== false,
+        offset,
+        result,
+      });
+      notifyPlayback({ appId: track.appId, reason, status: "playing" });
+      return;
+    }
+
     const nextUrl = await resolveAudioUrl(track);
     if (invocationId !== playInvocationCounter) {
       return;
@@ -1063,8 +1235,32 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       audio.src = nextUrl;
     }
 
+    const maybeSetSinkId = (
+      audio as HTMLAudioElement & {
+        setSinkId?: (sinkId: string) => Promise<void>;
+        sinkId?: string;
+      }
+    ).setSinkId;
+    if (typeof maybeSetSinkId === "function") {
+      try {
+        await maybeSetSinkId.call(audio, "default");
+        logClient("debug", "set_sink_id_ok", {
+          sinkId: (
+            audio as HTMLAudioElement & {
+              sinkId?: string;
+            }
+          ).sinkId,
+        });
+      } catch (error) {
+        logClient("warning", "set_sink_id_failed", {
+          error: toErrorMessage(error),
+        });
+      }
+    }
+
     audio.loop = track.loop !== false;
-    audio.volume = clamp(track.volume ?? 1);
+    audio.muted = false;
+    audio.volume = getEffectiveTrackVolume(track.volume);
     const configuredOffset = clamp(track.startOffset ?? 0, 0, 30);
     const offset =
       typeof track.resumeTime === "number" && Number.isFinite(track.resumeTime)
@@ -1083,6 +1279,17 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     if (runningGameAppId !== null) {
       return;
     }
+    logClient("info", "play_attempt", {
+      appId: track.appId,
+      reason,
+      sameTrack,
+      volume: audio.volume,
+      muted: audio.muted,
+      readyState: audio.readyState,
+      networkState: audio.networkState,
+      contextState: visualizerAudioContext?.state ?? null,
+      src: nextUrl,
+    });
     await audio.play();
     if (offset > 0 && !seekApplied) {
       await seekAudioToOffset(audio, offset);
@@ -1097,6 +1304,48 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     ) {
       clearGlobalAmbientResumeSnapshot();
     }
+    console.info("[ThemeDeck] playback started", {
+      appId: track.appId,
+      reason,
+      volume: audio.volume,
+      muted: audio.muted,
+      paused: audio.paused,
+      currentTime: Number.isFinite(audio.currentTime) ? audio.currentTime : null,
+      src: audio.currentSrc || audio.src,
+      desktopModeActive,
+      runningGameAppId,
+    });
+    logClient("info", "play_started", {
+      appId: track.appId,
+      reason,
+      volume: audio.volume,
+      muted: audio.muted,
+      paused: audio.paused,
+      readyState: audio.readyState,
+      networkState: audio.networkState,
+      contextState: visualizerAudioContext?.state ?? null,
+      currentTime: Number.isFinite(audio.currentTime) ? audio.currentTime : null,
+      src: audio.currentSrc || audio.src,
+    });
+    const emitProbe = (tag: string) => {
+      if (audio !== sharedAudio) {
+        return;
+      }
+      logClient("info", tag, {
+        appId: track.appId,
+        paused: audio.paused,
+        ended: audio.ended,
+        muted: audio.muted,
+        volume: audio.volume,
+        readyState: audio.readyState,
+        networkState: audio.networkState,
+        contextState: visualizerAudioContext?.state ?? null,
+        currentTime: Number.isFinite(audio.currentTime) ? audio.currentTime : null,
+      });
+    };
+    window.setTimeout(() => emitProbe("play_probe_1200ms"), 1200);
+    window.setTimeout(() => emitProbe("play_probe_8000ms"), 8000);
+    window.setTimeout(() => emitProbe("play_probe_15000ms"), 15000);
     notifyPlayback({ appId: track.appId, reason, status: "playing" });
   } catch (error) {
     if (invocationId !== playInvocationCounter) {
@@ -1104,9 +1353,19 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     }
     if (isIgnorablePlaybackError(error)) {
       console.warn("[ThemeDeck] playback interrupted", error);
+      logClient("warning", "play_interrupted", {
+        appId: track.appId,
+        reason,
+        error: toErrorMessage(error),
+      });
       return;
     }
     console.error("[ThemeDeck] failed to play", error);
+    logClient("error", "play_failed", {
+      appId: track.appId,
+      reason,
+      error: toErrorMessage(error),
+    });
     const message =
       error instanceof Error && error.message
         ? error.message
@@ -1115,7 +1374,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       title: "ThemeDeck",
       body: `Can't play ${track.filename}: ${message}`,
     });
-    stopPlayback(false);
+    stopPlayback(false, "play_failed_exception");
   } finally {
     if (
       invocationId === playInvocationCounter &&
@@ -1136,7 +1395,7 @@ const applyVolumeToActiveTrack = (appId: number, volume: number) => {
   ) {
     return;
   }
-  sharedAudio.volume = clamp(volume);
+  sharedAudio.volume = getEffectiveTrackVolume(volume);
 };
 
 const applyStartOffsetToActiveTrack = (appId: number, startOffset: number) => {
@@ -1161,6 +1420,28 @@ const applyLoopToActiveTrack = (appId: number, loop: boolean) => {
     return;
   }
   sharedAudio.loop = loop;
+};
+
+const getTrackVolumeForPlaybackState = (state: PlaybackState): number | undefined => {
+  if (state.appId === GLOBAL_AMBIENT_APP_ID) {
+    return latestGlobalTrackForAutoPlay?.volume;
+  }
+  if (state.appId === STORE_TRACK_APP_ID) {
+    return latestStoreTrackForAutoPlay?.volume;
+  }
+  if (state.appId && state.appId > 0) {
+    return latestTracksForAutoPlay[state.appId]?.volume;
+  }
+  return undefined;
+};
+
+const applyMasterVolumeToActiveTrack = () => {
+  if (!sharedAudio || playbackState.status !== "playing") {
+    return;
+  }
+  sharedAudio.volume = getEffectiveTrackVolume(
+    getTrackVolumeForPlaybackState(playbackState)
+  );
 };
 
 const notifyFocus = (appId: number | null) => {
@@ -1193,18 +1474,78 @@ const getLibraryPath = (): string => {
   }
 };
 
-const readAppIdFromLocation = (): number | null => {
-  const pathname = getLibraryPath();
-  for (const pattern of DETAIL_PATTERNS) {
-    const match = pathname.match(pattern);
-    if (match?.[1]) {
-      const parsed = Number.parseInt(match[1], 10);
-      if (!Number.isNaN(parsed)) {
-        return parsed;
+const getDetailRouteCandidates = (): string[] => {
+  const candidates = new Set<string>();
+  const pushLocation = (loc?: Location | null) => {
+    if (!loc) return;
+    const composed = `${loc.pathname || ""}${loc.hash || ""}${loc.search || ""}`
+      .trim()
+      .toLowerCase();
+    if (composed) {
+      candidates.add(composed);
+    }
+    const href = String(loc.href || "").trim().toLowerCase();
+    if (href) {
+      candidates.add(href);
+    }
+  };
+
+  try {
+    const focusedWindow =
+      window.SteamUIStore?.GetFocusedWindowInstance?.() ??
+      Router.WindowStore?.GamepadUIMainWindowInstance;
+    const browserWindow =
+      focusedWindow?.BrowserWindow ??
+      Router.WindowStore?.GamepadUIMainWindowInstance?.BrowserWindow;
+    pushLocation(browserWindow?.location ?? null);
+  } catch {
+    // ignore
+  }
+
+  pushLocation(window.location);
+  try {
+    pushLocation(window.top?.location ?? null);
+  } catch {
+    // ignore cross-origin access
+  }
+
+  return Array.from(candidates);
+};
+
+const readAppIdFromRouteSignals = (): number | null => {
+  const candidates = getDetailRouteCandidates();
+  const genericPatterns = [
+    /\/library\/app\/(\d+)/,
+    /\/library\/details\/(\d+)/,
+    /\/library\/[^\/]+\/app\/(\d+)/,
+  ];
+
+  for (const candidate of candidates) {
+    for (const pattern of DETAIL_PATTERNS) {
+      const match = candidate.match(pattern);
+      if (match?.[1]) {
+        const parsed = Number.parseInt(match[1], 10);
+        if (!Number.isNaN(parsed) && parsed > 0) {
+          return parsed;
+        }
+      }
+    }
+    for (const pattern of genericPatterns) {
+      const match = candidate.match(pattern);
+      if (match?.[1]) {
+        const parsed = Number.parseInt(match[1], 10);
+        if (!Number.isNaN(parsed) && parsed > 0) {
+          return parsed;
+        }
       }
     }
   }
+
   return null;
+};
+
+const readAppIdFromLocation = (): number | null => {
+  return readAppIdFromRouteSignals();
 };
 
 const startLocationWatcher = () => {
@@ -1313,7 +1654,7 @@ const setDesktopModeState = (next: boolean) => {
   }
   desktopModeActive = next;
   if (desktopModeActive && playbackState.status === "playing") {
-    stopPlayback(true);
+    stopPlayback(true, "setDesktopModeState");
   }
   scheduleAutoPlaybackFromContext();
 };
@@ -1797,7 +2138,7 @@ const setRunningGameAppId = (next: number | null) => {
     if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
       captureGlobalAmbientResumeSnapshot();
     }
-    stopPlayback(true);
+    stopPlayback(true, "setRunningGameAppId");
   }
   scheduleAutoPlaybackFromContext();
 };
@@ -2312,8 +2653,8 @@ const GameFocusBridge = () => {
     const gameName = appId ? getDisplayName(appId) : "Unknown game";
     const resolved = resolveNowPlayingText(sourceName, gameName);
     return {
-      subtitle: resolved.line3,
-      title: resolved.line2,
+      trackName: resolved.trackName,
+      albumName: resolved.albumName,
     };
   }, [appId, playingTrack]);
 
@@ -2358,7 +2699,8 @@ const GameFocusBridge = () => {
       <style>{`
         @keyframes themedeck-nowplaying-marquee {
           0% { transform: translateX(0); }
-          100% { transform: translateX(calc(-50% - 12px)); }
+          72%, 86% { transform: translateX(calc(-50% - 6px)); }
+          100% { transform: translateX(calc(-50% - 6px)); }
         }
       `}</style>
       <div
@@ -2387,10 +2729,10 @@ const GameFocusBridge = () => {
           <NowPlayingVisualizer />
         </div>
         <div style={{ ...marqueeBaseStyle, marginTop: "0.14rem", fontSize: "0.96rem", fontWeight: 700 }}>
-          <MarqueeText text={parsedNowPlaying.title} />
+          <MarqueeText text={parsedNowPlaying.trackName} />
         </div>
         <div style={{ ...marqueeBaseStyle, marginTop: "0.1rem", fontSize: "0.77rem", opacity: 0.84 }}>
-          <MarqueeText text={parsedNowPlaying.subtitle} />
+          <MarqueeText text={parsedNowPlaying.albumName} />
         </div>
       </div>
     </div>
@@ -2509,22 +2851,25 @@ const NowPlayingVisualizer = () => {
 
 const MarqueeText = ({ text }: { text: string }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const contentRef = useRef<HTMLSpanElement | null>(null);
+  const measureRef = useRef<HTMLSpanElement | null>(null);
   const [shouldScroll, setShouldScroll] = useState(false);
+  const [scrollReady, setScrollReady] = useState(false);
 
   useEffect(() => {
     const measure = () => {
       const container = containerRef.current;
-      const content = contentRef.current;
-      if (!container || !content) {
+      const measureNode = measureRef.current;
+      if (!container || !measureNode) {
         return;
       }
-      const measuredOverflow = content.scrollWidth > container.clientWidth + 4;
+      const contentWidth = measureNode.getBoundingClientRect().width;
+      const containerWidth = container.getBoundingClientRect().width;
+      const measuredOverflow = contentWidth > containerWidth + 2;
       const heuristicOverflow = text.length > 34;
       setShouldScroll(measuredOverflow || heuristicOverflow);
     };
     measure();
-    const timeoutId = window.setTimeout(measure, 30);
+    const timeoutId = window.setTimeout(measure, 60);
     window.addEventListener("resize", measure);
     let observer: ResizeObserver | null = null;
     if (typeof ResizeObserver !== "undefined" && containerRef.current) {
@@ -2540,17 +2885,52 @@ const MarqueeText = ({ text }: { text: string }) => {
     };
   }, [text]);
 
-  if (!shouldScroll) {
+  useEffect(() => {
+    if (!shouldScroll) {
+      setScrollReady(false);
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      setScrollReady(true);
+    }, 3000);
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [shouldScroll, text]);
+
+  if (!shouldScroll || !scrollReady) {
     return (
-      <div ref={containerRef} style={{ overflow: "hidden", whiteSpace: "nowrap" }}>
-        <span ref={contentRef}>{text}</span>
+      <div ref={containerRef} style={{ overflow: "hidden", whiteSpace: "nowrap", position: "relative" }}>
+        <span
+          ref={measureRef}
+          style={{
+            position: "absolute",
+            visibility: "hidden",
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {text}
+        </span>
+        <span>{text}</span>
       </div>
     );
   }
 
-  const durationSeconds = clamp(text.length * 0.28, 8, 22);
+  const durationSeconds = clamp(text.length * 0.28, 8, 24);
   return (
-    <div ref={containerRef} style={{ overflow: "hidden", whiteSpace: "nowrap" }}>
+    <div ref={containerRef} style={{ overflow: "hidden", whiteSpace: "nowrap", position: "relative", width: "100%" }}>
+      <span
+        ref={measureRef}
+        style={{
+          position: "absolute",
+          visibility: "hidden",
+          pointerEvents: "none",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {text}
+      </span>
       <div
         style={{
           display: "inline-flex",
@@ -2558,10 +2938,11 @@ const MarqueeText = ({ text }: { text: string }) => {
           gap: "12px",
           minWidth: "max-content",
           animation: `themedeck-nowplaying-marquee ${durationSeconds}s linear infinite`,
+          animationPlayState: "running",
           willChange: "transform",
         }}
       >
-        <span ref={contentRef}>{text}</span>
+        <span>{text}</span>
         <span>{text}</span>
       </div>
     </div>
@@ -2622,11 +3003,11 @@ const toHumanReadableTrackName = (value: string): string => {
 const resolveNowPlayingText = (
   sourceName: string,
   gameName: string
-): { line2: string; line3: string } => {
+): { trackName: string; albumName: string } => {
   const cleaned = toHumanReadableTrackName(sourceName);
-  const defaultGame = toHumanReadableTrackName(gameName) || "Unknown game";
+  const defaultAlbum = toHumanReadableTrackName(gameName) || "Unknown album";
   if (!cleaned) {
-    return { line2: "Unknown track", line3: defaultGame };
+    return { trackName: "Unknown track", albumName: defaultAlbum };
   }
   const parts = cleaned
     .split(/\s+[-–—]\s+/)
@@ -2635,19 +3016,26 @@ const resolveNowPlayingText = (
   if (parts.length >= 2) {
     const first = parts[0];
     const rest = parts.slice(1).join(" - ");
+    const firstLooksAlbum = /(ost|soundtrack|album|score)/i.test(first);
     const restLooksAlbum = /(ost|soundtrack|album|score)/i.test(rest);
-    if (restLooksAlbum) {
+    if (restLooksAlbum && !firstLooksAlbum) {
       return {
-        line2: first || cleaned,
-        line3: rest || defaultGame,
+        trackName: first || cleaned,
+        albumName: rest || defaultAlbum,
+      };
+    }
+    if (firstLooksAlbum && !restLooksAlbum) {
+      return {
+        trackName: rest || cleaned,
+        albumName: first || defaultAlbum,
       };
     }
     return {
-      line2: rest || first || cleaned,
-      line3: first || defaultGame,
+      trackName: rest || cleaned,
+      albumName: first || defaultAlbum,
     };
   }
-  return { line2: cleaned, line3: defaultGame };
+  return { trackName: cleaned, albumName: defaultAlbum };
 };
 
 const normalizeGlobalTrack = (
@@ -2997,10 +3385,11 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
     return null;
   }
 
-  // Treat only an actively mounted game-details bridge as valid per-game context.
-  // This keeps tile/context-menu focus from triggering game playback.
-  const effectiveAppId =
-    activeDetailBridgeCount > 0 ? activeDetailRouteAppId : null;
+  // Prefer the mounted game-details bridge app id, but fall back to route/url
+  // signals so autoplay still works through remounts/focus transitions.
+  const routeSignalAppId = readAppIdFromRouteSignals();
+  const bridgeAppId = activeDetailBridgeCount > 0 ? activeDetailRouteAppId : null;
+  const effectiveAppId = bridgeAppId ?? routeSignalAppId;
 
   if (effectiveAppId && readAutoPlaySetting()) {
     const gameTrack = latestTracksForAutoPlay[effectiveAppId];
@@ -3095,9 +3484,18 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
 };
 
 const applyAutoPlaybackFromContext = () => {
+  if (activeDetailBridgeCount > 0 && activeDetailRouteAppId) {
+    lastGameDetailContextSeenAtMs = Date.now();
+  } else {
+    const routeSignalAppId = readAppIdFromRouteSignals();
+    if (routeSignalAppId) {
+      lastGameDetailContextSeenAtMs = Date.now();
+    }
+  }
+
   if (desktopModeActive) {
     if (playbackState.status === "playing") {
-      stopPlayback(true);
+      stopPlayback(true, "applyAutoPlaybackFromContext_desktopMode");
     }
     return;
   }
@@ -3107,7 +3505,7 @@ const applyAutoPlaybackFromContext = () => {
       if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
         captureGlobalAmbientResumeSnapshot();
       }
-      stopPlayback(true);
+      stopPlayback(true, "applyAutoPlaybackFromContext_runningGame");
     }
     return;
   }
@@ -3132,7 +3530,7 @@ const applyAutoPlaybackFromContext = () => {
     if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
       captureGlobalAmbientResumeSnapshot();
     }
-    stopPlayback(true);
+    stopPlayback(true, "applyAutoPlaybackFromContext_launchSuppression");
     return;
   }
 
@@ -3141,7 +3539,7 @@ const applyAutoPlaybackFromContext = () => {
       if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
         captureGlobalAmbientResumeSnapshot();
       }
-      stopPlayback(true);
+      stopPlayback(true, "applyAutoPlaybackFromContext_themeDeckRoute");
     }
     return;
   }
@@ -3155,7 +3553,7 @@ const applyAutoPlaybackFromContext = () => {
     playbackState.status === "playing"
   ) {
     captureGlobalAmbientResumeSnapshot();
-    stopPlayback(true);
+    stopPlayback(true, "applyAutoPlaybackFromContext_shouldSuppressGlobal");
     return;
   }
   if (playbackState.reason === "manual") {
@@ -3175,11 +3573,24 @@ const applyAutoPlaybackFromContext = () => {
 
   const nextTrack = resolveAutoTrackFromContext();
   if (!nextTrack) {
+    const playingAppId =
+      typeof playbackState.appId === "number" ? playbackState.appId : null;
+    if (
+      playbackState.reason === "auto" &&
+      playbackState.status === "playing" &&
+      playingAppId !== null &&
+      playingAppId > 0 &&
+      latestTracksForAutoPlay[playingAppId] &&
+      Date.now() - lastGameDetailContextSeenAtMs < 220
+    ) {
+      // Keep the active game track alive through transient route/context gaps.
+      return;
+    }
     if (playbackState.reason === "auto" && playbackState.status === "playing") {
       if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
         captureGlobalAmbientResumeSnapshot();
       }
-      stopPlayback(true);
+      stopPlayback(true, "applyAutoPlaybackFromContext_noNextTrack");
     }
     return;
   }
@@ -3247,6 +3658,11 @@ const handleLaunchStopModeChanged = () => {
   scheduleAutoPlaybackFromContext();
 };
 
+const handleMasterVolumeChanged = () => {
+  applyMasterVolumeToActiveTrack();
+  scheduleAutoPlaybackFromContext();
+};
+
 const startAutoPlaybackCoordinator = () => {
   if (autoPlaybackStarted) {
     return;
@@ -3254,6 +3670,7 @@ const startAutoPlaybackCoordinator = () => {
   autoPlaybackStarted = true;
   ambientInterruptionModeRuntime = readAmbientInterruptionModeSetting();
   launchStopModeRuntime = readLaunchStopModeSetting();
+  masterVolumeRuntime = readMasterVolumeSetting() / 100;
   startDesktopModeWatcher();
   startRunningGameWatcher();
   refreshAutoPlaybackTrackCache();
@@ -3278,6 +3695,7 @@ const startAutoPlaybackCoordinator = () => {
     scheduleAutoPlaybackFromContext
   );
   window.addEventListener(LAUNCH_STOP_MODE_EVENT, handleLaunchStopModeChanged);
+  window.addEventListener(MASTER_VOLUME_EVENT, handleMasterVolumeChanged);
   window.addEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
   refreshStoreContext();
   autoPlaybackRouteInterval = window.setInterval(() => {
@@ -3315,6 +3733,7 @@ const stopAutoPlaybackCoordinator = () => {
     LAUNCH_STOP_MODE_EVENT,
     handleLaunchStopModeChanged
   );
+  window.removeEventListener(MASTER_VOLUME_EVENT, handleMasterVolumeChanged);
   window.removeEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
   stopDesktopModeWatcher();
   if (autoPlaybackRouteInterval) {
@@ -3477,6 +3896,35 @@ const useStoreTrackEnabledSetting = (): [boolean, (value: boolean) => void] =>
     STORE_TRACK_ENABLED_EVENT
   );
 
+const useMasterVolumeSetting = (): [number, (value: number) => void] => {
+  const [value, setValue] = useState<number>(() => readMasterVolumeSetting());
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const parsed = Number.parseFloat(
+        String((event as CustomEvent<number>).detail ?? "")
+      );
+      setValue(
+        Number.isFinite(parsed)
+          ? Math.round(clamp(parsed, 1, 100))
+          : readMasterVolumeSetting()
+      );
+    };
+    window.addEventListener(MASTER_VOLUME_EVENT, handler as EventListener);
+    return () =>
+      window.removeEventListener(MASTER_VOLUME_EVENT, handler as EventListener);
+  }, []);
+
+  const update = useCallback((next: number) => {
+    const normalized = Math.round(clamp(next, 1, 100));
+    setValue(normalized);
+    persistMasterVolumeSetting(normalized);
+    applyMasterVolumeToActiveTrack();
+  }, []);
+
+  return [value, update];
+};
+
 const useAmbientInterruptionModeSetting = (): [
   AmbientInterruptionMode,
   (value: AmbientInterruptionMode) => void
@@ -3633,6 +4081,7 @@ const Content = () => {
   const [globalAmbientEnabled, setGlobalAmbientEnabled] =
     useGlobalAmbientEnabledSetting();
   const [storeTrackEnabled, setStoreTrackEnabled] = useStoreTrackEnabledSetting();
+  const [masterVolume, setMasterVolume] = useMasterVolumeSetting();
   const [ambientDisableStore, setAmbientDisableStore] =
     useAmbientDisableStoreSetting();
   const [ambientInterruptionMode, setAmbientInterruptionMode] =
@@ -3668,7 +4117,7 @@ const Content = () => {
   const resolvingMissingNameIdsRef = useRef<Set<number>>(new Set());
   const [missingResolveInFlightCount, setMissingResolveInFlightCount] = useState(0);
   const playback = usePlaybackStateValue();
-  const topFocusRef = useRef<HTMLDivElement | null>(null);
+  const pageRef = useRef<HTMLDivElement | null>(null);
   const getGameName = useCallback(
     (appId: number) => {
       const store = (window as any)?.appStore;
@@ -4426,7 +4875,7 @@ const Content = () => {
       playback.appId === GLOBAL_AMBIENT_APP_ID &&
       playback.status === "playing"
     ) {
-      stopPlayback(false);
+      stopPlayback(false, "handleGlobalPreviewToggle_manualPause");
       return;
     }
     playTrack(
@@ -4523,7 +4972,7 @@ const Content = () => {
       clearGlobalAmbientResumeSnapshot();
       clearAudioCache(removedPath);
       if (playback.appId === GLOBAL_AMBIENT_APP_ID) {
-        stopPlayback(true);
+        stopPlayback(true, "handleRemoveGlobalTrack");
       }
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
       scheduleAutoPlaybackFromContext();
@@ -4539,7 +4988,7 @@ const Content = () => {
   const handleStorePreviewToggle = () => {
     if (!storeTrack) return;
     if (playback.appId === STORE_TRACK_APP_ID && playback.status === "playing") {
-      stopPlayback(false);
+      stopPlayback(false, "handleStorePreviewToggle_manualPause");
       return;
     }
     playTrack(
@@ -4635,7 +5084,7 @@ const Content = () => {
       latestStoreTrackForAutoPlay = null;
       clearAudioCache(removedPath);
       if (playback.appId === STORE_TRACK_APP_ID) {
-        stopPlayback(true);
+        stopPlayback(true, "handleRemoveStoreTrack");
       }
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
       scheduleAutoPlaybackFromContext();
@@ -4649,12 +5098,19 @@ const Content = () => {
   };
 
   useEffect(() => {
-    topFocusRef.current?.focus();
+    const timeoutId = window.setTimeout(() => {
+      focusFirstInteractiveElement(
+        pageRef.current,
+        "button, [role='button'], [role='radio'], input, textarea, select, [tabindex]:not([tabindex='-1'])"
+      );
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
   return (
     <ScrollPanel>
       <div
+        ref={pageRef}
         className="themedeck-main"
         style={{
           paddingBottom: "1.5rem",
@@ -4702,11 +5158,6 @@ const Content = () => {
           word-break: break-word !important;
         }
       `}</style>
-      <div
-        ref={topFocusRef}
-        tabIndex={-1}
-        style={{ position: "absolute", width: 0, height: 0, outline: "none" }}
-      />
       <PanelSection>
         <PanelSectionRow>
           <div style={{ width: "100%", paddingTop: "0.2rem" }}>
@@ -5462,6 +5913,26 @@ const Content = () => {
           </PanelSectionRow>
         )}
       </PanelSection>
+      <PanelSection title="ThemeDeck master volume">
+        <PanelSectionRow>
+          <div style={{ width: "100%" }}>
+            <SliderField
+              value={masterVolume}
+              label="Master volume override"
+              min={1}
+              max={100}
+              step={1}
+              valueSuffix="%"
+              showValue
+              onChange={setMasterVolume}
+            />
+            <div style={{ opacity: 0.78, fontSize: "0.84rem", marginTop: "0.35rem" }}>
+              At 100%, ThemeDeck respects each game/global/store track volume. Below
+              100%, all ThemeDeck music plays at this volume instead.
+            </div>
+          </div>
+        </PanelSectionRow>
+      </PanelSection>
       </div>
     </ScrollPanel>
   );
@@ -5479,7 +5950,6 @@ const ChangeTheme = () => {
     files: [],
   });
   const [browserLoading, setBrowserLoading] = useState(true);
-  const [manualPath, setManualPath] = useState("/home/deck");
   const [ytDlpStatus, setYtDlpStatus] = useState<YtDlpStatus>({
     installed: false,
   });
@@ -5493,7 +5963,7 @@ const ChangeTheme = () => {
     window.location.pathname || ""
   );
   const [selectedYouTubeId, setSelectedYouTubeId] = useState<string | null>(null);
-  const topFocusRef = useRef<HTMLDivElement | null>(null);
+  const pageRef = useRef<HTMLDivElement | null>(null);
   const assignedVideoId = useMemo(() => {
     if (!track?.filename) return "";
     const match = track.filename.match(/\[([A-Za-z0-9_-]{6,})\]\.[A-Za-z0-9]+$/);
@@ -5594,7 +6064,6 @@ const ChangeTheme = () => {
         const listing = await listDirectory(nextDir || currentDir);
         setBrowser(listing);
         setCurrentDir(listing.path);
-        setManualPath(listing.path);
       } catch (error) {
         console.error("[ThemeDeck] list directory failed", error);
       } finally {
@@ -5609,7 +6078,13 @@ const ChangeTheme = () => {
   }, []);
 
   useEffect(() => {
-    topFocusRef.current?.focus();
+    const timeoutId = window.setTimeout(() => {
+      focusFirstInteractiveElement(
+        pageRef.current,
+        "button, [role='button'], [role='radio'], [tabindex]:not([tabindex='-1'])"
+      );
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
   }, [appId]);
 
   useEffect(
@@ -5654,7 +6129,7 @@ const ChangeTheme = () => {
     }
   };
 
-  const handleYouTubeSearch = async () => {
+  const handleYouTubeSearch = async (overrideQuery?: string) => {
     if (!ytDlpStatus.installed) {
       toaster.toast({
         title: "ThemeDeck",
@@ -5662,7 +6137,7 @@ const ChangeTheme = () => {
       });
       return;
     }
-    const query = youtubeQuery.trim();
+    const query = (overrideQuery ?? youtubeQuery).trim();
     if (!query) {
       toaster.toast({
         title: "ThemeDeck",
@@ -5791,12 +6266,6 @@ const ChangeTheme = () => {
     saveFromPath(joinPath(currentDir, file));
   };
 
-  const handleManualGo = () => {
-    if (!manualPath) return;
-    refreshDirectory(manualPath);
-  };
-
-
   const handleRemove = async () => {
     if (!appId) return;
     try {
@@ -5874,11 +6343,49 @@ const ChangeTheme = () => {
   const handleTrackPreviewToggle = () => {
     if (!track || !appId) return;
     if (playback.appId === appId && playback.status === "playing") {
-      stopPlayback(false);
+      stopPlayback(false, "handleTrackPreviewToggle_manualPause");
       return;
     }
     playTrack(track, "manual");
   };
+
+  const audioFiles = useMemo(
+    () =>
+      browser.files.filter((file) =>
+        AUDIO_EXTENSIONS.some((ext) => file.toLowerCase().endsWith(`.${ext}`))
+      ),
+    [browser.files]
+  );
+  const searchPresets = useMemo(() => {
+    const displayName = getDisplayName(appId);
+    return [
+      `${displayName} theme music`,
+      `${displayName} soundtrack`,
+      `${displayName} ost`,
+      `${displayName} main theme`,
+    ];
+  }, [appId]);
+  const runPresetSearch = (query: string) => {
+    setYoutubeQuery(query);
+    void handleYouTubeSearch(query);
+  };
+  const selectedYouTubeIndex = selectedYouTubeResult
+    ? youtubeResults.findIndex((item) => item.id === selectedYouTubeResult.id)
+    : -1;
+  const selectRelativeYouTubeResult = (delta: number) => {
+    if (!youtubeResults.length) return;
+    const currentIndex = Math.max(0, selectedYouTubeIndex);
+    const nextIndex =
+      (currentIndex + delta + youtubeResults.length) % youtubeResults.length;
+    setSelectedYouTubeId(youtubeResults[nextIndex].id);
+  };
+  const directoryShortcuts = [
+    { label: "Home", path: "/home/deck" },
+    { label: "Music", path: "/home/deck/Music" },
+    { label: "Downloads", path: "/home/deck/Downloads" },
+    { label: "SD card", path: "/run/media/mmcblk0p1" },
+    { label: "Root", path: "/" },
+  ];
 
   if (!appId) {
     return (
@@ -5895,6 +6402,7 @@ const ChangeTheme = () => {
   return (
     <ScrollPanel>
       <div
+        ref={pageRef}
         style={{
           padding: 24,
           paddingTop: 48,
@@ -5903,67 +6411,78 @@ const ChangeTheme = () => {
           boxSizing: "border-box",
         }}
       >
-      <div
-        ref={topFocusRef}
-        tabIndex={-1}
-        style={{ position: "absolute", width: 0, height: 0, outline: "none" }}
-      />
-      <PanelSection title={`ThemeDeck for ${getDisplayName(appId)}`}>
-        <PanelSectionRow>
-          {loading ? (
-            <Spinner />
-          ) : track ? (
-            <div>
-              <div style={{ fontWeight: 600 }}>{track.filename}</div>
-              <div style={{ opacity: 0.8 }}>{track.path}</div>
-            </div>
-          ) : (
-            <div>No music selected yet.</div>
-          )}
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div
-            style={{
-              width: "100%",
-              display: "flex",
-              gap: "0.5rem",
-              flexWrap: "nowrap",
-              alignItems: "center",
-            }}
-          >
-            {track ? (
-              <button
-                className="DialogButton"
-                onClick={handleTrackPreviewToggle}
-                style={{ minWidth: "6.5rem", whiteSpace: "nowrap" }}
-              >
-                {playback.appId === appId && playback.status === "playing"
-                  ? "Pause"
-                  : "Play"}
-              </button>
-            ) : null}
-            {track ? (
-              <button
-                className="DialogButton"
-                onClick={handleRemove}
-                style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
-              >
-                Remove music
-              </button>
-            ) : null}
-            <button
-              className="DialogButton"
-              onClick={() => Navigation.NavigateBack()}
-              style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
-            >
-              Done
-            </button>
-          </div>
-        </PanelSectionRow>
-        {track ? (
+        <PanelSection title={`ThemeDeck for ${getDisplayName(appId)}`}>
           <PanelSectionRow>
-            <div style={{ width: "100%" }}>
-              <div style={{ marginTop: "0.25rem" }}>
+            <div
+              style={{
+                width: "100%",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.5rem",
+              }}
+            >
+              {loading ? (
+                <Spinner />
+              ) : track ? (
+                <>
+                  <div style={{ fontWeight: 700 }}>{track.filename}</div>
+                  <div
+                    style={{
+                      opacity: 0.8,
+                      fontFamily: "monospace",
+                      fontSize: "0.78rem",
+                      lineHeight: 1.35,
+                      wordBreak: "break-word",
+                    }}
+                  >
+                    {track.path}
+                  </div>
+                </>
+              ) : (
+                <div>No music selected yet.</div>
+              )}
+              <div
+                style={{
+                  width: "100%",
+                  display: "flex",
+                  gap: "0.5rem",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                {track ? (
+                  <button
+                    className="DialogButton"
+                    onClick={handleTrackPreviewToggle}
+                    style={{ minWidth: "7rem", whiteSpace: "nowrap" }}
+                  >
+                    {playback.appId === appId && playback.status === "playing"
+                      ? "Pause"
+                      : "Play"}
+                  </button>
+                ) : null}
+                {track ? (
+                  <button
+                    className="DialogButton"
+                    onClick={handleRemove}
+                    style={{ minWidth: "9rem", whiteSpace: "nowrap" }}
+                  >
+                    Remove music
+                  </button>
+                ) : null}
+                <button
+                  className="DialogButton"
+                  onClick={() => Navigation.NavigateBack()}
+                  style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
+                >
+                  Done
+                </button>
+              </div>
+            </div>
+          </PanelSectionRow>
+          {track ? (
+            <PanelSectionRow>
+              <Focusable style={{ width: "100%" }}>
                 <SliderField
                   value={Math.round(track.volume * 100)}
                   label="Volume"
@@ -5974,137 +6493,287 @@ const ChangeTheme = () => {
                   showValue
                   onChange={handleTrackVolumeChange}
                 />
-              </div>
-              <div style={{ marginTop: "0.35rem" }}>
-                <SliderField
-                  value={Math.round(track.startOffset)}
-                  label="Start skip"
-                  min={0}
-                  max={30}
-                  step={1}
-                  valueSuffix="s"
-                  showValue
-                  onChange={handleTrackStartOffsetChange}
-                />
-              </div>
-              <div style={{ marginTop: "0.35rem" }}>
-                <ToggleField
-                  checked={track.loop}
-                  label="Loop track"
-                  description="Play continuously when this track is active."
-                  onChange={handleTrackLoopChange}
-                />
-              </div>
-            </div>
-          </PanelSectionRow>
-        ) : null}
-      </PanelSection>
+                <div style={{ marginTop: "0.35rem" }}>
+                  <SliderField
+                    value={Math.round(track.startOffset)}
+                    label="Start skip"
+                    min={0}
+                    max={30}
+                    step={1}
+                    valueSuffix="s"
+                    showValue
+                    onChange={handleTrackStartOffsetChange}
+                  />
+                </div>
+                <div style={{ marginTop: "0.35rem" }}>
+                  <ToggleField
+                    checked={track.loop}
+                    label="Loop track"
+                    description="Play continuously when this track is active."
+                    onChange={handleTrackLoopChange}
+                  />
+                </div>
+              </Focusable>
+            </PanelSectionRow>
+          ) : null}
+        </PanelSection>
 
-      <PanelSection title="YouTube search (yt-dlp)">
-        <PanelSectionRow>
-          <div
-            style={{
-              width: "100%",
-              display: "flex",
-              flexDirection: "column",
-              gap: "0.35rem",
-            }}
-          >
-            <div style={{ fontWeight: 600 }}>
-              {ytDlpStatus.installed
-                ? `yt-dlp ${ytDlpStatus.version || ""}`.trim()
-                : "yt-dlp not installed"}
-            </div>
-            {ytDlpStatus.path ? (
-              <div style={{ fontFamily: "monospace", fontSize: "0.8rem", opacity: 0.8 }}>
-                {ytDlpStatus.path}
-              </div>
-            ) : null}
-            <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-              Search YouTube for game music, download audio locally, and assign it to
-              this game.
-            </div>
-            {!ytDlpStatus.installed ? (
-              <button
-                className="DialogButton"
-                onClick={async () => {
-                  setYtDlpBusy(true);
-                  try {
-                    const status = await updateYtDlp();
-                    setYtDlpStatus(status);
-                    toaster.toast({
-                      title: "ThemeDeck",
-                      body: `yt-dlp ready (${status.version || "latest"})`,
-                    });
-                  } catch (error) {
-                    toaster.toast({
-                      title: "ThemeDeck",
-                      body: `Failed to install yt-dlp: ${getErrorMessage(
-                        error,
-                        "Unknown update error"
-                      )}`,
-                    });
-                  } finally {
-                    setYtDlpBusy(false);
-                    refreshYtDlpStatus(true);
-                  }
-                }}
-                disabled={ytDlpBusy}
-                style={{ width: "fit-content" }}
-              >
-                {ytDlpBusy ? "Installing..." : "Install yt-dlp"}
-              </button>
-            ) : null}
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "1fr auto",
-              width: "100%",
-              gap: "0.5rem",
-              alignItems: "center",
-            }}
-          >
-            <TextField
-              value={youtubeQuery}
-              onChange={(event) => setYoutubeQuery(event.target.value)}
-              style={{ width: "100%", minWidth: "22rem" }}
-            />
-            <button
-              className="DialogButton"
-              onClick={handleYouTubeSearch}
-              disabled={youtubeLoading || ytDlpBusy}
-              style={{ minWidth: "12rem" }}
-            >
-              {youtubeLoading ? "Searching..." : "Search"}
-            </button>
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          {youtubeError ? (
+        <PanelSection title="YouTube search (yt-dlp)">
+          <PanelSectionRow>
             <div
               style={{
                 width: "100%",
-                padding: "0.55rem 0.7rem",
-                borderRadius: "0.35rem",
-                background: "rgba(255, 90, 90, 0.13)",
-                color: "#ffd7d7",
-                fontSize: "0.85rem",
-                lineHeight: 1.35,
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.45rem",
               }}
             >
-              {youtubeError}
+              <div style={{ fontWeight: 700 }}>
+                {ytDlpStatus.installed
+                  ? `yt-dlp ${ytDlpStatus.version || ""}`.trim()
+                  : "yt-dlp not installed"}
+              </div>
+              {ytDlpStatus.path ? (
+                <div
+                  style={{
+                    fontFamily: "monospace",
+                    fontSize: "0.78rem",
+                    opacity: 0.8,
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {ytDlpStatus.path}
+                </div>
+              ) : null}
+              {!ytDlpStatus.installed ? (
+                <button
+                  className="DialogButton"
+                  onClick={async () => {
+                    setYtDlpBusy(true);
+                    try {
+                      const status = await updateYtDlp();
+                      setYtDlpStatus(status);
+                      toaster.toast({
+                        title: "ThemeDeck",
+                        body: `yt-dlp ready (${status.version || "latest"})`,
+                      });
+                    } catch (error) {
+                      toaster.toast({
+                        title: "ThemeDeck",
+                        body: `Failed to install yt-dlp: ${getErrorMessage(
+                          error,
+                          "Unknown update error"
+                        )}`,
+                      });
+                    } finally {
+                      setYtDlpBusy(false);
+                      refreshYtDlpStatus(true);
+                    }
+                  }}
+                  disabled={ytDlpBusy}
+                  style={{ width: "fit-content", minWidth: "11rem" }}
+                >
+                  {ytDlpBusy ? "Installing..." : "Install yt-dlp"}
+                </button>
+              ) : null}
+              <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap" }}>
+                {searchPresets.map((query) => (
+                  <button
+                    key={query}
+                    className="DialogButton"
+                    onClick={() => runPresetSearch(query)}
+                    disabled={youtubeLoading || ytDlpBusy}
+                    style={{ minWidth: "12rem", whiteSpace: "normal" }}
+                  >
+                    {youtubeLoading && youtubeQuery === query ? "Searching..." : query}
+                  </button>
+                ))}
+              </div>
             </div>
+          </PanelSectionRow>
+          {youtubeError ? (
+            <PanelSectionRow>
+              <div
+                style={{
+                  width: "100%",
+                  padding: "0.55rem 0.7rem",
+                  borderRadius: "0.35rem",
+                  background: "rgba(255, 90, 90, 0.13)",
+                  color: "#ffd7d7",
+                  fontSize: "0.85rem",
+                  lineHeight: 1.35,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                }}
+              >
+                {youtubeError}
+              </div>
+            </PanelSectionRow>
           ) : null}
-        </PanelSectionRow>
-        <PanelSectionRow>
-          {youtubeLoading ? (
-            <Spinner />
-          ) : (
+          <PanelSectionRow>
+            {youtubeLoading ? (
+              <Spinner />
+            ) : (
+              <div
+                style={{
+                  width: "100%",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.6rem",
+                }}
+              >
+                {selectedYouTubeResult ? (
+                  <div
+                    style={{
+                      display: "flex",
+                      gap: "0.45rem",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <button
+                      className="DialogButton"
+                      onClick={() => selectRelativeYouTubeResult(-1)}
+                      disabled={youtubeResults.length < 2}
+                      style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
+                    >
+                      Prev
+                    </button>
+                    <button
+                      className="DialogButton"
+                      onClick={() => selectRelativeYouTubeResult(1)}
+                      disabled={youtubeResults.length < 2}
+                      style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
+                    >
+                      Next
+                    </button>
+                    <button
+                      className="DialogButton"
+                      onClick={() => handleYouTubePreview(selectedYouTubeResult)}
+                      disabled={previewLoadingVideoId !== null || downloadingVideoId !== null}
+                      style={{ minWidth: "9rem", whiteSpace: "nowrap" }}
+                    >
+                      {previewLoadingVideoId === selectedYouTubeResult.id
+                        ? "Loading..."
+                        : previewingVideoId === selectedYouTubeResult.id
+                        ? "Stop Preview"
+                        : "Play Preview"}
+                    </button>
+                    <button
+                      className="DialogButton"
+                      onClick={() => handleYouTubeDownload(selectedYouTubeResult)}
+                      disabled={downloadingVideoId !== null}
+                      style={{ minWidth: "12rem", whiteSpace: "nowrap" }}
+                    >
+                      {downloadingVideoId === selectedYouTubeResult.id
+                        ? "Downloading..."
+                        : "Download & Assign"}
+                    </button>
+                  </div>
+                ) : null}
+                <div
+                  style={{
+                    width: "100%",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "0.45rem",
+                  }}
+                >
+                  {youtubeResults.map((result, index) => {
+                    const duration = formatDuration(result.duration);
+                    const thumbnailUrl = `https://i.ytimg.com/vi/${encodeURIComponent(
+                      result.id
+                    )}/mqdefault.jpg`;
+                    const isCurrentlyAssigned =
+                      !!assignedVideoId && assignedVideoId === result.id;
+                    const isSelected = selectedYouTubeId === result.id;
+                    return (
+                      <Focusable
+                        key={result.id}
+                        onActivate={() => setSelectedYouTubeId(result.id)}
+                        style={{
+                          borderRadius: "0.4rem",
+                          padding: "0.55rem",
+                          width: "100%",
+                          background: isCurrentlyAssigned
+                            ? "rgba(80, 190, 90, 0.22)"
+                            : isSelected
+                            ? "rgba(120, 180, 255, 0.16)"
+                            : "rgba(255,255,255,0.05)",
+                          border: isCurrentlyAssigned
+                            ? "1px solid rgba(120, 230, 130, 0.75)"
+                            : isSelected
+                            ? "1px solid rgba(120, 180, 255, 0.9)"
+                            : "1px solid rgba(255,255,255,0.08)",
+                          display: "grid",
+                          gridTemplateColumns: "8rem minmax(0, 1fr)",
+                          gap: "0.65rem",
+                          alignItems: "center",
+                        }}
+                      >
+                        <img
+                          src={thumbnailUrl}
+                          alt=""
+                          style={{
+                            width: "8rem",
+                            aspectRatio: "16 / 9",
+                            objectFit: "cover",
+                            borderRadius: "0.3rem",
+                            background: "rgba(0,0,0,0.25)",
+                          }}
+                        />
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: "0.75rem", opacity: 0.78 }}>
+                            {isSelected
+                              ? `Selected ${index + 1} of ${youtubeResults.length}`
+                              : `Result ${index + 1} of ${youtubeResults.length}`}
+                          </div>
+                          <div
+                            style={{
+                              fontWeight: 700,
+                              lineHeight: 1.25,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              display: "-webkit-box",
+                              WebkitLineClamp: 2,
+                              WebkitBoxOrient: "vertical",
+                            }}
+                          >
+                            {result.title}
+                          </div>
+                          <div style={{ opacity: 0.82, fontSize: "0.82rem" }}>
+                            {[result.uploader || "", duration]
+                              .filter(Boolean)
+                              .join(" | ") || "YouTube"}
+                          </div>
+                          {isCurrentlyAssigned ? (
+                            <div
+                              style={{
+                                marginTop: "0.25rem",
+                                color: "#b9fbc1",
+                                fontWeight: 700,
+                                fontSize: "0.76rem",
+                              }}
+                            >
+                              Currently assigned
+                            </div>
+                          ) : null}
+                        </div>
+                      </Focusable>
+                    );
+                  })}
+                  {!youtubeResults.length ? (
+                    <div style={{ opacity: 0.7 }}>
+                      Choose one of the search rows above to load results.
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            )}
+          </PanelSectionRow>
+        </PanelSection>
+
+        <PanelSection title="Browse local files">
+          <PanelSectionRow>
             <div
               style={{
                 width: "100%",
@@ -6113,254 +6782,90 @@ const ChangeTheme = () => {
                 gap: "0.5rem",
               }}
             >
-              {!!selectedYouTubeResult && youtubeResults.length > 1 ? (
-                <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap" }}>
+              <div
+                style={{
+                  display: "flex",
+                  width: "100%",
+                  gap: "0.5rem",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                }}
+              >
+                <button className="DialogButton" onClick={goUp}>
+                  Up
+                </button>
+                {directoryShortcuts.map((shortcut) => (
                   <button
+                    key={shortcut.label}
                     className="DialogButton"
-                    onClick={() => {
-                      const index = youtubeResults.findIndex((item) => item.id === selectedYouTubeResult.id);
-                      const next = index <= 0 ? youtubeResults[youtubeResults.length - 1] : youtubeResults[index - 1];
-                      setSelectedYouTubeId(next.id);
-                    }}
+                    onClick={() => refreshDirectory(shortcut.path)}
                     style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
                   >
-                    Prev
+                    {shortcut.label}
                   </button>
-                  <button
-                    className="DialogButton"
-                    onClick={() => {
-                      const index = youtubeResults.findIndex((item) => item.id === selectedYouTubeResult.id);
-                      const next = index >= youtubeResults.length - 1 ? youtubeResults[0] : youtubeResults[index + 1];
-                      setSelectedYouTubeId(next.id);
-                    }}
-                    style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
-                  >
-                    Next
-                  </button>
-                  <button
-                    className="DialogButton"
-                    onClick={() => handleYouTubePreview(selectedYouTubeResult)}
-                    disabled={previewLoadingVideoId !== null || downloadingVideoId !== null}
-                    style={{ minWidth: "8rem", whiteSpace: "nowrap" }}
-                  >
-                    {previewingVideoId === selectedYouTubeResult.id ? "Stop Preview" : "Play Preview"}
-                  </button>
-                  <button
-                    className="DialogButton"
-                    onClick={() => handleYouTubeDownload(selectedYouTubeResult)}
-                    disabled={downloadingVideoId !== null}
-                    style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
-                  >
-                    {downloadingVideoId === selectedYouTubeResult.id ? "Downloading..." : "Download & Assign"}
-                  </button>
-                </div>
-              ) : null}
+                ))}
+              </div>
+              <div
+                style={{
+                  fontFamily: "monospace",
+                  fontSize: "0.78rem",
+                  lineHeight: 1.35,
+                  opacity: 0.85,
+                  wordBreak: "break-word",
+                }}
+              >
+                {currentDir}
+              </div>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            {browserLoading ? (
+              <Spinner />
+            ) : (
               <div
                 style={{
                   width: "100%",
-                  display: "grid",
-                  gap: "0.5rem",
-                  gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.35rem",
+                  paddingRight: "0.25rem",
                 }}
               >
-              {youtubeResults.map((result) => {
-                const duration = formatDuration(result.duration);
-                const thumbnailUrl = `https://i.ytimg.com/vi/${encodeURIComponent(
-                  result.id
-                )}/hqdefault.jpg`;
-                const isCurrentlyAssigned =
-                  !!assignedVideoId && assignedVideoId === result.id;
-                const isSelected = selectedYouTubeId === result.id;
-                return (
-                  <Focusable
-                    key={result.id}
-                    onActivate={() => setSelectedYouTubeId(result.id)}
+                {browser.dirs.map((dir) => (
+                  <button
+                    key={`dir-${dir}`}
+                    className="DialogButton"
+                    onClick={() => handleDirClick(dir)}
                     style={{
-                      borderRadius: "0.4rem",
-                      padding: "0.6rem",
-                      background: isCurrentlyAssigned
-                        ? "rgba(80, 190, 90, 0.22)"
-                        : "rgba(255,255,255,0.05)",
-                      border: isCurrentlyAssigned
-                        ? "1px solid rgba(120, 230, 130, 0.75)"
-                        : isSelected
-                        ? "1px solid rgba(120, 180, 255, 0.85)"
-                        : "1px solid transparent",
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: "0.35rem",
+                      justifyContent: "flex-start",
+                      minHeight: "2.6rem",
+                      whiteSpace: "normal",
                     }}
                   >
-                    {isSelected ? (
-                      <div style={{ fontSize: "0.72rem", opacity: 0.9 }}>Selected</div>
-                    ) : null}
-                    <div
-                      onClick={() => setSelectedYouTubeId(result.id)}
-                      style={{ cursor: "pointer" }}
-                    >
-                      <img
-                        src={thumbnailUrl}
-                        alt={result.title}
-                        style={{
-                          width: "100%",
-                          aspectRatio: "16 / 9",
-                          objectFit: "cover",
-                          borderRadius: "0.35rem",
-                          background: "rgba(0,0,0,0.25)",
-                        }}
-                      />
-                    </div>
-                    {isCurrentlyAssigned ? (
-                      <div
-                        style={{
-                          display: "inline-block",
-                          width: "fit-content",
-                          padding: "0.15rem 0.4rem",
-                          borderRadius: "0.3rem",
-                          background: "rgba(120, 230, 130, 0.2)",
-                          color: "#b9fbc1",
-                          fontWeight: 700,
-                          fontSize: "0.75rem",
-                        }}
-                      >
-                        Currently assigned
-                      </div>
-                    ) : null}
-                    <div style={{ fontWeight: 600 }}>{result.title}</div>
-                    <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                      {[result.uploader || "", duration].filter(Boolean).join("  |  ") ||
-                        "YouTube"}
-                    </div>
-                    <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                      <button
-                        className="DialogButton"
-                        onClick={() => {
-                          setSelectedYouTubeId(result.id);
-                          handleYouTubePreview(result);
-                        }}
-                        disabled={
-                          previewLoadingVideoId !== null || downloadingVideoId !== null
-                        }
-                        style={{ minWidth: "8rem", whiteSpace: "nowrap" }}
-                      >
-                        {previewLoadingVideoId === result.id
-                          ? "Loading..."
-                          : previewingVideoId === result.id
-                          ? "Stop Preview"
-                          : "Play Preview"}
-                      </button>
-                      <button
-                        className="DialogButton"
-                        onClick={() => {
-                          setSelectedYouTubeId(result.id);
-                          handleYouTubeDownload(result);
-                        }}
-                        disabled={downloadingVideoId !== null}
-                        style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
-                      >
-                        {downloadingVideoId === result.id
-                          ? "Downloading..."
-                          : "Download & Assign"}
-                      </button>
-                    </div>
-                  </Focusable>
-                );
-              })}
-              {!youtubeResults.length && (
-                <div style={{ opacity: 0.7, whiteSpace: "nowrap" }}>
-                  No results yet. Search for a game soundtrack above.
-                </div>
-              )}
-              </div>
-            </div>
-          )}
-        </PanelSectionRow>
-      </PanelSection>
-
-      <PanelSection title="Or, browse local files to assign from system storage">
-        <PanelSectionRow>
-          <div
-            style={{
-              display: "flex",
-              width: "100%",
-              gap: "0.5rem",
-              alignItems: "center",
-            }}
-          >
-            <button className="DialogButton" onClick={goUp}>
-              Up
-            </button>
-            <div style={{ flexGrow: 1, fontFamily: "monospace" }}>
-              {currentDir}
-            </div>
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "1fr auto",
-              width: "100%",
-              gap: "0.5rem",
-              alignItems: "center",
-            }}
-          >
-            <TextField
-              value={manualPath}
-              onChange={(e) => setManualPath(e.target.value)}
-              style={{ width: "100%", minWidth: "20rem" }}
-            />
-            <button className="DialogButton" onClick={handleManualGo}>
-              Go
-            </button>
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          {browserLoading ? (
-            <Spinner />
-          ) : (
-            <div
-              style={{
-                width: "100%",
-                display: "flex",
-                flexDirection: "column",
-                gap: "0.35rem",
-                paddingRight: "0.25rem",
-              }}
-            >
-              {browser.dirs.map((dir) => (
-                <button
-                  key={`dir-${dir}`}
-                  className="DialogButton"
-                  onClick={() => handleDirClick(dir)}
-                  style={{ justifyContent: "flex-start" }}
-                >
-                  📁 {dir}
-                </button>
-              ))}
-              {browser.files
-                .filter((file) =>
-                  AUDIO_EXTENSIONS.some((ext) =>
-                    file.toLowerCase().endsWith(`.${ext}`)
-                  )
-                )
-                .map((file) => (
+                    Folder: {dir}
+                  </button>
+                ))}
+                {audioFiles.map((file) => (
                   <button
                     key={`file-${file}`}
                     className="DialogButton"
                     onClick={() => handleFileClick(file)}
-                    style={{ justifyContent: "flex-start" }}
+                    style={{
+                      justifyContent: "flex-start",
+                      minHeight: "2.6rem",
+                      whiteSpace: "normal",
+                    }}
                   >
-                    🎵 {file}
+                    Assign file: {file}
                   </button>
                 ))}
-              {!browser.dirs.length && !browser.files.length && (
-                <div style={{ opacity: 0.6 }}>Folder is empty.</div>
-              )}
-            </div>
-          )}
-        </PanelSectionRow>
-      </PanelSection>
+                {!browser.dirs.length && !audioFiles.length ? (
+                  <div style={{ opacity: 0.6 }}>No folders or audio files here.</div>
+                ) : null}
+              </div>
+            )}
+          </PanelSectionRow>
+        </PanelSection>
       </div>
     </ScrollPanel>
   );
@@ -6377,7 +6882,7 @@ const ChangeGlobalTheme = () => {
   });
   const [browserLoading, setBrowserLoading] = useState(true);
   const [manualPath, setManualPath] = useState("/home/deck");
-  const topFocusRef = useRef<HTMLDivElement | null>(null);
+  const pageRef = useRef<HTMLDivElement | null>(null);
 
   const loadTrack = useCallback(async () => {
     setLoading(true);
@@ -6417,7 +6922,13 @@ const ChangeGlobalTheme = () => {
   }, []);
 
   useEffect(() => {
-    topFocusRef.current?.focus();
+    const timeoutId = window.setTimeout(() => {
+      focusFirstInteractiveElement(
+        pageRef.current,
+        "button, [role='button'], [role='radio'], input, textarea, select, [tabindex]:not([tabindex='-1'])"
+      );
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
   const saveFromPath = async (fullPath: string) => {
@@ -6485,6 +6996,7 @@ const ChangeGlobalTheme = () => {
   return (
     <ScrollPanel>
       <div
+        ref={pageRef}
         style={{
           padding: 24,
           paddingTop: 48,
@@ -6493,11 +7005,6 @@ const ChangeGlobalTheme = () => {
           boxSizing: "border-box",
         }}
       >
-        <div
-          ref={topFocusRef}
-          tabIndex={-1}
-          style={{ position: "absolute", width: 0, height: 0, outline: "none" }}
-        />
         <PanelSection title="ThemeDeck global / ambient track">
           <PanelSectionRow>
             {loading ? (
@@ -6569,11 +7076,17 @@ const ChangeGlobalTheme = () => {
                 alignItems: "center",
               }}
             >
-              <TextField
-                value={manualPath}
-                onChange={(e) => setManualPath(e.target.value)}
-                style={{ width: "100%", minWidth: "20rem" }}
-              />
+            <TextField
+              value={manualPath}
+              onChange={(e) => setManualPath(e.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  handleManualGo();
+                }
+              }}
+              style={{ width: "100%", minWidth: "20rem" }}
+            />
               <button className="DialogButton" onClick={handleManualGo}>
                 Go
               </button>
@@ -6625,6 +7138,7 @@ const ChangeGlobalTheme = () => {
             )}
           </PanelSectionRow>
         </PanelSection>
+
       </div>
     </ScrollPanel>
   );
@@ -6641,7 +7155,7 @@ const ChangeStoreTheme = () => {
   });
   const [browserLoading, setBrowserLoading] = useState(true);
   const [manualPath, setManualPath] = useState("/home/deck");
-  const topFocusRef = useRef<HTMLDivElement | null>(null);
+  const pageRef = useRef<HTMLDivElement | null>(null);
 
   const loadTrack = useCallback(async () => {
     setLoading(true);
@@ -6681,7 +7195,13 @@ const ChangeStoreTheme = () => {
   }, []);
 
   useEffect(() => {
-    topFocusRef.current?.focus();
+    const timeoutId = window.setTimeout(() => {
+      focusFirstInteractiveElement(
+        pageRef.current,
+        "button, [role='button'], [role='radio'], input, textarea, select, [tabindex]:not([tabindex='-1'])"
+      );
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
   const saveFromPath = async (fullPath: string) => {
@@ -6747,6 +7267,7 @@ const ChangeStoreTheme = () => {
   return (
     <ScrollPanel>
       <div
+        ref={pageRef}
         style={{
           padding: 24,
           paddingTop: 48,
@@ -6755,11 +7276,6 @@ const ChangeStoreTheme = () => {
           boxSizing: "border-box",
         }}
       >
-        <div
-          ref={topFocusRef}
-          tabIndex={-1}
-          style={{ position: "absolute", width: 0, height: 0, outline: "none" }}
-        />
         <PanelSection title="ThemeDeck store-only track">
           <PanelSectionRow>
             {loading ? (
@@ -6831,11 +7347,17 @@ const ChangeStoreTheme = () => {
                 alignItems: "center",
               }}
             >
-              <TextField
-                value={manualPath}
-                onChange={(e) => setManualPath(e.target.value)}
-                style={{ width: "100%", minWidth: "20rem" }}
-              />
+            <TextField
+              value={manualPath}
+              onChange={(e) => setManualPath(e.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  handleManualGo();
+                }
+              }}
+              style={{ width: "100%", minWidth: "20rem" }}
+            />
               <button className="DialogButton" onClick={handleManualGo}>
                 Go
               </button>
@@ -6887,6 +7409,7 @@ const ChangeStoreTheme = () => {
             )}
           </PanelSectionRow>
         </PanelSection>
+
       </div>
     </ScrollPanel>
   );
@@ -6919,7 +7442,12 @@ export default definePlugin(() => {
   return {
     name: "ThemeDeck",
     titleView: (
-      <div className={staticClasses.Title}>ThemeDeck</div>
+      <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.1 }}>
+        <div className={staticClasses.Title}>ThemeDeck</div>
+        <div style={{ fontSize: "0.68rem", opacity: 0.72, marginTop: "0.1rem" }}>
+          {BUILD_LABEL.replace(/^ThemeDeck Build\s*/, "")}
+        </div>
+      </div>
     ),
     icon: <FaMusic />,
     content: <Content />,
@@ -6927,7 +7455,7 @@ export default definePlugin(() => {
       stopLocationWatcher();
       stopSteamAppWatchers();
       stopAutoPlaybackCoordinator();
-      stopPlayback(false);
+      stopPlayback(false, "onDismount");
       clearAudioCache();
       contextMenuUnpatch?.();
       gamePatches.forEach((patch, index) => {

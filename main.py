@@ -10,10 +10,12 @@ import shutil
 import ssl
 import subprocess
 import tempfile
+import threading
 import traceback
 import urllib.parse
 import urllib.request
 import urllib.error
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,11 @@ class Plugin:
         self._yt_venv_python = self._yt_venv_bin / "python"
         self._yt_venv_yt_dlp = self._yt_venv_bin / "yt-dlp"
         self._downloads_dir = self._settings_dir / "downloads"
+        self._playback_process: subprocess.Popen[bytes] | None = None
+        self._playback_player: str | None = None
+        self._playback_started_at: float = 0.0
+        self._playback_start_offset: float = 0.0
+        self._playback_log_file = self._settings_dir / "backend-player.log"
 
     async def _main(self) -> None:
         self._settings_dir.mkdir(parents=True, exist_ok=True)
@@ -58,6 +65,7 @@ class Plugin:
         decky.logger.info("ThemeDeck backend ready")
 
     async def _unload(self) -> None:
+        self._stop_playback_process()
         decky.logger.info("ThemeDeck backend unloaded")
 
     async def _migration(self) -> None:
@@ -67,6 +75,181 @@ class Plugin:
 
     async def get_tracks(self) -> dict[str, dict[str, Any]]:
         return self._tracks
+
+    async def play_track_backend(
+        self,
+        path: str,
+        volume: float = 1.0,
+        loop: bool = True,
+        start_offset: float = 0.0,
+    ) -> dict[str, Any]:
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists() or not resolved.is_file():
+            raise FileNotFoundError(f"Audio file not found: {resolved}")
+        try:
+            resolved.open("rb").close()
+        except PermissionError as error:
+            raise PermissionError(f"Permission denied: {resolved}") from error
+
+        player = self._resolve_audio_player()
+        if not player:
+            raise RuntimeError("No supported backend player found")
+
+        volume_pct = int(round(clamp(volume) * 100))
+        offset_seconds = clamp_seconds(start_offset)
+        self._stop_playback_process()
+
+        ffplay_path = self._find_command_path("ffplay")
+        if player == "mpv":
+            command = [
+                "mpv",
+                "--no-video",
+                "--quiet",
+                "--audio-display=no",
+                f"--volume={volume_pct}",
+                f"--start={offset_seconds}",
+                "--loop-file=inf" if loop else "--loop-file=no",
+                str(resolved),
+            ]
+        elif player == "mpg123":
+            scale = max(1, int(round(clamp(volume) * 32768)))
+            command = [
+                "mpg123",
+                "-q",
+                "-f",
+                str(scale),
+            ]
+            if loop:
+                command.extend(["--loop", "-1"])
+            # mpg123 accepts frame-based skip, not second-based seek; keep behavior
+            # stable by always starting from beginning for backend fallback.
+            command.append(str(resolved))
+        elif player == "ffmpeg":
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+            ]
+            if loop:
+                command.extend(["-stream_loop", "-1"])
+            command.extend(
+                [
+                    "-ss",
+                    str(offset_seconds),
+                    "-i",
+                    str(resolved),
+                    "-vn",
+                    "-af",
+                    f"volume={clamp(volume)}",
+                    "-f",
+                    "pulse",
+                    "default",
+                ]
+            )
+        elif player == "ffplay":
+            ffplay_exec = ffplay_path or "ffplay"
+            command = [
+                ffplay_exec,
+                "-nodisp",
+                "-loglevel",
+                "error",
+                "-ss",
+                str(offset_seconds),
+                "-af",
+                f"volume={clamp(volume)}",
+            ]
+            if loop:
+                # ffplay on Steam Deck does not support -stream_loop; use -loop 0.
+                command.extend(["-loop", "0"])
+            else:
+                command.append("-autoexit")
+            command.append(str(resolved))
+        else:
+            raise RuntimeError(f"Unsupported backend player selection: {player}")
+
+        decky.logger.info(
+            "play_track_backend start "
+            f"player={player} path={resolved} "
+            f"ffplay={ffplay_path} ffmpeg={self._find_command_path('ffmpeg')} "
+            f"mpv={self._find_command_path('mpv')} mpg123={self._find_command_path('mpg123')}"
+        )
+        self._settings_dir.mkdir(parents=True, exist_ok=True)
+        log_handle = self._playback_log_file.open("ab")
+        log_handle.write(
+            f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] start player={player} path={resolved}\n".encode(
+                "utf-8", errors="ignore"
+            )
+        )
+        log_handle.flush()
+        process = subprocess.Popen(
+            command,
+            stdout=log_handle,
+            stderr=log_handle,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=self._build_backend_audio_env(),
+        )
+        self._playback_process = process
+        self._playback_player = player
+        self._playback_started_at = time.time()
+        self._playback_start_offset = offset_seconds
+        threading.Thread(
+            target=self._monitor_playback_process,
+            args=(process, player, str(resolved), log_handle),
+            daemon=True,
+        ).start()
+        return {
+            "ok": True,
+            "pid": process.pid,
+            "player": player,
+            "path": str(resolved),
+            "loop": bool(loop),
+            "volume": clamp(volume),
+            "start_offset": offset_seconds,
+        }
+
+    async def stop_backend_playback(self) -> dict[str, Any]:
+        stopped = self._stop_playback_process()
+        return {"ok": True, "stopped": stopped}
+
+    async def get_backend_playback_state(self) -> dict[str, Any]:
+        process = self._playback_process
+        running = bool(process and process.poll() is None)
+        elapsed = 0.0
+        if running:
+            elapsed = max(0.0, time.time() - self._playback_started_at)
+        return {
+            "running": running,
+            "player": self._playback_player,
+            "pid": process.pid if process else None,
+            "elapsed": elapsed,
+            "start_offset": self._playback_start_offset,
+        }
+
+    async def log_client_event(
+        self, level: str, message: str, payload: dict[str, Any] | None = None
+    ) -> bool:
+        level_name = str(level or "info").strip().lower()
+        normalized_message = self._trim_message(str(message or "").strip() or "event", 240)
+        payload_suffix = ""
+        if payload is not None:
+            try:
+                payload_text = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+            except Exception:
+                payload_text = repr(payload)
+            payload_suffix = f" payload={self._trim_message(payload_text, 1400)}"
+        line = f"[client] {normalized_message}{payload_suffix}"
+        if level_name == "error":
+            decky.logger.error(line)
+        elif level_name in {"warn", "warning"}:
+            decky.logger.warning(line)
+        elif level_name == "debug":
+            decky.logger.debug(line)
+        else:
+            decky.logger.info(line)
+        return True
 
     async def get_localconfig_app_ids(self) -> dict[str, Any]:
         return {"app_ids": self._read_localconfig_app_ids()}
@@ -602,7 +785,90 @@ class Plugin:
                 self._save_tracks()
         except Exception as error:
             decky.logger.error(f"Failed to read tracks.json: {error}")
-            self._tracks = {}
+
+    def _resolve_audio_player(self) -> str | None:
+        if self._find_command_path("ffplay"):
+            return "ffplay"
+        if self._find_command_path("ffmpeg"):
+            return "ffmpeg"
+        if self._find_command_path("mpv"):
+            return "mpv"
+        if self._find_command_path("mpg123"):
+            return "mpg123"
+        return None
+
+    def _find_command_path(self, command: str) -> str | None:
+        resolved = shutil.which(command)
+        if resolved:
+            return resolved
+        direct = Path("/usr/bin") / command
+        if direct.exists() and os.access(direct, os.X_OK):
+            return str(direct)
+        return None
+
+    def _build_backend_audio_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        uid = os.getuid()
+        runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
+        env["XDG_RUNTIME_DIR"] = runtime_dir
+        pulse_native = Path(runtime_dir) / "pulse" / "native"
+        if pulse_native.exists():
+            env["PULSE_SERVER"] = f"unix:{pulse_native}"
+        return env
+
+    def _stop_playback_process(self) -> bool:
+        process = self._playback_process
+        self._playback_process = None
+        self._playback_player = None
+        if not process:
+            return False
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except Exception:
+                    process.kill()
+                    process.wait(timeout=1.0)
+            else:
+                # Reap exited child to avoid zombies.
+                process.wait(timeout=0.1)
+            return True
+        except Exception as error:
+            decky.logger.error(f"Failed stopping backend playback process: {error}")
+            return False
+
+    def _monitor_playback_process(
+        self,
+        process: subprocess.Popen[bytes],
+        player: str,
+        path: str,
+        log_handle: Any,
+    ) -> None:
+        try:
+            return_code = process.wait()
+            decky.logger.info(
+                f"backend playback exited player={player} rc={return_code} path={path}"
+            )
+            try:
+                log_handle.write(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] exit rc={return_code}\n".encode(
+                        "utf-8", errors="ignore"
+                    )
+                )
+                log_handle.flush()
+            except Exception:
+                pass
+        except Exception as error:
+            decky.logger.error(f"backend playback monitor failed: {error}")
+        finally:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+            if self._playback_process is process:
+                self._playback_process = None
+                self._playback_player = None
 
     def _save_tracks(self) -> None:
         try:

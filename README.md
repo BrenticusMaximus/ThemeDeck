@@ -25,6 +25,7 @@ Use the latest packaged release zip instead:
 - Auto-fill search terms based on the game you selected.
 - Highlight which YouTube result is already assigned.
 - Set per-game volume.
+- Add a master volume override that can cap all ThemeDeck playback without deleting per-game volume settings.
 - Skip silent intros with per-game "truncate start" timing.
 - Remove or change a game's assigned track at any time.
 - Auto-play music when opening game pages.
@@ -43,6 +44,11 @@ Use the latest packaged release zip instead:
 - Works with both installed and uninstalled games in your library.
 
 ## Release Updates
+
+## April 27, 2026 Update (v2.6.0)
+
+- Added a ThemeDeck master volume override at the bottom of settings.
+- At 100%, ThemeDeck respects each game/global/store track volume; below 100%, all ThemeDeck music plays at the selected master level.
 
 ## April 21, 2026 Update (v2.5.5)
 
