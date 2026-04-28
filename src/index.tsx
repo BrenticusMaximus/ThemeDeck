@@ -6356,19 +6356,6 @@ const ChangeTheme = () => {
       ),
     [browser.files]
   );
-  const searchPresets = useMemo(() => {
-    const displayName = getDisplayName(appId);
-    return [
-      `${displayName} theme music`,
-      `${displayName} soundtrack`,
-      `${displayName} ost`,
-      `${displayName} main theme`,
-    ];
-  }, [appId]);
-  const runPresetSearch = (query: string) => {
-    setYoutubeQuery(query);
-    void handleYouTubeSearch(query);
-  };
   const selectedYouTubeIndex = selectedYouTubeResult
     ? youtubeResults.findIndex((item) => item.id === selectedYouTubeResult.id)
     : -1;
@@ -6525,26 +6512,23 @@ const ChangeTheme = () => {
                 width: "100%",
                 display: "flex",
                 flexDirection: "column",
-                gap: "0.45rem",
+                gap: "0.35rem",
               }}
             >
-              <div style={{ fontWeight: 700 }}>
+              <div style={{ fontWeight: 600 }}>
                 {ytDlpStatus.installed
                   ? `yt-dlp ${ytDlpStatus.version || ""}`.trim()
                   : "yt-dlp not installed"}
               </div>
               {ytDlpStatus.path ? (
-                <div
-                  style={{
-                    fontFamily: "monospace",
-                    fontSize: "0.78rem",
-                    opacity: 0.8,
-                    wordBreak: "break-word",
-                  }}
-                >
+                <div style={{ fontFamily: "monospace", fontSize: "0.8rem", opacity: 0.8 }}>
                   {ytDlpStatus.path}
                 </div>
               ) : null}
+              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
+                Search YouTube for game music, download audio locally, and assign it to
+                this game.
+              </div>
               {!ytDlpStatus.installed ? (
                 <button
                   className="DialogButton"
@@ -6571,45 +6555,57 @@ const ChangeTheme = () => {
                     }
                   }}
                   disabled={ytDlpBusy}
-                  style={{ width: "fit-content", minWidth: "11rem" }}
+                  style={{ width: "fit-content" }}
                 >
                   {ytDlpBusy ? "Installing..." : "Install yt-dlp"}
                 </button>
               ) : null}
-              <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap" }}>
-                {searchPresets.map((query) => (
-                  <button
-                    key={query}
-                    className="DialogButton"
-                    onClick={() => runPresetSearch(query)}
-                    disabled={youtubeLoading || ytDlpBusy}
-                    style={{ minWidth: "12rem", whiteSpace: "normal" }}
-                  >
-                    {youtubeLoading && youtubeQuery === query ? "Searching..." : query}
-                  </button>
-                ))}
-              </div>
             </div>
           </PanelSectionRow>
-          {youtubeError ? (
-            <PanelSectionRow>
-              <div
-                style={{
-                  width: "100%",
-                  padding: "0.55rem 0.7rem",
-                  borderRadius: "0.35rem",
-                  background: "rgba(255, 90, 90, 0.13)",
-                  color: "#ffd7d7",
-                  fontSize: "0.85rem",
-                  lineHeight: 1.35,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}
+          <PanelSectionRow>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr auto",
+                width: "100%",
+                gap: "0.5rem",
+                alignItems: "center",
+              }}
+            >
+              <TextField
+                value={youtubeQuery}
+                onChange={(event) => setYoutubeQuery(event.target.value)}
+                style={{ width: "100%", minWidth: "22rem" }}
+              />
+              <button
+                className="DialogButton"
+                onClick={() => handleYouTubeSearch()}
+                disabled={youtubeLoading || ytDlpBusy}
+                style={{ minWidth: "12rem" }}
               >
-                {youtubeError}
-              </div>
-            </PanelSectionRow>
-          ) : null}
+                {youtubeLoading ? "Searching..." : "Search"}
+              </button>
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            {youtubeError ? (
+                <div
+                  style={{
+                    width: "100%",
+                    padding: "0.55rem 0.7rem",
+                    borderRadius: "0.35rem",
+                    background: "rgba(255, 90, 90, 0.13)",
+                    color: "#ffd7d7",
+                    fontSize: "0.85rem",
+                    lineHeight: 1.35,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {youtubeError}
+                </div>
+            ) : null}
+          </PanelSectionRow>
           <PanelSectionRow>
             {youtubeLoading ? (
               <Spinner />
@@ -6650,19 +6646,15 @@ const ChangeTheme = () => {
                       className="DialogButton"
                       onClick={() => handleYouTubePreview(selectedYouTubeResult)}
                       disabled={previewLoadingVideoId !== null || downloadingVideoId !== null}
-                      style={{ minWidth: "9rem", whiteSpace: "nowrap" }}
+                      style={{ minWidth: "8rem", whiteSpace: "nowrap" }}
                     >
-                      {previewLoadingVideoId === selectedYouTubeResult.id
-                        ? "Loading..."
-                        : previewingVideoId === selectedYouTubeResult.id
-                        ? "Stop Preview"
-                        : "Play Preview"}
+                      {previewingVideoId === selectedYouTubeResult.id ? "Stop Preview" : "Play Preview"}
                     </button>
                     <button
                       className="DialogButton"
                       onClick={() => handleYouTubeDownload(selectedYouTubeResult)}
                       disabled={downloadingVideoId !== null}
-                      style={{ minWidth: "12rem", whiteSpace: "nowrap" }}
+                      style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
                     >
                       {downloadingVideoId === selectedYouTubeResult.id
                         ? "Downloading..."
@@ -6673,16 +6665,16 @@ const ChangeTheme = () => {
                 <div
                   style={{
                     width: "100%",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: "0.45rem",
+                    display: "grid",
+                    gap: "0.5rem",
+                    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
                   }}
                 >
-                  {youtubeResults.map((result, index) => {
+                  {youtubeResults.map((result) => {
                     const duration = formatDuration(result.duration);
                     const thumbnailUrl = `https://i.ytimg.com/vi/${encodeURIComponent(
                       result.id
-                    )}/mqdefault.jpg`;
+                    )}/hqdefault.jpg`;
                     const isCurrentlyAssigned =
                       !!assignedVideoId && assignedVideoId === result.id;
                     const isSelected = selectedYouTubeId === result.id;
@@ -6692,80 +6684,100 @@ const ChangeTheme = () => {
                         onActivate={() => setSelectedYouTubeId(result.id)}
                         style={{
                           borderRadius: "0.4rem",
-                          padding: "0.55rem",
-                          width: "100%",
+                          padding: "0.6rem",
                           background: isCurrentlyAssigned
                             ? "rgba(80, 190, 90, 0.22)"
-                            : isSelected
-                            ? "rgba(120, 180, 255, 0.16)"
                             : "rgba(255,255,255,0.05)",
                           border: isCurrentlyAssigned
                             ? "1px solid rgba(120, 230, 130, 0.75)"
                             : isSelected
-                            ? "1px solid rgba(120, 180, 255, 0.9)"
-                            : "1px solid rgba(255,255,255,0.08)",
-                          display: "grid",
-                          gridTemplateColumns: "8rem minmax(0, 1fr)",
-                          gap: "0.65rem",
-                          alignItems: "center",
+                            ? "1px solid rgba(120, 180, 255, 0.85)"
+                            : "1px solid transparent",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "0.35rem",
                         }}
                       >
-                        <img
-                          src={thumbnailUrl}
-                          alt=""
-                          style={{
-                            width: "8rem",
-                            aspectRatio: "16 / 9",
-                            objectFit: "cover",
-                            borderRadius: "0.3rem",
-                            background: "rgba(0,0,0,0.25)",
-                          }}
-                        />
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ fontSize: "0.75rem", opacity: 0.78 }}>
-                            {isSelected
-                              ? `Selected ${index + 1} of ${youtubeResults.length}`
-                              : `Result ${index + 1} of ${youtubeResults.length}`}
-                          </div>
+                        {isSelected ? (
+                          <div style={{ fontSize: "0.72rem", opacity: 0.9 }}>Selected</div>
+                        ) : null}
+                        <div
+                          onClick={() => setSelectedYouTubeId(result.id)}
+                          style={{ cursor: "pointer" }}
+                        >
+                          <img
+                            src={thumbnailUrl}
+                            alt={result.title}
+                            style={{
+                              width: "100%",
+                              aspectRatio: "16 / 9",
+                              objectFit: "cover",
+                              borderRadius: "0.35rem",
+                              background: "rgba(0,0,0,0.25)",
+                            }}
+                          />
+                        </div>
+                        {isCurrentlyAssigned ? (
                           <div
                             style={{
+                              display: "inline-block",
+                              width: "fit-content",
+                              padding: "0.15rem 0.4rem",
+                              borderRadius: "0.3rem",
+                              background: "rgba(120, 230, 130, 0.2)",
+                              color: "#b9fbc1",
                               fontWeight: 700,
-                              lineHeight: 1.25,
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              display: "-webkit-box",
-                              WebkitLineClamp: 2,
-                              WebkitBoxOrient: "vertical",
+                              fontSize: "0.75rem",
                             }}
                           >
-                            {result.title}
+                            Currently assigned
                           </div>
-                          <div style={{ opacity: 0.82, fontSize: "0.82rem" }}>
-                            {[result.uploader || "", duration]
-                              .filter(Boolean)
-                              .join(" | ") || "YouTube"}
-                          </div>
-                          {isCurrentlyAssigned ? (
-                            <div
-                              style={{
-                                marginTop: "0.25rem",
-                                color: "#b9fbc1",
-                                fontWeight: 700,
-                                fontSize: "0.76rem",
-                              }}
-                            >
-                              Currently assigned
-                            </div>
-                          ) : null}
+                        ) : null}
+                        <div style={{ fontWeight: 600 }}>{result.title}</div>
+                        <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
+                          {[result.uploader || "", duration].filter(Boolean).join("  |  ") ||
+                            "YouTube"}
+                        </div>
+                        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                          <button
+                            className="DialogButton"
+                            onClick={() => {
+                              setSelectedYouTubeId(result.id);
+                              handleYouTubePreview(result);
+                            }}
+                            disabled={
+                              previewLoadingVideoId !== null || downloadingVideoId !== null
+                            }
+                            style={{ minWidth: "8rem", whiteSpace: "nowrap" }}
+                          >
+                            {previewLoadingVideoId === result.id
+                              ? "Loading..."
+                              : previewingVideoId === result.id
+                              ? "Stop Preview"
+                              : "Play Preview"}
+                          </button>
+                          <button
+                            className="DialogButton"
+                            onClick={() => {
+                              setSelectedYouTubeId(result.id);
+                              handleYouTubeDownload(result);
+                            }}
+                            disabled={downloadingVideoId !== null}
+                            style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
+                          >
+                            {downloadingVideoId === result.id
+                              ? "Downloading..."
+                              : "Download & Assign"}
+                          </button>
                         </div>
                       </Focusable>
                     );
                   })}
-                  {!youtubeResults.length ? (
-                    <div style={{ opacity: 0.7 }}>
-                      Choose one of the search rows above to load results.
+                  {!youtubeResults.length && (
+                    <div style={{ opacity: 0.7, whiteSpace: "nowrap" }}>
+                      No results yet. Search for a game soundtrack above.
                     </div>
-                  ) : null}
+                  )}
                 </div>
               </div>
             )}
