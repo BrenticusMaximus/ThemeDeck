@@ -25,7 +25,7 @@ Use the latest packaged release zip instead:
 - Auto-fill search terms based on the game you selected.
 - Highlight which YouTube result is already assigned.
 - Set per-game volume.
-- Add a master volume override that can cap all ThemeDeck playback without deleting per-game volume settings.
+- Master volume control to override all game music.
 - Skip silent intros with per-game "truncate start" timing.
 - Remove or change a game's assigned track at any time.
 - Auto-play music when opening game pages.
