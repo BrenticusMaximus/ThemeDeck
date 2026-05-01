@@ -8,11 +8,13 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Install Package
 
-**Do not use GitHub's green Code button "Download ZIP" (for example `main.zip`) for ThemeDeck installation.**  
-That archive is source code only and is not a Decky-installable plugin package.
+1. Go to https://github.com/BrenticusMaximus/ThemeDeck/releases/ and download the latest ZIP, not the source code.
 
-Use the latest packaged release zip instead:  
-[ThemeDeck Releases](https://github.com/BrenticusMaximus/ThemeDeck/releases)
+2. Put it anywhere on your steam deck where you'll be able to find it later.
+
+3. On steam deck, go to decky settings, general, enable developer mode.
+
+4. On steam deck, go to decky settings, developer, 'install plugin from zip file', and find the zip from step 2. 
 
 ![ThemeDeck February 19 2026 update thumbnail](https://images.steamusercontent.com/ugc/10217922894651388729/0056712F90842A587703E222C9AD211D53B2344E/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
