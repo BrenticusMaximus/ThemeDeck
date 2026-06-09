@@ -6,7 +6,7 @@
 
 ThemeDeck lets you add and manage custom music across your Steam library and key Steam UI pages.
 
-<a href="https://discord.gg/Smh4K5Ad">Additional support, suggestions, etc. can be found in my Discord</a>.
+<a href="https://discord.gg/Smh4K5Ad">For support, suggestions, etc. please visit my Discord</a>.
 
 ## Install Package
 
