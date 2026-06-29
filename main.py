@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import traceback
+import unicodedata
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -51,6 +52,8 @@ class Plugin:
         self._yt_venv_python = self._yt_venv_bin / "python"
         self._yt_venv_yt_dlp = self._yt_venv_bin / "yt-dlp"
         self._downloads_dir = self._settings_dir / "downloads"
+        self._preview_dir = self._settings_dir / "previews"
+        self._debug_log_file = Path.home() / "ThemeDeck" / "themedeck-debug.log"
         self._playback_process: subprocess.Popen[bytes] | None = None
         self._playback_player: str | None = None
         self._playback_started_at: float = 0.0
@@ -61,17 +64,19 @@ class Plugin:
         self._settings_dir.mkdir(parents=True, exist_ok=True)
         self._bin_dir.mkdir(parents=True, exist_ok=True)
         self._downloads_dir.mkdir(parents=True, exist_ok=True)
+        self._preview_dir.mkdir(parents=True, exist_ok=True)
         self._load_tracks()
-        decky.logger.info("ThemeDeck backend ready")
+        self._log_info("ThemeDeck backend ready")
 
     async def _unload(self) -> None:
         self._stop_playback_process()
-        decky.logger.info("ThemeDeck backend unloaded")
+        self._log_info("ThemeDeck backend unloaded")
 
     async def _migration(self) -> None:
         self._settings_dir.mkdir(parents=True, exist_ok=True)
         self._bin_dir.mkdir(parents=True, exist_ok=True)
         self._downloads_dir.mkdir(parents=True, exist_ok=True)
+        self._preview_dir.mkdir(parents=True, exist_ok=True)
 
     async def get_tracks(self) -> dict[str, dict[str, Any]]:
         return self._tracks
@@ -249,6 +254,7 @@ class Plugin:
             decky.logger.debug(line)
         else:
             decky.logger.info(line)
+        self._write_debug_log(level_name, line)
         return True
 
     async def get_localconfig_app_ids(self) -> dict[str, Any]:
@@ -557,20 +563,30 @@ class Plugin:
             "version": "",
         }
         if not invocation:
+            self._log_info("yt-dlp status: not installed")
             return status
         status["source"] = invocation["source"]
         version = await self._get_yt_dlp_version(invocation)
         if version:
             status["version"] = version
+        self._log_info(
+            f"yt-dlp status source={status.get('source')} "
+            f"path={status.get('path')} version={status.get('version') or 'unknown'}"
+        )
         return status
 
     async def update_yt_dlp(self) -> dict[str, Any]:
+        self._log_info("yt-dlp update requested")
         self._bin_dir.mkdir(parents=True, exist_ok=True)
         venv_error = await self._install_yt_dlp_in_venv()
+        if venv_error:
+            self._log_warning(f"yt-dlp venv install/update failed: {venv_error}")
+        else:
+            self._log_info("yt-dlp venv install/update completed")
         status = await self.get_yt_dlp_status()
         if status.get("installed") and status.get("source") in {"venv", "system"}:
             if status.get("version"):
-                decky.logger.info(
+                self._log_info(
                     f"yt-dlp available via {status.get('source')} ({status.get('version')})"
                 )
             return status
@@ -594,13 +610,15 @@ class Plugin:
                 raise RuntimeError(
                     f"Installed file is not executable: {self._yt_dlp_path}"
                 )
-            decky.logger.info(f"yt-dlp updated successfully ({version})")
+            self._log_info(f"yt-dlp local binary updated successfully ({version})")
         except Exception as error:
-            decky.logger.error(f"Failed to update yt-dlp: {error}")
+            self._log_error(f"Failed to update yt-dlp local binary: {error}")
             pip_error = await self._try_install_yt_dlp_with_pip()
+            if pip_error:
+                self._log_warning(f"yt-dlp user pip fallback failed: {pip_error}")
             status = await self.get_yt_dlp_status()
             if status.get("installed"):
-                decky.logger.info("yt-dlp became available via pip/system fallback")
+                self._log_info("yt-dlp became available via pip/system fallback")
                 return status
             summary = self._trim_message(str(error), 140)
             if venv_error:
@@ -617,6 +635,10 @@ class Plugin:
         status = await self.get_yt_dlp_status()
         if not status.get("installed"):
             raise RuntimeError("yt-dlp update completed but executable was not found")
+        self._log_info(
+            f"yt-dlp update finished source={status.get('source')} "
+            f"version={status.get('version') or 'unknown'}"
+        )
         return status
 
     async def search_youtube(self, query: str, limit: int = 10) -> dict[str, Any]:
@@ -627,91 +649,105 @@ class Plugin:
 
             yt_dlp = self._require_yt_dlp_invocation()
             safe_limit = max(1, min(int(limit), 25))
-            command = [
-                *yt_dlp["command"],
-                "--no-warnings",
-                "--no-check-certificate",
-                "--skip-download",
-                "--flat-playlist",
-                "--print",
-                "%(id)s\t%(title)s\t%(uploader)s\t%(duration)s\t%(url)s",
-                f"ytsearch{safe_limit}:{cleaned_query}",
-            ]
-            result = await self._run_command(command, timeout=90, env=yt_dlp["env"])
-            if result.returncode != 0:
-                raise RuntimeError(self._command_error(result, "YouTube search failed"))
 
+            search_queries = self._youtube_search_candidates(cleaned_query)
             results: list[dict[str, Any]] = []
-            for raw_line in (result.stdout or "").splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                parts = line.split("\t")
-                if len(parts) < 2:
-                    continue
-                video_id = parts[0].strip()
-                if not video_id:
-                    continue
-                title = parts[1].strip() or video_id
-                uploader = parts[2].strip() if len(parts) > 2 else ""
-                duration_raw = parts[3].strip() if len(parts) > 3 else ""
-                duration: int | None = None
-                if duration_raw:
-                    try:
-                        duration = int(float(duration_raw))
-                    except ValueError:
-                        duration = None
-                if duration is not None and duration > 15 * 60:
-                    continue
-                url_raw = parts[4].strip() if len(parts) > 4 else ""
-                if url_raw.startswith("http://") or url_raw.startswith("https://"):
-                    webpage_url = url_raw
-                else:
-                    webpage_url = f"https://www.youtube.com/watch?v={video_id}"
-                results.append(
-                    {
-                        "id": video_id,
-                        "title": title,
-                        "uploader": uploader,
-                        "duration": duration,
-                        "webpage_url": webpage_url,
-                    }
+            last_stdout = ""
+            for search_query in search_queries:
+                self._log_info(
+                    f"youtube search requested query={search_query!r} "
+                    f"source={yt_dlp.get('source')} path={yt_dlp.get('path')}"
                 )
+                command = [
+                    *yt_dlp["command"],
+                    "--no-warnings",
+                    "--no-check-certificate",
+                    "--skip-download",
+                    "--flat-playlist",
+                    "--dump-json",
+                    f"ytsearch{safe_limit}:{search_query}",
+                ]
+                result = await self._run_command(command, timeout=90, env=yt_dlp["env"])
+                last_stdout = result.stdout or ""
+                if result.returncode != 0:
+                    raise RuntimeError(self._command_error(result, "YouTube search failed"))
+
+                results = self._parse_youtube_search_json_lines(last_stdout)
+                if results:
+                    if search_query != cleaned_query:
+                        self._log_info(
+                            f"youtube search fallback succeeded original={cleaned_query!r} "
+                            f"fallback={search_query!r}"
+                        )
+                    break
+
+                self._log_warning(
+                    f"youtube search returned no parseable results query={search_query!r} "
+                    f"stdout_sample={self._trim_message(last_stdout, 500)!r}"
+                )
+
+            self._log_info(
+                f"youtube search completed query={cleaned_query!r} results={len(results)}"
+            )
             return {"results": results}
         except Exception as error:
-            decky.logger.error(f"search_youtube failed query={query!r}: {error}")
-            decky.logger.error(traceback.format_exc())
+            self._log_error(f"search_youtube failed query={query!r}: {error}")
+            self._log_error(traceback.format_exc())
             raise
 
     async def get_youtube_preview_stream(self, video_url: str) -> dict[str, Any]:
         yt_dlp = self._require_yt_dlp_invocation()
         normalized_url = self._normalize_youtube_url(video_url)
+        video_id = self._extract_youtube_video_id(normalized_url)
+        preview_key = re.sub(r"[^A-Za-z0-9_-]+", "_", video_id or "preview")[:80]
+        preview_dir = self._preview_dir / preview_key
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        self._log_info(f"youtube preview requested url={normalized_url} key={preview_key}")
+
+        cached_path = self._find_latest_audio_file(preview_dir)
+        if cached_path:
+            self._log_info(f"youtube preview using cached file={cached_path}")
+            payload = await self.load_track_audio(str(cached_path))
+            payload["path"] = str(cached_path)
+            return payload
+
         command = [
             *yt_dlp["command"],
             "--no-warnings",
             "--no-check-certificate",
             "--no-playlist",
-            "--get-url",
-            "-f",
-            "ba[ext=m4a]/bestaudio/best",
+            "--extract-audio",
+            "--audio-format",
+            "mp3",
+            "--audio-quality",
+            "5",
+            "--restrict-filenames",
+            "--force-overwrites",
+            "--paths",
+            str(preview_dir),
+            "-o",
+            "preview.%(ext)s",
+            "--print",
+            "after_move:filepath",
             normalized_url,
         ]
-        result = await self._run_command(command, timeout=90, env=yt_dlp["env"])
+        result = await self._run_command(command, timeout=240, env=yt_dlp["env"])
         if result.returncode != 0:
             raise RuntimeError(
-                self._command_error(result, "Failed to resolve preview stream")
+                self._command_error(result, "Failed to prepare preview audio")
             )
-        stream_url = ""
-        for raw_line in (result.stdout or "").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith("http://") or line.startswith("https://"):
-                stream_url = line
-                break
-        if not stream_url:
-            raise RuntimeError("yt-dlp did not return a playable preview stream URL")
-        return {"stream_url": stream_url}
+        output_lines = [
+            line.strip() for line in (result.stdout or "").splitlines() if line.strip()
+        ]
+        preview_path = self._extract_downloaded_path(output_lines, preview_dir)
+        if not preview_path:
+            preview_path = self._find_latest_audio_file(preview_dir)
+        if not preview_path:
+            raise RuntimeError("Preview completed but no audio file was found")
+        self._log_info(f"youtube preview prepared file={preview_path}")
+        payload = await self.load_track_audio(str(preview_path))
+        payload["path"] = str(preview_path)
+        return payload
 
     async def download_youtube_audio(
         self, app_id: int, video_url: str
@@ -721,8 +757,13 @@ class Plugin:
 
         yt_dlp = self._require_yt_dlp_invocation()
         normalized_url = self._normalize_youtube_url(video_url)
+        video_id = self._extract_youtube_video_id(normalized_url)
         app_download_dir = self._downloads_dir / str(app_id)
         app_download_dir.mkdir(parents=True, exist_ok=True)
+        self._log_info(
+            f"youtube download requested app={app_id} url={normalized_url} "
+            f"video_id={video_id} source={yt_dlp.get('source')} path={yt_dlp.get('path')}"
+        )
 
         command = [
             *yt_dlp["command"],
@@ -760,6 +801,9 @@ class Plugin:
             raise RuntimeError("Download completed but no audio file was found")
 
         tracks = await self.set_track(app_id, str(downloaded_path), downloaded_path.name)
+        self._tracks[str(app_id)]["youtube_id"] = video_id
+        self._save_tracks()
+        self._log_info(f"youtube download assigned app={app_id} file={downloaded_path}")
         return {
             "tracks": tracks,
             "path": str(downloaded_path),
@@ -876,6 +920,27 @@ class Plugin:
                 json.dump(self._tracks, handle, indent=2, ensure_ascii=False)
         except Exception as error:
             decky.logger.error(f"Failed to save tracks.json: {error}")
+
+    def _write_debug_log(self, level: str, message: str) -> None:
+        try:
+            self._debug_log_file.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with self._debug_log_file.open("a", encoding="utf-8") as handle:
+                handle.write(f"[{timestamp}] [{level.upper()}] {message}\n")
+        except Exception:
+            pass
+
+    def _log_info(self, message: str) -> None:
+        decky.logger.info(message)
+        self._write_debug_log("info", message)
+
+    def _log_warning(self, message: str) -> None:
+        decky.logger.warning(message)
+        self._write_debug_log("warning", message)
+
+    def _log_error(self, message: str) -> None:
+        decky.logger.error(message)
+        self._write_debug_log("error", message)
 
     def _read_localconfig_app_ids(self) -> list[int]:
         candidates = [
@@ -1112,7 +1177,8 @@ class Plugin:
     async def _run_command(
         self, command: list[str], timeout: int = 120, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        decky.logger.info(f"Executing command: {' '.join(command)}")
+        command_text = " ".join(command)
+        self._log_info(f"Executing command: {command_text}")
         run_env = os.environ.copy()
         # Decky loader can inject PyInstaller/OpenSSL paths that break Python tools.
         run_env.pop("LD_LIBRARY_PATH", None)
@@ -1130,13 +1196,13 @@ class Plugin:
             env=run_env,
         )
         if result.returncode != 0:
-            decky.logger.error(
-                f"Command failed rc={result.returncode}: {' '.join(command)}"
-            )
+            self._log_error(f"Command failed rc={result.returncode}: {command_text}")
             if result.stderr:
-                decky.logger.error(f"stderr: {result.stderr}")
+                self._log_error(f"stderr: {self._trim_message(result.stderr, 1200)}")
             if result.stdout:
-                decky.logger.error(f"stdout: {result.stdout}")
+                self._log_error(f"stdout: {self._trim_message(result.stdout, 1200)}")
+        else:
+            self._log_info(f"Command completed rc=0: {command_text}")
         return result
 
     def _command_error(
@@ -1173,6 +1239,107 @@ class Plugin:
         if host not in {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}:
             raise ValueError("Only YouTube links are supported")
         return candidate
+
+    def _extract_youtube_video_id(self, value: str) -> str:
+        parsed = urllib.parse.urlparse(value)
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host == "youtu.be":
+            video_id = parsed.path.strip("/").split("/")[0]
+            if video_id:
+                return video_id
+        query = urllib.parse.parse_qs(parsed.query)
+        video_ids = query.get("v") or []
+        if video_ids and video_ids[0]:
+            return video_ids[0]
+        parts = [part for part in parsed.path.split("/") if part]
+        for marker in ("shorts", "embed", "live"):
+            if marker in parts:
+                index = parts.index(marker)
+                if index + 1 < len(parts):
+                    return parts[index + 1]
+        return re.sub(r"[^A-Za-z0-9_-]+", "_", value)[-80:]
+
+    def _simplify_youtube_query(self, value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+        cleaned = re.sub(r"[^\w\s:'&+.-]+", " ", ascii_text)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _youtube_search_candidates(self, query: str) -> list[str]:
+        candidates: list[str] = []
+
+        def add(value: str) -> None:
+            cleaned = re.sub(r"\s+", " ", (value or "").strip())
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+
+        add(query)
+        simplified = self._simplify_youtube_query(query)
+        add(simplified)
+        if simplified:
+            add(re.sub(r"\btheme\s+music\b", "soundtrack", simplified, flags=re.IGNORECASE))
+            add(re.sub(r"\btheme\s+music\b", "ost", simplified, flags=re.IGNORECASE))
+        return candidates[:4]
+
+    def _parse_youtube_search_json_lines(self, stdout: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for raw_line in (stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                self._log_warning(
+                    f"youtube search skipped non-json line={self._trim_message(line, 240)!r}"
+                )
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            video_id = str(item.get("id") or "").strip()
+            if not video_id or video_id in seen_ids:
+                continue
+            title = str(item.get("title") or video_id).strip()
+            uploader = str(
+                item.get("uploader") or item.get("channel") or item.get("creator") or ""
+            ).strip()
+            duration_raw = item.get("duration")
+            duration: int | None = None
+            if duration_raw not in {None, "", "NA"}:
+                try:
+                    duration = int(float(duration_raw))
+                except (TypeError, ValueError):
+                    duration = None
+            if duration is not None and duration > 15 * 60:
+                continue
+
+            url_raw = str(
+                item.get("webpage_url")
+                or item.get("original_url")
+                or item.get("url")
+                or ""
+            ).strip()
+            if url_raw.startswith("http://") or url_raw.startswith("https://"):
+                webpage_url = url_raw
+            else:
+                webpage_url = f"https://www.youtube.com/watch?v={video_id}"
+
+            seen_ids.add(video_id)
+            results.append(
+                {
+                    "id": video_id,
+                    "title": title,
+                    "uploader": uploader,
+                    "duration": duration,
+                    "webpage_url": webpage_url,
+                }
+            )
+        return results
 
     def _extract_downloaded_path(
         self, lines: list[str], base_dir: Path

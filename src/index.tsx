@@ -17,10 +17,16 @@ import {
   appDetailsClasses,
   gamepadContextMenuClasses,
   fakeRenderComponent,
+  findModuleByExport,
+  findModuleDetailsByExport,
   findModuleChild,
   MenuItem,
   Patch,
   findInTree,
+  Export,
+  beforePatch,
+  DialogButton,
+  GamepadButton,
 } from "@decky/ui";
 import {
   callable,
@@ -31,6 +37,8 @@ import {
 } from "@decky/api";
 import {
   ReactElement,
+  ReactNode,
+  CSSProperties,
   useCallback,
   useEffect,
   useMemo,
@@ -52,6 +60,7 @@ type BackendTrack = {
   volume?: number;
   start_offset?: number;
   loop?: boolean;
+  youtube_id?: string;
 };
 
 type RawTrackMap = Record<string, BackendTrack>;
@@ -63,6 +72,7 @@ type GameTrack = {
   volume: number;
   startOffset: number;
   loop: boolean;
+  youtubeId?: string;
   resumeTime?: number;
 };
 
@@ -85,6 +95,9 @@ type GameOption = {
   appid: number;
   name: string;
 };
+
+type BulkAssignMode = "all" | "installed" | "uninstalled";
+type YouTubeResultAction = "preview" | "download";
 
 type DirectoryListing = {
   path: string;
@@ -111,7 +124,11 @@ type YouTubeDownloadResponse = {
 };
 
 type YouTubePreviewResponse = {
-  stream_url: string;
+  stream_url?: string;
+  data?: string;
+  mime?: string;
+  mtime?: number;
+  path?: string;
 };
 
 type GlobalTrack = {
@@ -179,12 +196,120 @@ const focusFirstInteractiveElement = (
   element?.focus();
 };
 
+const scrollFocusedElementIntoView = (target: unknown) => {
+  const element = target instanceof HTMLElement ? target : null;
+  element?.scrollIntoView({
+    block: "nearest",
+    inline: "nearest",
+    behavior: "smooth",
+  });
+};
+
+const findNearestScrollableParent = (element: HTMLElement): HTMLElement | null => {
+  let parent = element.parentElement;
+  while (parent) {
+    const style = window.getComputedStyle(parent);
+    const canScrollY = /(auto|scroll|overlay)/.test(style.overflowY);
+    if (canScrollY && parent.scrollHeight > parent.clientHeight + 8) {
+      return parent;
+    }
+    parent = parent.parentElement;
+  }
+  parent = element.parentElement;
+  while (parent) {
+    if (parent.scrollHeight > parent.clientHeight + 8) {
+      return parent;
+    }
+    parent = parent.parentElement;
+  }
+  return null;
+};
+
+const scrollYouTubeResultIntoView = (target: unknown) => {
+  const element = target instanceof HTMLElement ? target : null;
+  const resultCard =
+    element?.closest<HTMLElement>("[data-themedeck-youtube-result-card='true']") ??
+    element;
+  if (!resultCard) return;
+  const placeResult = () => {
+    const scroller = findNearestScrollableParent(resultCard);
+    if (!scroller) {
+      resultCard.scrollIntoView({
+        block: "center",
+        inline: "nearest",
+        behavior: "auto",
+      });
+      return;
+    }
+    const scrollerRect = scroller.getBoundingClientRect();
+    const cardRect = resultCard.getBoundingClientRect();
+    const desiredTop = Math.min(
+      Math.max(360, scroller.clientHeight * 0.62),
+      Math.max(220, scroller.clientHeight - 80)
+    );
+    scroller.scrollTop += cardRect.top - scrollerRect.top - desiredTop;
+  };
+  placeResult();
+  window.requestAnimationFrame(placeResult);
+  window.setTimeout(placeResult, 120);
+  window.setTimeout(placeResult, 260);
+};
+
+type ControllerButtonProps = {
+  children: ReactNode;
+  onClick?: (event?: unknown) => void;
+  disabled?: boolean;
+  style?: CSSProperties;
+  className?: string;
+  buttonRef?: (element: HTMLElement | null) => void;
+  onCancel?: () => void;
+  onGamepadFocus?: (event: any) => void;
+  onButtonDown?: (event: any) => void;
+  onGamepadDirection?: (event: any) => void;
+  [key: string]: any;
+};
+
+const ControllerDialogButton = DialogButton as any;
+
+const ControllerButton = ({
+  children,
+  onClick,
+  disabled,
+  style,
+  className,
+  buttonRef,
+  onCancel,
+  onGamepadFocus,
+  onButtonDown,
+  onGamepadDirection,
+  ...buttonProps
+}: ControllerButtonProps) => (
+  <ControllerDialogButton
+    {...buttonProps}
+    className={className}
+    ref={buttonRef}
+    disabled={disabled}
+    focusable={!disabled}
+    onClick={(event: unknown) => onClick?.(event)}
+    onCancelButton={() => onCancel?.()}
+    onButtonDown={onButtonDown}
+    onGamepadDirection={onGamepadDirection}
+    onGamepadFocus={(event: any) => {
+      if (onGamepadFocus) {
+        onGamepadFocus(event);
+        return;
+      }
+      scrollFocusedElementIntoView(event?.target);
+    }}
+    style={style}
+  >
+    {children}
+  </ControllerDialogButton>
+);
+
 const fetchTracks = callable<[], RawTrackMap>("get_tracks");
 const fetchGlobalTrack = callable<[], BackendTrack | null>("get_global_track");
 const fetchStoreTrack = callable<[], BackendTrack | null>("get_store_track");
-const fetchLocalconfigAppIds = callable<[], { app_ids?: number[] }>(
-  "get_localconfig_app_ids"
-);
 const resolveStoreAppNames = callable<
   [appIds: number[]],
   Record<string, string>
@@ -2240,26 +2365,42 @@ const stopRunningGameWatcher = () => {
 
 const resolveLibraryContextMenu = () => {
   try {
-    const component = fakeRenderComponent(
-      findModuleChild((module: any) => {
-        if (!module || typeof module !== "object") return;
-        for (const prop in module) {
-          const value = module[prop];
-          if (
-            value?.toString &&
-            value.toString().includes("().LibraryContextMenu")
-          ) {
-            return Object.values(module).find(
-              (sibling: any) =>
-                sibling?.toString?.().includes("createElement") &&
-                sibling.toString().includes("navigator:")
-            );
-          }
-        }
-        return;
-      })
+    const moduleWithContextMenu = findModuleByExport(
+      (candidate: Export) =>
+        !!candidate?.toString?.().includes("().LibraryContextMenu"),
+      1
     );
-    return component?.type ?? null;
+    if (moduleWithContextMenu && typeof moduleWithContextMenu === "object") {
+      const siblingMatch = Object.values(moduleWithContextMenu).find(
+        (sibling: any) =>
+          typeof sibling === "function" &&
+          !!sibling?.toString?.().includes("navigator:")
+      );
+      if (typeof siblingMatch === "function") {
+        const component = fakeRenderComponent(siblingMatch);
+        if (component?.type?.prototype) {
+          return component.type;
+        }
+      }
+    }
+
+    // Fallback for older clients or alternative bundles.
+    const byChild = findModuleChild((module: any) => {
+      if (typeof module !== "object") return;
+      for (const prop in module) {
+        const value = module[prop];
+        if (value?.toString?.().includes?.("().LibraryContextMenu")) {
+          return Object.values(module).find(
+            (sibling: any) =>
+              sibling?.toString?.().includes?.("createElement") &&
+              sibling?.toString?.().includes?.("navigator:")
+          );
+        }
+      }
+      return;
+    });
+    const fallback = fakeRenderComponent(byChild);
+    return fallback?.type ?? null;
   } catch (error) {
     console.error("[ThemeDeck] unable to resolve context menu", error);
     return null;
@@ -2300,6 +2441,25 @@ const coerceMenuChildren = (children: any): any[] | null => {
   if (Array.isArray(children?.props?.children)) return children.props.children;
   if (Array.isArray(children?.children)) return children.children;
   return null;
+};
+
+const collectMenuChildArrays = (
+  root: any,
+  arrays: any[][] = [],
+  seen = new WeakSet<object>()
+): any[][] => {
+  if (!root) return arrays;
+  if (Array.isArray(root)) {
+    arrays.push(root);
+    root.forEach((child) => collectMenuChildArrays(child, arrays, seen));
+    return arrays;
+  }
+  if (typeof root !== "object") return arrays;
+  if (seen.has(root)) return arrays;
+  seen.add(root);
+  collectMenuChildArrays(root.props?.children, arrays, seen);
+  collectMenuChildArrays(root.children, arrays, seen);
+  return arrays;
 };
 
 const pruneThemeDeckMenu = (children: any) => {
@@ -2363,17 +2523,29 @@ const isGameContextMenu = (items: any[]): boolean => {
   if (!items?.length) return false;
   return !!findInReactTree(
     items,
-    (node: any) =>
-      typeof node?.props?.onSelected === "function" &&
-      node.props.onSelected.toString().includes("launchSource")
+    (node: any) => {
+      const onSelected =
+        typeof node?.props?.onSelected === "function"
+          ? node.props.onSelected
+          : typeof node?.onSelected === "function"
+            ? node.onSelected
+            : null;
+      return !!onSelected?.toString?.().includes("launchSource");
+    }
   );
 };
 
 const isLibraryAppContextMenu = (items: any[]): boolean => {
   if (!items?.length) return false;
   return !!findInReactTree(items, (node: any) => {
-    if (typeof node?.props?.onSelected !== "function") return false;
-    const source = node.props.onSelected.toString();
+    const onSelected =
+      typeof node?.props?.onSelected === "function"
+        ? node.props.onSelected
+        : typeof node?.onSelected === "function"
+          ? node.onSelected
+          : null;
+    if (!onSelected) return false;
+    const source = onSelected.toString();
     return (
       source.includes("launchSource") ||
       source.includes("AppProperties") ||
@@ -2440,15 +2612,42 @@ const patchMenuItems = (
   menuItems: any,
   fallbackAppId: number | null
 ): number | null => {
-  const entries = coerceMenuChildren(menuItems);
-  if (!Array.isArray(entries) || !entries.length) return null;
-  if (!isGameContextMenu(entries) && !isLibraryAppContextMenu(entries)) {
+  const candidates = collectMenuChildArrays(menuItems).filter(
+    (entries) => entries.length > 0
+  );
+  if (!candidates.length) return null;
+
+  const entries =
+    candidates.find((candidate) => isGameContextMenu(candidate)) ??
+    candidates.find((candidate) => isLibraryAppContextMenu(candidate)) ??
+    (fallbackAppId ? candidates.find((candidate) => candidate.length > 1) : null) ??
+    (fallbackAppId ? candidates[0] : null);
+
+  if (!entries) {
     return null;
   }
   const derivedAppId = deriveAppIdFromMenuItems(entries, fallbackAppId);
   if (!derivedAppId) return null;
   insertThemeDeckMenu(entries, derivedAppId);
   return derivedAppId;
+};
+
+const patchRenderedContextMenu = (
+  node: any,
+  state: { appId: number | null }
+): number | null => {
+  const menuItems = node?.props?.children?.[0] ?? node?.props?.children ?? node;
+  const fallbackAppId =
+    extractAppIdFromTree(node) ??
+    state.appId ??
+    readAppIdFromLocation() ??
+    extractAppId(focusedAppId);
+  const patched = patchMenuItems(menuItems, fallbackAppId);
+  if (patched) {
+    state.appId = patched;
+    setContextMenuActiveAppId(patched);
+  }
+  return patched;
 };
 
 const patchContextMenuFocus = () => {
@@ -2503,41 +2702,71 @@ const patchContextMenuFocus = () => {
           component,
           "type",
           (_innerArgs: Record<string, unknown>[], rendered: any) => {
-            afterPatch(
-              rendered.type.prototype,
-              "render",
-              (_renderArgs: Record<string, unknown>[], node: any) => {
-                const menuItems =
-                  node?.props?.children?.[0] ?? node?.props?.children;
-                const fallbackAppId =
-                  extractAppIdFromTree(node) ?? state.appId;
-                const patched = patchMenuItems(menuItems, fallbackAppId);
-                if (patched) {
-                  state.appId = patched;
-                  setContextMenuActiveAppId(patched);
-                }
-                return node;
-              }
-            );
-            afterPatch(
-              rendered.type.prototype,
-              "shouldComponentUpdate",
-              ([nextProps]: any, shouldUpdate: any) => {
-                if (shouldUpdate === true) {
+            const renderedType = rendered?.type;
+            if (renderedType?.prototype?.render) {
+              afterPatch(
+                renderedType.prototype,
+                "render",
+                (_renderArgs: Record<string, unknown>[], ret2: any) => {
+                  const menuItems = ret2?.props?.children?.[0];
+                  if (!Array.isArray(menuItems)) return ret2;
+                  if (!isGameContextMenu(menuItems)) return ret2;
+                  try {
+                    pruneThemeDeckMenu(menuItems);
+                  } catch (_error) {
+                    return ret2;
+                  }
                   const fallbackAppId =
-                    extractAppIdFromTree(nextProps?.children) ?? state.appId;
-                  const patched = patchMenuItems(
-                    nextProps?.children,
+                    appId ??
+                    readAppIdFromLocation() ??
+                    extractAppId(focusedAppId);
+                  const resolvedAppId = deriveAppIdFromMenuItems(
+                    menuItems,
                     fallbackAppId
                   );
-                  if (patched) {
-                    state.appId = patched;
-                    setContextMenuActiveAppId(patched);
+                  if (resolvedAppId) {
+                    insertThemeDeckMenu(menuItems, resolvedAppId);
+                    state.appId = resolvedAppId;
+                    setContextMenuActiveAppId(resolvedAppId);
                   }
+                  return ret2;
                 }
-                return shouldUpdate;
-              }
-            );
+              );
+            } else {
+              patchRenderedContextMenu(rendered, state);
+            }
+            if (renderedType?.prototype?.shouldComponentUpdate) {
+              afterPatch(
+                renderedType.prototype,
+                "shouldComponentUpdate",
+                ([nextProps]: any, shouldUpdate: any) => {
+                  const menuItems = nextProps?.children;
+                  if (!Array.isArray(menuItems)) return shouldUpdate;
+                  try {
+                    pruneThemeDeckMenu(menuItems);
+                  } catch (_error) {
+                    return shouldUpdate;
+                  }
+                  if (shouldUpdate === true) {
+                    const fallbackAppId =
+                      appId ??
+                      state.appId ??
+                      readAppIdFromLocation() ??
+                      extractAppId(focusedAppId);
+                    const resolvedAppId = deriveAppIdFromMenuItems(
+                      menuItems,
+                      fallbackAppId
+                    );
+                    if (resolvedAppId) {
+                      insertThemeDeckMenu(menuItems, resolvedAppId);
+                      state.appId = resolvedAppId;
+                      setContextMenuActiveAppId(resolvedAppId);
+                    }
+                  }
+                  return shouldUpdate;
+                }
+              );
+            }
             return rendered;
           }
         );
@@ -2559,6 +2788,49 @@ const patchContextMenuFocus = () => {
     patches.unmount?.unpatch();
     setContextMenuActiveAppId(null);
   };
+};
+
+const patchShowContextMenu = () => {
+  try {
+    const [module, _menuFn, exportName] = findModuleDetailsByExport(
+      (candidate: Export) => {
+        const source = candidate?.toString?.();
+        return (
+          typeof source === "string" &&
+          source.includes("GetContextMenuManagerFromWindow(") &&
+          source.includes(".CreateContextMenuInstance(")
+        );
+      },
+      1
+    );
+
+    if (!module || !exportName || typeof module[exportName] !== "function") {
+      return null;
+    }
+
+    const patch = beforePatch(
+      module,
+      exportName,
+      (args: Record<string, unknown>[]) => {
+        const children = args?.[0];
+        const fallbackAppId =
+          readAppIdFromLocation() ??
+          extractAppId(contextMenuActiveAppId) ??
+          extractAppId(focusedAppId);
+        const patchedAppId = patchMenuItems(children, fallbackAppId ?? null);
+        if (patchedAppId) {
+          setContextMenuActiveAppId(patchedAppId);
+        }
+      }
+    );
+
+    return () => {
+      patch?.unpatch();
+    };
+  } catch (error) {
+    console.error("[ThemeDeck] failed to patch showContextMenu", error);
+    return null;
+  }
 };
 
 const injectBridgeIntoRoute = (routePattern: string) =>
@@ -2987,6 +3259,36 @@ const formatDuration = (seconds?: number | null) => {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 };
 
+const sanitizeYouTubeQuery = (value: string): string => {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/[™®©]/g, "")
+    .replace(/[^\w\s:'&+.-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+};
+
+const extractYouTubeIdsFromText = (value?: string | null): string[] => {
+  const text = String(value || "");
+  if (!text) return [];
+  const ids = new Set<string>();
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([A-Za-z0-9_-]{6,})/g,
+    /\[([A-Za-z0-9_-]{6,})\](?=\.[A-Za-z0-9]+$|$)/g,
+    /(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{11})(?=\.[A-Za-z0-9]+$|[^A-Za-z0-9_-]|$)/g,
+  ];
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      const candidate = match[1];
+      if (candidate) {
+        ids.add(candidate);
+      }
+    }
+  }
+  return Array.from(ids);
+};
+
 const toHumanReadableTrackName = (value: string): string => {
   let text = String(value || "").trim();
   if (!text) {
@@ -3082,6 +3384,7 @@ const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
           ? clamp(track.start_offset, 0, 30)
           : 0,
       loop: track.loop !== false,
+      youtubeId: typeof track.youtube_id === "string" ? track.youtube_id : undefined,
     };
   }
 
@@ -3822,6 +4125,55 @@ const getDisplayName = (appId: number) => {
   );
 };
 
+const isInstalledAppOverview = (overview: any): boolean => {
+  if (!overview || typeof overview !== "object") {
+    return false;
+  }
+  const explicitFlags = [
+    overview.is_installed,
+    overview.installed,
+    overview.bIsInstalled,
+    overview.bInstalled,
+    overview.isInstalled,
+  ];
+  for (const flag of explicitFlags) {
+    if (typeof flag === "boolean") {
+      return flag;
+    }
+    if (typeof flag === "number") {
+      return flag !== 0;
+    }
+  }
+  const statusValue =
+    overview.eAppOwnershipInstalledState ??
+    overview.installed_state ??
+    overview.install_state ??
+    overview.eInstalledState;
+  if (typeof statusValue === "number") {
+    return statusValue !== 0;
+  }
+  const stateText = String(
+    overview.state ??
+      overview.app_state ??
+      overview.strAppState ??
+      overview.status ??
+      overview.m_eAppState ??
+      overview.eAppState ??
+      ""
+  )
+    .trim()
+    .toLowerCase();
+  if (stateText) {
+    return (
+      stateText.includes("installed") ||
+      stateText.includes("ready") ||
+      stateText.includes("downloaded") ||
+      stateText.includes("cached")
+    );
+  }
+  return false;
+};
+
 const getThemeDeckRouteAppId = (pathname?: string): number | null => {
   const path = pathname || window.location.pathname || "";
   const match = path.match(/\/themedeck\/(\d+)/);
@@ -4077,6 +4429,9 @@ const Content = () => {
     setStoreTrack,
   } = useTrackState();
   const [library, setLibrary] = useState<GameOption[]>([]);
+  const [installedLibraryAppIds, setInstalledLibraryAppIds] = useState<Set<number>>(
+    new Set()
+  );
   const [autoPlay, setAutoPlay] = useAutoPlaySetting();
   const [globalAmbientEnabled, setGlobalAmbientEnabled] =
     useGlobalAmbientEnabledSetting();
@@ -4107,6 +4462,8 @@ const Content = () => {
   const bulkAssignStopRequestedRef = useRef(false);
   const bulkAssignRunIdRef = useRef(0);
   const [showMissingGames, setShowMissingGames] = useState(false);
+  const [bulkAssignMode, setBulkAssignMode] =
+    useState<BulkAssignMode>("all");
   const [resolvedMissingNames, setResolvedMissingNames] = useState<Record<number, string>>(
     {}
   );
@@ -4148,10 +4505,16 @@ const Content = () => {
     }
     return unique;
   }, [library]);
-  const unassignedLibraryGameCount = useMemo(
-    () => libraryGames.filter((game) => !tracks[game.appid]).length,
-    [libraryGames, tracks]
-  );
+  const filteredLibraryGames = useMemo(() => {
+    const isInstalled = (appId: number) => installedLibraryAppIds.has(appId);
+    if (bulkAssignMode === "installed") {
+      return libraryGames.filter((game) => isInstalled(game.appid));
+    }
+    if (bulkAssignMode === "uninstalled") {
+      return libraryGames.filter((game) => !isInstalled(game.appid));
+    }
+    return libraryGames;
+  }, [bulkAssignMode, installedLibraryAppIds, libraryGames]);
   const missingGamesStatus = useMemo(() => {
     const unknownNamePattern = /^App\s+\d+$/i;
     return libraryGames
@@ -4355,6 +4718,7 @@ const Content = () => {
   }, [showMissingGames, unresolvedMissingGameIds]);
   const loadLibrary = useCallback(async () => {
     try {
+      setInstalledLibraryAppIds(new Set());
       const byId = new Map<number, GameOption>();
       const addEntry = (entry: any, fallbackId?: unknown) => {
         const fallbackAppId = Number.parseInt(String(fallbackId ?? ""), 10);
@@ -4407,6 +4771,7 @@ const Content = () => {
         if (overview?.visible_in_game_list === false) {
           return;
         }
+        const installed = isInstalledAppOverview(overview);
         const name = String(
           overview?.display_name ||
             overview?.localized_name ||
@@ -4418,6 +4783,16 @@ const Content = () => {
         const existing = byId.get(appid);
         if (!existing || existing.name.startsWith("App ")) {
           byId.set(appid, { appid, name });
+        }
+        if (installed) {
+          setInstalledLibraryAppIds((prev) => {
+            if (prev.has(appid)) {
+              return prev;
+            }
+            const next = new Set(prev);
+            next.add(appid);
+            return next;
+          });
         }
       };
       const addCollection = (raw: any) => {
@@ -4470,13 +4845,6 @@ const Content = () => {
         // no-op
       }
 
-      try {
-        const localconfigAppIds = await fetchLocalconfigAppIds();
-        addCollection(localconfigAppIds?.app_ids ?? []);
-      } catch (error) {
-        console.error("[ThemeDeck] localconfig app id fallback failed", error);
-      }
-
       const games = Array.from(byId.values()).sort((a, b) =>
         a.name.localeCompare(b.name)
       );
@@ -4515,22 +4883,37 @@ const Content = () => {
   }, [refreshYtDlpStatus]);
 
   const handleUpdateYtDlp = async () => {
-    const confirmed = window.confirm(
-      "Update yt-dlp now? Only do this if YouTube search is not working."
-    );
-    if (!confirmed) {
+    if (ytDlpBusy) {
       return;
     }
+    logClient("info", "yt_dlp_update_button_pressed", {
+      installed: ytDlpStatus.installed,
+      version: ytDlpStatus.version || "",
+      source: ytDlpStatus.source || "",
+      path: ytDlpStatus.path || "",
+    });
     setYtDlpBusy(true);
+    toaster.toast({
+      title: "ThemeDeck",
+      body: "Updating yt-dlp. This can take a minute.",
+    });
     try {
       const status = await updateYtDlp();
       setYtDlpStatus(status);
+      logClient("info", "yt_dlp_update_success", {
+        version: status.version || "",
+        source: status.source || "",
+        path: status.path || "",
+      });
       toaster.toast({
         title: "ThemeDeck",
         body: `yt-dlp ready (${status.version || "latest"})`,
       });
     } catch (error) {
       console.error("[ThemeDeck] update yt-dlp failed", error);
+      logClient("error", "yt_dlp_update_failed", {
+        error: getErrorMessage(error, "Unknown update error"),
+      });
       toaster.toast({
         title: "ThemeDeck",
         body: `Failed to update yt-dlp: ${getErrorMessage(
@@ -4556,10 +4939,11 @@ const Content = () => {
     }));
   }, [bulkAssign.running]);
 
-  const handleAutoAssignMissingTracks = useCallback(async () => {
+  const handleBulkAssign = useCallback(async (mode: BulkAssignMode) => {
     if (bulkAssign.running || ytDlpBusy) {
       return;
     }
+    setBulkAssignMode(mode);
     if (!ytDlpStatus.installed) {
       toaster.toast({
         title: "ThemeDeck",
@@ -4582,11 +4966,26 @@ const Content = () => {
       // Keep using current in-memory tracks if refresh fails.
     }
 
-    const allMissingGames = libraryGames.filter((game) => !latestTracks[game.appid]);
+    const scopedGames =
+      mode === "installed"
+        ? libraryGames.filter((game) => installedLibraryAppIds.has(game.appid))
+        : mode === "uninstalled"
+          ? libraryGames.filter((game) => !installedLibraryAppIds.has(game.appid))
+          : libraryGames;
+
+    const allMissingGames = scopedGames.filter(
+      (game) => !latestTracks[game.appid]
+    );
     if (!allMissingGames.length) {
+      const modeLabel =
+        mode === "installed"
+          ? "installed games"
+          : mode === "uninstalled"
+            ? "uninstalled games"
+            : "library games";
       toaster.toast({
         title: "ThemeDeck",
-        body: "All library games already have assigned music.",
+        body: `No ${modeLabel} are missing assigned music.`,
       });
       return;
     }
@@ -4861,6 +5260,7 @@ const Content = () => {
     });
   }, [
     bulkAssign.running,
+    installedLibraryAppIds,
     getGameName,
     libraryGames,
     tracks,
@@ -5528,35 +5928,57 @@ const Content = () => {
               Uses first YouTube result per game and only targets games with no assigned track.
             </div>
             <div style={{ opacity: 0.95, fontSize: "0.88rem", marginTop: "0.25rem", fontWeight: 600 }}>
-              Games currently without music assigned: {unassignedLibraryGameCount}
+              Games currently without music assigned:{" "}
+              {filteredLibraryGames.filter((game) => !tracks[game.appid]).length}
             </div>
             <div style={{ opacity: 0.75, fontSize: "0.8rem", marginTop: "0.15rem" }}>
               Total library games detected: {libraryGames.length}
             </div>
             <div
               style={{
-                marginTop: "0.5rem",
                 display: "flex",
                 flexDirection: "column",
                 gap: "0.35rem",
-                alignItems: "stretch",
+                marginTop: "0.5rem",
               }}
             >
-              <button
-                className="DialogButton themedeck-fit themedeck-wrap"
-                onClick={handleAutoAssignMissingTracks}
-                disabled={
-                  bulkAssign.running || ytDlpBusy || !ytDlpStatus.installed
-                }
-                style={{
-                  textAlign: "left",
-                  fontSize: "0.92rem",
-                  paddingRight: "0.65rem",
-                  paddingLeft: "0.65rem",
-                }}
-              >
-                {bulkAssign.running ? "Running..." : "Auto-assign missing"}
-              </button>
+              {(
+                [
+                  { value: "all", label: "Download music for all games" },
+                  {
+                    value: "installed",
+                    label: "Download music only for installed games",
+                  },
+                  {
+                    value: "uninstalled",
+                    label: "Download music only for uninstalled games",
+                  },
+                ] as Array<{ value: BulkAssignMode; label: string }>
+              ).map((option) => (
+                <button
+                  key={option.value}
+                  className="DialogButton themedeck-fit themedeck-wrap"
+                  onClick={() => {
+                    void handleBulkAssign(option.value);
+                  }}
+                  style={{
+                    textAlign: "left",
+                    fontSize: "0.92rem",
+                    paddingRight: "0.8rem",
+                    paddingLeft: "0.8rem",
+                    minHeight: "2.8rem",
+                    display: "block",
+                    border:
+                      bulkAssignMode === option.value
+                        ? "1px solid rgba(98, 168, 255, 0.9)"
+                        : "1px solid rgba(255, 255, 255, 0.12)",
+                  }}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ marginTop: "0.5rem" }}>
               <button
                 className="DialogButton themedeck-fit themedeck-wrap"
                 onClick={handleStopBulkAssign}
@@ -5565,6 +5987,7 @@ const Content = () => {
                   fontSize: "0.92rem",
                   paddingRight: "0.65rem",
                   paddingLeft: "0.65rem",
+                  width: "100%",
                 }}
               >
                 STOP
@@ -5964,17 +6387,29 @@ const ChangeTheme = () => {
   );
   const [selectedYouTubeId, setSelectedYouTubeId] = useState<string | null>(null);
   const pageRef = useRef<HTMLDivElement | null>(null);
-  const assignedVideoId = useMemo(() => {
-    if (!track?.filename) return "";
-    const match = track.filename.match(/\[([A-Za-z0-9_-]{6,})\]\.[A-Za-z0-9]+$/);
-    return match?.[1] ?? "";
-  }, [track?.filename]);
+  const youtubeActionRefs = useRef<Record<string, HTMLElement | null>>({});
+  const youtubeSearchButtonRef = useRef<HTMLElement | null>(null);
+  const localBrowseButtonRef = useRef<HTMLElement | null>(null);
+  const assignedVideoIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (track?.youtubeId) {
+      ids.add(track.youtubeId);
+    }
+    for (const source of [track?.filename, track?.path]) {
+      for (const id of extractYouTubeIdsFromText(source)) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }, [track?.filename, track?.path, track?.youtubeId]);
   const [previewLoadingVideoId, setPreviewLoadingVideoId] = useState<string | null>(
     null
   );
   const [previewingVideoId, setPreviewingVideoId] = useState<string | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewObjectUrlRef = useRef<string | null>(null);
   const playback = usePlaybackStateValue();
+  const navigateBack = useCallback(() => Navigation.NavigateBack(), []);
 
   const loadTrack = useCallback(async () => {
     if (!appId) return;
@@ -6013,10 +6448,10 @@ const ChangeTheme = () => {
     setYoutubeError("");
     setYoutubeResults([]);
     setYoutubeQuery("");
-    const nextQuery = `${getDisplayName(targetAppId)} theme music`;
+    const nextQuery = sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} theme music`);
     setYoutubeQuery(nextQuery);
     const delayedRefresh = window.setTimeout(() => {
-      setYoutubeQuery(`${getDisplayName(targetAppId)} theme music`);
+      setYoutubeQuery(sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} theme music`));
     }, 250);
     return () => {
       window.clearTimeout(delayedRefresh);
@@ -6174,6 +6609,10 @@ const ChangeTheme = () => {
     preview.pause();
     preview.currentTime = 0;
     preview.src = "";
+    if (previewObjectUrlRef.current) {
+      URL.revokeObjectURL(previewObjectUrlRef.current);
+      previewObjectUrlRef.current = null;
+    }
     setPreviewingVideoId(null);
   };
 
@@ -6185,9 +6624,21 @@ const ChangeTheme = () => {
     setPreviewLoadingVideoId(result.id);
     try {
       const response = await getYouTubePreviewStream(result.webpage_url);
-      const streamUrl = (response?.stream_url || "").trim();
-      if (!streamUrl) {
-        throw new Error("No preview stream URL returned");
+      let previewUrl = (response?.stream_url || "").trim();
+      if (!previewUrl && response?.data) {
+        if (previewObjectUrlRef.current) {
+          URL.revokeObjectURL(previewObjectUrlRef.current);
+          previewObjectUrlRef.current = null;
+        }
+        previewUrl = decodePayloadToObjectUrl({
+          data: response.data,
+          mime: response.mime,
+          mtime: response.mtime,
+        });
+        previewObjectUrlRef.current = previewUrl;
+      }
+      if (!previewUrl) {
+        throw new Error("No preview audio returned");
       }
       let preview = previewAudioRef.current;
       if (!preview) {
@@ -6203,7 +6654,7 @@ const ChangeTheme = () => {
       };
       preview.pause();
       preview.currentTime = 0;
-      preview.src = streamUrl;
+      preview.src = previewUrl;
       await preview.play();
       setPreviewingVideoId(result.id);
     } catch (error) {
@@ -6366,6 +6817,97 @@ const ChangeTheme = () => {
       (currentIndex + delta + youtubeResults.length) % youtubeResults.length;
     setSelectedYouTubeId(youtubeResults[nextIndex].id);
   };
+  const focusYouTubeResultAction = (
+    nextIndex: number,
+    action: YouTubeResultAction
+  ) => {
+    if (!youtubeResults.length) return;
+    const normalizedIndex =
+      (nextIndex + youtubeResults.length) % youtubeResults.length;
+    setSelectedYouTubeId(youtubeResults[normalizedIndex].id);
+    window.setTimeout(() => {
+      const refKey = `${normalizedIndex}:${action}`;
+      const nextButton =
+        youtubeActionRefs.current[refKey] ??
+        document.querySelector<HTMLElement>(
+          `[data-themedeck-youtube-result-index="${normalizedIndex}"]` +
+            `[data-themedeck-youtube-action="${action}"]`
+        );
+      nextButton?.focus();
+      scrollYouTubeResultIntoView(nextButton);
+    }, 0);
+  };
+  const focusControllerElement = (element: HTMLElement | null) => {
+    if (!element) return;
+    element.focus();
+    element.scrollIntoView({
+      block: "center",
+      inline: "nearest",
+      behavior: "smooth",
+    });
+  };
+  const handleYouTubeResultActionFocus = (
+    result: YouTubeSearchResult,
+    target: unknown
+  ) => {
+    setSelectedYouTubeId(result.id);
+    scrollYouTubeResultIntoView(target);
+  };
+  const handleYouTubeResultActionDirection = (
+    event: any,
+    index: number,
+    action: YouTubeResultAction,
+    activate: () => void
+  ) => {
+    const button = Number(event?.detail?.button ?? event?.button);
+    if (button === GamepadButton.OK) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      activate();
+      return;
+    }
+    if (button === GamepadButton.DIR_UP && action === "download") {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      focusYouTubeResultAction(index, "preview");
+      return;
+    }
+    if (button === GamepadButton.DIR_DOWN && action === "preview") {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      focusYouTubeResultAction(index, "download");
+      return;
+    }
+    if (
+      (button === GamepadButton.DIR_UP && action === "preview") ||
+      (button === GamepadButton.DIR_DOWN && action === "download")
+    ) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      return;
+    }
+    if (button === GamepadButton.DIR_LEFT && index === 0) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      focusControllerElement(youtubeSearchButtonRef.current);
+      return;
+    }
+    if (button === GamepadButton.DIR_RIGHT && index === youtubeResults.length - 1) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      focusControllerElement(localBrowseButtonRef.current);
+      return;
+    }
+    if (button !== GamepadButton.DIR_LEFT && button !== GamepadButton.DIR_RIGHT) {
+      return;
+    }
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    focusYouTubeResultAction(
+      index + (button === GamepadButton.DIR_RIGHT ? 1 : -1),
+      action
+    );
+  };
   const directoryShortcuts = [
     { label: "Home", path: "/home/deck" },
     { label: "Music", path: "/home/deck/Music" },
@@ -6438,32 +6980,32 @@ const ChangeTheme = () => {
                 }}
               >
                 {track ? (
-                  <button
-                    className="DialogButton"
+                  <ControllerButton
+                    onCancel={navigateBack}
                     onClick={handleTrackPreviewToggle}
                     style={{ minWidth: "7rem", whiteSpace: "nowrap" }}
                   >
                     {playback.appId === appId && playback.status === "playing"
                       ? "Pause"
                       : "Play"}
-                  </button>
+                  </ControllerButton>
                 ) : null}
                 {track ? (
-                  <button
-                    className="DialogButton"
+                  <ControllerButton
+                    onCancel={navigateBack}
                     onClick={handleRemove}
                     style={{ minWidth: "9rem", whiteSpace: "nowrap" }}
                   >
                     Remove music
-                  </button>
+                  </ControllerButton>
                 ) : null}
-                <button
-                  className="DialogButton"
-                  onClick={() => Navigation.NavigateBack()}
+                <ControllerButton
+                  onCancel={navigateBack}
+                  onClick={navigateBack}
                   style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
                 >
                   Done
-                </button>
+                </ControllerButton>
               </div>
             </div>
           </PanelSectionRow>
@@ -6530,20 +7072,44 @@ const ChangeTheme = () => {
                 this game.
               </div>
               {!ytDlpStatus.installed ? (
-                <button
-                  className="DialogButton"
-                  onClick={async () => {
-                    setYtDlpBusy(true);
-                    try {
-                      const status = await updateYtDlp();
-                      setYtDlpStatus(status);
-                      toaster.toast({
-                        title: "ThemeDeck",
-                        body: `yt-dlp ready (${status.version || "latest"})`,
-                      });
-                    } catch (error) {
-                      toaster.toast({
-                        title: "ThemeDeck",
+	                  <ControllerButton
+	                    onCancel={navigateBack}
+	                  onClick={async () => {
+	                    if (ytDlpBusy) {
+	                      return;
+	                    }
+	                    logClient("info", "yt_dlp_install_button_pressed", {
+	                      appId,
+	                      installed: ytDlpStatus.installed,
+	                      version: ytDlpStatus.version || "",
+	                      source: ytDlpStatus.source || "",
+	                      path: ytDlpStatus.path || "",
+	                    });
+	                    setYtDlpBusy(true);
+	                    toaster.toast({
+	                      title: "ThemeDeck",
+	                      body: "Installing/updating yt-dlp. This can take a minute.",
+	                    });
+	                    try {
+	                      const status = await updateYtDlp();
+	                      setYtDlpStatus(status);
+	                      logClient("info", "yt_dlp_install_success", {
+	                        appId,
+	                        version: status.version || "",
+	                        source: status.source || "",
+	                        path: status.path || "",
+	                      });
+	                      toaster.toast({
+	                        title: "ThemeDeck",
+	                        body: `yt-dlp ready (${status.version || "latest"})`,
+	                      });
+	                    } catch (error) {
+	                      logClient("error", "yt_dlp_install_failed", {
+	                        appId,
+	                        error: getErrorMessage(error, "Unknown update error"),
+	                      });
+	                      toaster.toast({
+	                        title: "ThemeDeck",
                         body: `Failed to install yt-dlp: ${getErrorMessage(
                           error,
                           "Unknown update error"
@@ -6558,7 +7124,7 @@ const ChangeTheme = () => {
                   style={{ width: "fit-content" }}
                 >
                   {ytDlpBusy ? "Installing..." : "Install yt-dlp"}
-                </button>
+                </ControllerButton>
               ) : null}
             </div>
           </PanelSectionRow>
@@ -6577,14 +7143,17 @@ const ChangeTheme = () => {
                 onChange={(event) => setYoutubeQuery(event.target.value)}
                 style={{ width: "100%", minWidth: "22rem" }}
               />
-              <button
-                className="DialogButton"
+              <ControllerButton
+                buttonRef={(element) => {
+                  youtubeSearchButtonRef.current = element;
+                }}
+                onCancel={navigateBack}
                 onClick={() => handleYouTubeSearch()}
                 disabled={youtubeLoading || ytDlpBusy}
                 style={{ minWidth: "12rem" }}
               >
                 {youtubeLoading ? "Searching..." : "Search"}
-              </button>
+              </ControllerButton>
             </div>
           </PanelSectionRow>
           <PanelSectionRow>
@@ -6626,32 +7195,32 @@ const ChangeTheme = () => {
                       flexWrap: "wrap",
                     }}
                   >
-                    <button
-                      className="DialogButton"
+                    <ControllerButton
+                      onCancel={navigateBack}
                       onClick={() => selectRelativeYouTubeResult(-1)}
                       disabled={youtubeResults.length < 2}
                       style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
                     >
                       Prev
-                    </button>
-                    <button
-                      className="DialogButton"
+                    </ControllerButton>
+                    <ControllerButton
+                      onCancel={navigateBack}
                       onClick={() => selectRelativeYouTubeResult(1)}
                       disabled={youtubeResults.length < 2}
                       style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
                     >
                       Next
-                    </button>
-                    <button
-                      className="DialogButton"
+                    </ControllerButton>
+                    <ControllerButton
+                      onCancel={navigateBack}
                       onClick={() => handleYouTubePreview(selectedYouTubeResult)}
                       disabled={previewLoadingVideoId !== null || downloadingVideoId !== null}
                       style={{ minWidth: "8rem", whiteSpace: "nowrap" }}
                     >
                       {previewingVideoId === selectedYouTubeResult.id ? "Stop Preview" : "Play Preview"}
-                    </button>
-                    <button
-                      className="DialogButton"
+                    </ControllerButton>
+                    <ControllerButton
+                      onCancel={navigateBack}
                       onClick={() => handleYouTubeDownload(selectedYouTubeResult)}
                       disabled={downloadingVideoId !== null}
                       style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
@@ -6659,7 +7228,7 @@ const ChangeTheme = () => {
                       {downloadingVideoId === selectedYouTubeResult.id
                         ? "Downloading..."
                         : "Download & Assign"}
-                    </button>
+                    </ControllerButton>
                   </div>
                 ) : null}
                 <div
@@ -6668,20 +7237,20 @@ const ChangeTheme = () => {
                     display: "grid",
                     gap: "0.5rem",
                     gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                    gridAutoRows: youtubeResults.length ? "16.25rem" : "auto",
                   }}
                 >
-                  {youtubeResults.map((result) => {
+                  {youtubeResults.map((result, resultIndex) => {
                     const duration = formatDuration(result.duration);
                     const thumbnailUrl = `https://i.ytimg.com/vi/${encodeURIComponent(
                       result.id
                     )}/hqdefault.jpg`;
-                    const isCurrentlyAssigned =
-                      !!assignedVideoId && assignedVideoId === result.id;
+                    const isCurrentlyAssigned = assignedVideoIds.has(result.id);
                     const isSelected = selectedYouTubeId === result.id;
                     return (
-                      <Focusable
+                      <div
                         key={result.id}
-                        onActivate={() => setSelectedYouTubeId(result.id)}
+                        data-themedeck-youtube-result-card="true"
                         style={{
                           borderRadius: "0.4rem",
                           padding: "0.6rem",
@@ -6695,12 +7264,50 @@ const ChangeTheme = () => {
                             : "1px solid transparent",
                           display: "flex",
                           flexDirection: "column",
-                          gap: "0.35rem",
+                          gap: "0.28rem",
+                          height: "calc(100% - 0.85rem)",
+                          marginTop: "0.85rem",
+                          minHeight: 0,
+                          overflow: "hidden",
+                          scrollMarginTop: "12rem",
+                          scrollMarginBottom: "2rem",
                         }}
                       >
-                        {isSelected ? (
-                          <div style={{ fontSize: "0.72rem", opacity: 0.9 }}>Selected</div>
-                        ) : null}
+                        <div
+                          style={{
+                            minHeight: "1.1rem",
+                            display: "flex",
+                            gap: "0.25rem",
+                            alignItems: "center",
+                            flexWrap: "nowrap",
+                            overflow: "hidden",
+                          }}
+                        >
+                          {isSelected ? (
+                            <span style={{ fontSize: "0.7rem", opacity: 0.92 }}>
+                              Selected
+                            </span>
+                          ) : null}
+                          {isCurrentlyAssigned ? (
+                            <span
+                              style={{
+                                display: "inline-block",
+                                maxWidth: "100%",
+                                padding: "0.1rem 0.3rem",
+                                borderRadius: "0.25rem",
+                                background: "rgba(120, 230, 130, 0.2)",
+                                color: "#b9fbc1",
+                                fontWeight: 700,
+                                fontSize: "0.68rem",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              Currently assigned
+                            </span>
+                          ) : null}
+                        </div>
                         <div
                           onClick={() => setSelectedYouTubeId(result.id)}
                           style={{ cursor: "pointer" }}
@@ -6710,37 +7317,85 @@ const ChangeTheme = () => {
                             alt={result.title}
                             style={{
                               width: "100%",
-                              aspectRatio: "16 / 9",
+                              height: "4.5rem",
                               objectFit: "cover",
                               borderRadius: "0.35rem",
                               background: "rgba(0,0,0,0.25)",
                             }}
                           />
                         </div>
-                        {isCurrentlyAssigned ? (
-                          <div
-                            style={{
-                              display: "inline-block",
-                              width: "fit-content",
-                              padding: "0.15rem 0.4rem",
-                              borderRadius: "0.3rem",
-                              background: "rgba(120, 230, 130, 0.2)",
-                              color: "#b9fbc1",
-                              fontWeight: 700,
-                              fontSize: "0.75rem",
-                            }}
-                          >
-                            Currently assigned
-                          </div>
-                        ) : null}
-                        <div style={{ fontWeight: 600 }}>{result.title}</div>
-                        <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
+                        <div
+                          style={{
+                            fontWeight: 600,
+                            fontSize: "0.82rem",
+                            lineHeight: 1.18,
+                            minHeight: "2rem",
+                            maxHeight: "2rem",
+                            overflow: "hidden",
+                            display: "-webkit-box",
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: "vertical",
+                            wordBreak: "break-word",
+                          }}
+                          title={result.title}
+                        >
+                          {result.title}
+                        </div>
+                        <div
+                          style={{
+                            opacity: 0.8,
+                            fontSize: "0.72rem",
+                            lineHeight: 1.15,
+                            minHeight: "0.9rem",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
                           {[result.uploader || "", duration].filter(Boolean).join("  |  ") ||
                             "YouTube"}
                         </div>
-                        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                          <button
-                            className="DialogButton"
+                        <div
+                          style={{
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: "0.3rem",
+                            marginTop: "auto",
+                          }}
+                        >
+                          <ControllerButton
+                            data-themedeck-youtube-result-index={resultIndex}
+                            data-themedeck-youtube-action="preview"
+                            buttonRef={(element) => {
+                              youtubeActionRefs.current[`${resultIndex}:preview`] =
+                                element;
+                            }}
+                            onCancel={navigateBack}
+                            onGamepadFocus={(event: any) =>
+                              handleYouTubeResultActionFocus(result, event?.target)
+                            }
+                            onButtonDown={(event: any) =>
+                              handleYouTubeResultActionDirection(
+                                event,
+                                resultIndex,
+                                "preview",
+                                () => {
+                                  setSelectedYouTubeId(result.id);
+                                  handleYouTubePreview(result);
+                                }
+                              )
+                            }
+                            onGamepadDirection={(event: any) =>
+                              handleYouTubeResultActionDirection(
+                                event,
+                                resultIndex,
+                                "preview",
+                                () => {
+                                  setSelectedYouTubeId(result.id);
+                                  handleYouTubePreview(result);
+                                }
+                              )
+                            }
                             onClick={() => {
                               setSelectedYouTubeId(result.id);
                               handleYouTubePreview(result);
@@ -6748,29 +7403,76 @@ const ChangeTheme = () => {
                             disabled={
                               previewLoadingVideoId !== null || downloadingVideoId !== null
                             }
-                            style={{ minWidth: "8rem", whiteSpace: "nowrap" }}
+                            style={{
+                              width: "100%",
+                              minWidth: 0,
+                              minHeight: "2rem",
+                              whiteSpace: "nowrap",
+                              fontSize: "0.75rem",
+                              scrollMarginTop: "15rem",
+                              scrollMarginBottom: "3rem",
+                            }}
                           >
                             {previewLoadingVideoId === result.id
                               ? "Loading..."
                               : previewingVideoId === result.id
                               ? "Stop Preview"
                               : "Play Preview"}
-                          </button>
-                          <button
-                            className="DialogButton"
+                          </ControllerButton>
+                          <ControllerButton
+                            data-themedeck-youtube-result-index={resultIndex}
+                            data-themedeck-youtube-action="download"
+                            buttonRef={(element) => {
+                              youtubeActionRefs.current[`${resultIndex}:download`] =
+                                element;
+                            }}
+                            onCancel={navigateBack}
+                            onGamepadFocus={(event: any) =>
+                              handleYouTubeResultActionFocus(result, event?.target)
+                            }
+                            onButtonDown={(event: any) =>
+                              handleYouTubeResultActionDirection(
+                                event,
+                                resultIndex,
+                                "download",
+                                () => {
+                                  setSelectedYouTubeId(result.id);
+                                  handleYouTubeDownload(result);
+                                }
+                              )
+                            }
+                            onGamepadDirection={(event: any) =>
+                              handleYouTubeResultActionDirection(
+                                event,
+                                resultIndex,
+                                "download",
+                                () => {
+                                  setSelectedYouTubeId(result.id);
+                                  handleYouTubeDownload(result);
+                                }
+                              )
+                            }
                             onClick={() => {
                               setSelectedYouTubeId(result.id);
                               handleYouTubeDownload(result);
                             }}
                             disabled={downloadingVideoId !== null}
-                            style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
+                            style={{
+                              width: "100%",
+                              minWidth: 0,
+                              minHeight: "2rem",
+                              whiteSpace: "nowrap",
+                              fontSize: "0.75rem",
+                              scrollMarginTop: "15rem",
+                              scrollMarginBottom: "3rem",
+                            }}
                           >
                             {downloadingVideoId === result.id
                               ? "Downloading..."
                               : "Download & Assign"}
-                          </button>
+                          </ControllerButton>
                         </div>
-                      </Focusable>
+                      </div>
                     );
                   })}
                   {!youtubeResults.length && (
@@ -6784,7 +7486,7 @@ const ChangeTheme = () => {
           </PanelSectionRow>
         </PanelSection>
 
-        <PanelSection title="Browse local files">
+        <PanelSection title="Or, browse local files">
           <PanelSectionRow>
             <div
               style={{
@@ -6803,18 +7505,24 @@ const ChangeTheme = () => {
                   flexWrap: "wrap",
                 }}
               >
-                <button className="DialogButton" onClick={goUp}>
+                <ControllerButton
+                  buttonRef={(element) => {
+                    localBrowseButtonRef.current = element;
+                  }}
+                  onCancel={navigateBack}
+                  onClick={goUp}
+                >
                   Up
-                </button>
+                </ControllerButton>
                 {directoryShortcuts.map((shortcut) => (
-                  <button
+                  <ControllerButton
                     key={shortcut.label}
-                    className="DialogButton"
+                    onCancel={navigateBack}
                     onClick={() => refreshDirectory(shortcut.path)}
                     style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
                   >
                     {shortcut.label}
-                  </button>
+                  </ControllerButton>
                 ))}
               </div>
               <div
@@ -6844,9 +7552,9 @@ const ChangeTheme = () => {
                 }}
               >
                 {browser.dirs.map((dir) => (
-                  <button
+                  <ControllerButton
                     key={`dir-${dir}`}
-                    className="DialogButton"
+                    onCancel={navigateBack}
                     onClick={() => handleDirClick(dir)}
                     style={{
                       justifyContent: "flex-start",
@@ -6855,12 +7563,12 @@ const ChangeTheme = () => {
                     }}
                   >
                     Folder: {dir}
-                  </button>
+                  </ControllerButton>
                 ))}
                 {audioFiles.map((file) => (
-                  <button
+                  <ControllerButton
                     key={`file-${file}`}
-                    className="DialogButton"
+                    onCancel={navigateBack}
                     onClick={() => handleFileClick(file)}
                     style={{
                       justifyContent: "flex-start",
@@ -6869,7 +7577,7 @@ const ChangeTheme = () => {
                     }}
                   >
                     Assign file: {file}
-                  </button>
+                  </ControllerButton>
                 ))}
                 {!browser.dirs.length && !audioFiles.length ? (
                   <div style={{ opacity: 0.6 }}>No folders or audio files here.</div>
@@ -7435,6 +8143,7 @@ export default definePlugin(() => {
     injectBridgeIntoRoute(path)
   );
   const contextMenuUnpatch = patchContextMenuFocus();
+  const showContextMenuUnpatch = patchShowContextMenu();
   routerHook.addRoute(
     "/themedeck/global",
     () => <ChangeGlobalTheme />,
@@ -7470,6 +8179,7 @@ export default definePlugin(() => {
       stopPlayback(false, "onDismount");
       clearAudioCache();
       contextMenuUnpatch?.();
+      showContextMenuUnpatch?.();
       gamePatches.forEach((patch, index) => {
         try {
           routerHook.removePatch(GAME_DETAIL_ROUTES[index], patch);

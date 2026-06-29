@@ -1,6 +1,6 @@
 {
   "name": "themedeck",
-  "version": "2.6.0",
+  "version": "3.0.0",
   "description": "ThemeDeck plays game, global, and store-specific music tracks based on where you are in Gaming Mode.",
   "type": "module",
   "scripts": {
@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-name/themedeck.git"
+    "url": "git+https://github.com/BrenticusMaximus/ThemeDeck.git"
   },
   "keywords": [
     "decky",
@@ -23,9 +23,9 @@
   "author": "Your Name <you@example.com>",
   "license": "BSD-3-Clause",
   "bugs": {
-    "url": "https://github.com/your-name/themedeck/issues"
+    "url": "https://github.com/BrenticusMaximus/ThemeDeck/issues"
   },
-  "homepage": "https://github.com/your-name/themedeck#readme",
+  "homepage": "https://github.com/BrenticusMaximus/ThemeDeck#readme",
   "devDependencies": {
     "@decky/rollup": "^1.0.1",
     "@decky/ui": "^4.7.2",

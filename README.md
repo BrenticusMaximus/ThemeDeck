@@ -49,6 +49,24 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Release Updates
 
+## June 29, 2026 Update (v3.0.0)
+
+- Added controller-first navigation for assigning music from the "Choose ThemeDeck music..." screen.
+- You can now use the D-pad plus A/B buttons to search YouTube, preview tracks, download and assign tracks, and browse local files while docked.
+- YouTube results now have per-result **Play Preview** and **Download & Assign** buttons, so you no longer need to select a result and scroll back to shared buttons.
+- Controller controls for YouTube results:
+  - D-pad left/right moves between YouTube search results.
+  - D-pad up/down switches between **Play Preview** and **Download & Assign** inside the current result.
+  - Press A on **Play Preview** to start or stop a preview.
+  - Press A on **Download & Assign** to download that result and assign it to the current game.
+  - Press B to go back.
+  - From the first result, D-pad left returns to the search controls.
+  - From the last result, D-pad right moves down to **Or, browse local files**.
+- Improved YouTube search handling for game names with special characters, including trademark symbols.
+- Added local cached previews so YouTube preview playback works more reliably in Gaming Mode.
+- Added clearer **Currently assigned** highlighting when a YouTube search result matches the track already assigned to the game.
+- Added extra ThemeDeck debug logging at `/home/deck/ThemeDeck/themedeck-debug.log`.
+
 ## April 27, 2026 Update (v2.6.0)
 
 - Added a ThemeDeck master volume override at the bottom of settings.
