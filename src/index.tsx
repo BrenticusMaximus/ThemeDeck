@@ -3259,6 +3259,34 @@ const formatDuration = (seconds?: number | null) => {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 };
 
+const formatYtDlpVersion = (version?: string | null): string => {
+  const text = String(version || "").trim();
+  const match = text.match(/^(\d{4})\.(\d{2})\.(\d{2})(.*)$/);
+  if (!match) {
+    return text;
+  }
+  const monthNames = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ];
+  const monthIndex = Number.parseInt(match[2], 10) - 1;
+  const monthName = monthNames[monthIndex];
+  if (!monthName) {
+    return text;
+  }
+  return `${match[1]}, ${monthName} ${match[3]}${match[4] || ""}`;
+};
+
 const sanitizeYouTubeQuery = (value: string): string => {
   return String(value || "")
     .normalize("NFKD")
@@ -4907,7 +4935,7 @@ const Content = () => {
       });
       toaster.toast({
         title: "ThemeDeck",
-        body: `yt-dlp ready (${status.version || "latest"})`,
+        body: `yt-dlp ready (${formatYtDlpVersion(status.version) || "latest"})`,
       });
     } catch (error) {
       console.error("[ThemeDeck] update yt-dlp failed", error);
@@ -5899,7 +5927,7 @@ const Content = () => {
               </div>
               <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
                 {ytDlpStatus.installed
-                  ? `yt-dlp ${ytDlpStatus.version || ""}`.trim()
+                  ? `yt-dlp ${formatYtDlpVersion(ytDlpStatus.version) || ""}`.trim()
                   : "yt-dlp not installed"}
               </div>
               <button
@@ -6695,11 +6723,6 @@ const ChangeTheme = () => {
     }
   };
 
-  const selectedYouTubeResult = useMemo(
-    () => youtubeResults.find((item) => item.id === selectedYouTubeId) ?? null,
-    [youtubeResults, selectedYouTubeId]
-  );
-
   const joinPath = (base: string, child: string) =>
     base === "/" ? `/${child}` : `${base.replace(/\/$/, "")}/${child}`;
 
@@ -6807,16 +6830,6 @@ const ChangeTheme = () => {
       ),
     [browser.files]
   );
-  const selectedYouTubeIndex = selectedYouTubeResult
-    ? youtubeResults.findIndex((item) => item.id === selectedYouTubeResult.id)
-    : -1;
-  const selectRelativeYouTubeResult = (delta: number) => {
-    if (!youtubeResults.length) return;
-    const currentIndex = Math.max(0, selectedYouTubeIndex);
-    const nextIndex =
-      (currentIndex + delta + youtubeResults.length) % youtubeResults.length;
-    setSelectedYouTubeId(youtubeResults[nextIndex].id);
-  };
   const focusYouTubeResultAction = (
     nextIndex: number,
     action: YouTubeResultAction
@@ -7059,7 +7072,7 @@ const ChangeTheme = () => {
             >
               <div style={{ fontWeight: 600 }}>
                 {ytDlpStatus.installed
-                  ? `yt-dlp ${ytDlpStatus.version || ""}`.trim()
+                  ? `yt-dlp ${formatYtDlpVersion(ytDlpStatus.version) || ""}`.trim()
                   : "yt-dlp not installed"}
               </div>
               {ytDlpStatus.path ? (
@@ -7101,7 +7114,7 @@ const ChangeTheme = () => {
 	                      });
 	                      toaster.toast({
 	                        title: "ThemeDeck",
-	                        body: `yt-dlp ready (${status.version || "latest"})`,
+	                        body: `yt-dlp ready (${formatYtDlpVersion(status.version) || "latest"})`,
 	                      });
 	                    } catch (error) {
 	                      logClient("error", "yt_dlp_install_failed", {
@@ -7187,50 +7200,6 @@ const ChangeTheme = () => {
                   gap: "0.6rem",
                 }}
               >
-                {selectedYouTubeResult ? (
-                  <div
-                    style={{
-                      display: "flex",
-                      gap: "0.45rem",
-                      flexWrap: "wrap",
-                    }}
-                  >
-                    <ControllerButton
-                      onCancel={navigateBack}
-                      onClick={() => selectRelativeYouTubeResult(-1)}
-                      disabled={youtubeResults.length < 2}
-                      style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
-                    >
-                      Prev
-                    </ControllerButton>
-                    <ControllerButton
-                      onCancel={navigateBack}
-                      onClick={() => selectRelativeYouTubeResult(1)}
-                      disabled={youtubeResults.length < 2}
-                      style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
-                    >
-                      Next
-                    </ControllerButton>
-                    <ControllerButton
-                      onCancel={navigateBack}
-                      onClick={() => handleYouTubePreview(selectedYouTubeResult)}
-                      disabled={previewLoadingVideoId !== null || downloadingVideoId !== null}
-                      style={{ minWidth: "8rem", whiteSpace: "nowrap" }}
-                    >
-                      {previewingVideoId === selectedYouTubeResult.id ? "Stop Preview" : "Play Preview"}
-                    </ControllerButton>
-                    <ControllerButton
-                      onCancel={navigateBack}
-                      onClick={() => handleYouTubeDownload(selectedYouTubeResult)}
-                      disabled={downloadingVideoId !== null}
-                      style={{ minWidth: "11rem", whiteSpace: "nowrap" }}
-                    >
-                      {downloadingVideoId === selectedYouTubeResult.id
-                        ? "Downloading..."
-                        : "Download & Assign"}
-                    </ControllerButton>
-                  </div>
-                ) : null}
                 <div
                   style={{
                     width: "100%",
