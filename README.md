@@ -18,7 +18,7 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 4. On steam deck, go to decky settings, developer, 'install plugin from zip file', and find the zip from step 2. 
 
-![ThemeDeck February 19 2026 update thumbnail](https://images.steamusercontent.com/ugc/10217922894651388729/0056712F90842A587703E222C9AD211D53B2344E/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
+![ThemeDeck June 29 2026 update thumbnail](https://images.steamusercontent.com/ugc/10246844756434218824/5BE3695A090A9AD263F22EE5F73C7CDA3B84CEB0/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
 ## Main Features
 
@@ -52,8 +52,7 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 ## June 29, 2026 Update (v3.0.0)
 
 - Added controller-first navigation for assigning music from the "Choose ThemeDeck music..." screen.
-- You can now use the D-pad plus A/B buttons to search YouTube, preview tracks, download and assign tracks, and browse local files while docked.
-- YouTube results now have per-result **Play Preview** and **Download & Assign** buttons, so you no longer need to select a result and scroll back to shared buttons.
+- You can now use the D-pad plus A/B buttons to search YouTube, preview tracks, download and assign tracks, and browse local files while docked or using an external controller.
 - Controller controls for YouTube results:
   - D-pad left/right moves between YouTube search results.
   - D-pad up/down switches between **Play Preview** and **Download & Assign** inside the current result.
