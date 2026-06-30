@@ -123,6 +123,11 @@ type YouTubeDownloadResponse = {
   filename: string;
 };
 
+type SteamLibraryGamesResponse = {
+  games?: GameOption[];
+  installed_app_ids?: number[];
+};
+
 type YouTubePreviewResponse = {
   stream_url?: string;
   data?: string;
@@ -382,6 +387,9 @@ const logClientEvent = callable<
   [level: string, message: string, payload?: Record<string, unknown>],
   boolean
 >("log_client_event");
+const getSteamLibraryGames = callable<[], SteamLibraryGamesResponse>(
+  "get_steam_library_games"
+);
 
 const TRACKS_UPDATED_EVENT = "themedeck:tracks-updated";
 const AUDIO_EXTENSIONS = ["mp3", "aac", "flac", "ogg", "wav", "m4a"];
@@ -4748,6 +4756,7 @@ const Content = () => {
     try {
       setInstalledLibraryAppIds(new Set());
       const byId = new Map<number, GameOption>();
+      const detectedInstalledAppIds = new Set<number>();
       const addEntry = (entry: any, fallbackId?: unknown) => {
         const fallbackAppId = Number.parseInt(String(fallbackId ?? ""), 10);
         let appid = Number.NaN;
@@ -4813,14 +4822,7 @@ const Content = () => {
           byId.set(appid, { appid, name });
         }
         if (installed) {
-          setInstalledLibraryAppIds((prev) => {
-            if (prev.has(appid)) {
-              return prev;
-            }
-            const next = new Set(prev);
-            next.add(appid);
-            return next;
-          });
+          detectedInstalledAppIds.add(appid);
         }
       };
       const addCollection = (raw: any) => {
@@ -4873,11 +4875,39 @@ const Content = () => {
         // no-op
       }
 
+      try {
+        const backendLibrary = await getSteamLibraryGames();
+        addCollection(backendLibrary?.games);
+        const backendInstalledIds = Array.isArray(backendLibrary?.installed_app_ids)
+          ? backendLibrary.installed_app_ids
+          : [];
+        backendInstalledIds.forEach((rawAppId) => {
+          const appId = Number.parseInt(String(rawAppId ?? ""), 10);
+          if (Number.isFinite(appId) && appId > 0) {
+            detectedInstalledAppIds.add(appId);
+          }
+        });
+        logClient("info", "library_backend_scan", {
+          games: Array.isArray(backendLibrary?.games) ? backendLibrary.games.length : 0,
+          installed: backendInstalledIds.length,
+        });
+      } catch (error) {
+        console.error("[ThemeDeck] backend library scan failed", error);
+        logClient("warning", "library_backend_scan_failed", {
+          error: getErrorMessage(error, "Unknown library scan error"),
+        });
+      }
+
       const games = Array.from(byId.values()).sort((a, b) =>
         a.name.localeCompare(b.name)
       );
       setLibrary(games);
+      setInstalledLibraryAppIds(detectedInstalledAppIds);
       console.info("[ThemeDeck] library detection count", games.length);
+      logClient("info", "library_detection_count", {
+        games: games.length,
+        installed: detectedInstalledAppIds.size,
+      });
     } catch (error) {
       console.error("[ThemeDeck] library load failed", error);
     }

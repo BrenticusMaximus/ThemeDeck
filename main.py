@@ -260,6 +260,13 @@ class Plugin:
     async def get_localconfig_app_ids(self) -> dict[str, Any]:
         return {"app_ids": self._read_localconfig_app_ids()}
 
+    async def get_steam_library_games(self) -> dict[str, Any]:
+        games, installed_app_ids = await asyncio.to_thread(self._read_steam_library_games)
+        return {
+            "games": games,
+            "installed_app_ids": sorted(installed_app_ids),
+        }
+
     async def resolve_store_app_names(self, app_ids: list[int]) -> dict[str, str]:
         unique_ids = sorted(
             {
@@ -964,6 +971,112 @@ class Plugin:
                     f"Failed scanning localconfig under {base}: {error}"
                 )
         return sorted(app_ids)
+
+    def _read_steam_library_games(self) -> tuple[list[dict[str, Any]], set[int]]:
+        by_id: dict[int, dict[str, Any]] = {}
+        installed_app_ids: set[int] = set()
+
+        def add_game(app_id: int, name: str | None = None, installed: bool = False) -> None:
+            if app_id <= 0:
+                return
+            existing = by_id.get(app_id)
+            clean_name = self._trim_message(str(name or "").strip(), 180)
+            if not clean_name:
+                clean_name = f"App {app_id}"
+            if existing is None:
+                by_id[app_id] = {"appid": app_id, "name": clean_name}
+            elif existing["name"].startswith("App ") and not clean_name.startswith("App "):
+                existing["name"] = clean_name
+            if installed:
+                installed_app_ids.add(app_id)
+
+        for app_id in self._read_localconfig_app_ids():
+            add_game(app_id)
+
+        for steam_root in self._get_steam_roots():
+            for library_path in self._read_steam_library_paths(steam_root):
+                manifest_dir = library_path / "steamapps"
+                if not manifest_dir.exists():
+                    continue
+                try:
+                    manifests = list(manifest_dir.glob("appmanifest_*.acf"))
+                except Exception as error:
+                    decky.logger.error(
+                        f"Failed listing Steam app manifests under {manifest_dir}: {error}"
+                    )
+                    continue
+                for manifest in manifests:
+                    app_id, name = self._read_appmanifest_summary(manifest)
+                    if app_id > 0:
+                        add_game(app_id, name, installed=True)
+
+        games = sorted(by_id.values(), key=lambda game: str(game["name"]).lower())
+        self._log_info(
+            f"Steam library filesystem scan found games={len(games)} installed={len(installed_app_ids)}"
+        )
+        return games, installed_app_ids
+
+    def _get_steam_roots(self) -> list[Path]:
+        candidates = [
+            Path.home() / ".local" / "share" / "Steam",
+            Path.home() / ".steam" / "steam",
+        ]
+        seen: set[Path] = set()
+        roots: list[Path] = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.expanduser().resolve()
+            except Exception:
+                resolved = candidate
+            if resolved in seen or not resolved.exists():
+                continue
+            seen.add(resolved)
+            roots.append(resolved)
+        return roots
+
+    def _read_steam_library_paths(self, steam_root: Path) -> list[Path]:
+        paths: list[Path] = [steam_root]
+        libraryfolders = steam_root / "steamapps" / "libraryfolders.vdf"
+        try:
+            text = libraryfolders.read_text(encoding="utf-8", errors="ignore")
+        except FileNotFoundError:
+            return paths
+        except Exception as error:
+            decky.logger.error(f"Failed reading Steam libraryfolders {libraryfolders}: {error}")
+            return paths
+
+        for match in re.finditer(r'"path"\s+"([^"]+)"', text, flags=re.IGNORECASE):
+            raw_path = match.group(1).replace("\\\\", "\\")
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                path = steam_root / path
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if resolved not in paths:
+                paths.append(resolved)
+        return paths
+
+    def _read_appmanifest_summary(self, path: Path) -> tuple[int, str | None]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as error:
+            decky.logger.error(f"Failed reading app manifest {path}: {error}")
+            return 0, None
+
+        app_id = 0
+        name: str | None = None
+        app_id_match = re.search(r'"appid"\s+"(\d+)"', text, flags=re.IGNORECASE)
+        name_match = re.search(r'"name"\s+"([^"]*)"', text, flags=re.IGNORECASE)
+        if app_id_match:
+            try:
+                app_id = int(app_id_match.group(1))
+            except ValueError:
+                app_id = 0
+        if name_match:
+            name = name_match.group(1).strip()
+        return app_id, name
 
     def _extract_app_ids_from_localconfig(self, path: Path) -> set[int]:
         app_ids: set[int] = set()

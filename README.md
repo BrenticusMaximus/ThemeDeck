@@ -49,6 +49,11 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Release Updates
 
+## June 30, 2026 Update (v3.0.1)
+
+- Fixed bulk auto-assign library detection when Steam's frontend library cache reports zero games.
+- Added a backend Steam library scan so "all games", "installed games", "uninstalled games", and "games without music" use the Deck's actual Steam library files.
+
 ## June 29, 2026 Update (v3.0.0)
 
 - Added controller-first navigation for assigning music from the "Choose ThemeDeck music..." screen.
