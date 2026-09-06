@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+- Installs `yt-dlp[default]` so the `yt-dlp-ejs` challenge scripts and recommended dependencies stay in sync with yt-dlp.
+- Detects a supported Deno runtime and installs a checksum-verified, ThemeDeck-managed copy when needed.
+- Configures YouTube previews and downloads to use Deno, with optional Firefox browser cookies, without overwriting the user's global yt-dlp configuration.
+- Keeps using a verified fallback yt-dlp executable when a virtual-environment update fails.
+
 ## 2.5.5 - 2026-04-21
 - Adds a "Now Playing" overlay card that displays the active track while browsing game pages.
 - Adds a real audio-reactive visualizer synced to active playback.
