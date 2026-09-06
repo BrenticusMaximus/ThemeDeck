@@ -49,6 +49,12 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Release Updates
 
+## September 6, 2026 Update (v3.0.2)
+
+- Improved sleep/wake behavior for global ambient music.
+- ThemeDeck now releases browser audio and visualizer resources before sleep and rebuilds them after wake.
+- Fixed stale playback state that could prevent global ambient music from resuming.
+
 ## June 30, 2026 Update (v3.0.1)
 
 - Fixed bulk auto-assign library detection when Steam's frontend library cache reports zero games.

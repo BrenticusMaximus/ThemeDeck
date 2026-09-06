@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.0.2 - 2026-09-06
+- Stops and releases browser audio and visualizer resources before system sleep.
+- Rebuilds playback state after wake and resumes eligible global ambient music.
+- Recovers when Steam suspends the audio element but ThemeDeck's playback state is stale.
+
 ## 2.5.5 - 2026-04-21
 - Adds a "Now Playing" overlay card that displays the active track while browsing game pages.
 - Adds a real audio-reactive visualizer synced to active playback.

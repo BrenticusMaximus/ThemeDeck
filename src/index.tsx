@@ -489,6 +489,10 @@ let autoPlaybackTrackRefreshInFlight = false;
 let autoPlaybackRouteInterval: number | null = null;
 let autoPlaybackStoreProbeInFlight = false;
 let storeContextActive = false;
+let systemSuspending = false;
+let systemLifecycleGeneration = 0;
+const systemLifecycleSubscriptions: Array<() => void> = [];
+const systemResumeRecoveryTimeouts = new Set<number>();
 let playInvocationCounter = 0;
 let playInFlightSignature: string | null = null;
 let desktopModeActive = false;
@@ -1080,8 +1084,10 @@ const clearGlobalAmbientResumeSnapshot = () => {
   globalAmbientResumeSnapshot = null;
 };
 
-const captureGlobalAmbientResumeSnapshot = () => {
-  const mode = getAmbientInterruptionModeRuntime();
+const captureGlobalAmbientResumeSnapshot = (
+  modeOverride?: AmbientInterruptionMode
+) => {
+  const mode = modeOverride ?? getAmbientInterruptionModeRuntime();
   if (mode === "stop") {
     clearGlobalAmbientResumeSnapshot();
     return;
@@ -1296,13 +1302,16 @@ const isIgnorablePlaybackError = (error: unknown): boolean => {
 };
 
 const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
+  if (systemSuspending) {
+    return;
+  }
   stopPlaybackToken += 1;
   if (stopPlaybackFadeInterval) {
     window.clearInterval(stopPlaybackFadeInterval);
     stopPlaybackFadeInterval = null;
   }
   const inDesktopMode = await refreshDesktopModeState();
-  if (inDesktopMode) {
+  if (inDesktopMode || systemSuspending) {
     return;
   }
   if (runningGameAppId !== null) {
@@ -3823,6 +3832,9 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
 };
 
 const applyAutoPlaybackFromContext = () => {
+  if (systemSuspending) {
+    return;
+  }
   if (activeDetailBridgeCount > 0 && activeDetailRouteAppId) {
     lastGameDetailContextSeenAtMs = Date.now();
   } else {
@@ -3946,7 +3958,12 @@ const applyAutoPlaybackFromContext = () => {
   if (
     playbackState.reason === "auto" &&
     playbackState.status === "playing" &&
-    playbackState.appId === nextTrack.appId
+    playbackState.appId === nextTrack.appId &&
+    (USE_BACKEND_PLAYBACK ||
+      (!!sharedAudio &&
+        !sharedAudio.paused &&
+        !sharedAudio.ended &&
+        !!(sharedAudio.currentSrc || sharedAudio.src)))
   ) {
     return;
   }
@@ -4002,6 +4019,134 @@ const handleMasterVolumeChanged = () => {
   scheduleAutoPlaybackFromContext();
 };
 
+const discardPlaybackResources = (reason: string) => {
+  playInvocationCounter += 1;
+  playInFlightSignature = null;
+  stopPlayback(false, reason);
+  resetVisualizerGraph(true);
+  visualizerRetryAfterMs = 0;
+
+  const audio = sharedAudio;
+  if (audio) {
+    try {
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      audio.remove();
+    } catch (error) {
+      logClient("warning", "discard_audio_failed", {
+        reason,
+        error: toErrorMessage(error),
+      });
+    }
+  }
+  if ((window as any).__themedeckSharedAudio === audio) {
+    delete (window as any).__themedeckSharedAudio;
+  }
+  sharedAudio = null;
+  clearAudioCache();
+};
+
+const handleSystemSuspend = () => {
+  systemSuspending = true;
+  systemLifecycleGeneration += 1;
+  logClient("info", "system_suspend_requested", {
+    playbackAppId: playbackState.appId,
+    playbackStatus: playbackState.status,
+  });
+  if (
+    playbackState.appId === GLOBAL_AMBIENT_APP_ID &&
+    playbackState.status === "playing"
+  ) {
+    // Sleep is a pause regardless of the normal interruption preference. This
+    // preserves the ambient position without counting time spent asleep.
+    captureGlobalAmbientResumeSnapshot("pause");
+  }
+  discardPlaybackResources("system_suspend");
+};
+
+const handleSystemResume = async () => {
+  const generation = ++systemLifecycleGeneration;
+  logClient("info", "system_resume_from_suspend");
+
+  // A suspend callback can be missed during a Steam UI reload. Capture any
+  // surviving position before throwing away browser media objects that may no
+  // longer be usable after wake.
+  if (
+    playbackState.appId === GLOBAL_AMBIENT_APP_ID &&
+    playbackState.status === "playing"
+  ) {
+    captureGlobalAmbientResumeSnapshot("pause");
+  }
+  systemSuspending = true;
+  discardPlaybackResources("system_resume_reset");
+  systemSuspending = false;
+  desktopModeLastCheck = 0;
+
+  await refreshDesktopModeState(true);
+  if (generation !== systemLifecycleGeneration || systemSuspending) return;
+  await refreshRunningGameState();
+  if (generation !== systemLifecycleGeneration || systemSuspending) return;
+  await refreshAutoPlaybackTrackCache();
+  if (generation !== systemLifecycleGeneration || systemSuspending) return;
+
+  scheduleAutoPlaybackFromContext();
+  [350, 1500].forEach((delay) => {
+    const timeoutId = window.setTimeout(() => {
+      systemResumeRecoveryTimeouts.delete(timeoutId);
+      if (generation !== systemLifecycleGeneration || systemSuspending) return;
+      void refreshRunningGameState();
+      scheduleAutoPlaybackFromContext();
+    }, delay);
+    systemResumeRecoveryTimeouts.add(timeoutId);
+  });
+};
+
+const startSystemLifecycleWatcher = () => {
+  if (systemLifecycleSubscriptions.length) {
+    return;
+  }
+  const system = (window as any)?.SteamClient?.System;
+  const registrations: Array<[string, () => void]> = [
+    ["RegisterForOnSuspendRequest", handleSystemSuspend],
+    ["RegisterForOnResumeFromSuspend", () => void handleSystemResume()],
+  ];
+  registrations.forEach(([method, handler]) => {
+    const register = system?.[method];
+    if (typeof register !== "function") {
+      logClient("warning", "system_lifecycle_api_unavailable", { method });
+      return;
+    }
+    try {
+      const clean = wrapUnsubscribe(register.call(system, handler));
+      if (clean) {
+        systemLifecycleSubscriptions.push(clean);
+      }
+    } catch (error) {
+      logClient("warning", "system_lifecycle_registration_failed", {
+        method,
+        error: toErrorMessage(error),
+      });
+    }
+  });
+};
+
+const stopSystemLifecycleWatcher = () => {
+  systemLifecycleSubscriptions.splice(0).forEach((clean) => {
+    try {
+      clean();
+    } catch (error) {
+      console.error("[ThemeDeck] lifecycle watcher cleanup failed", error);
+    }
+  });
+  systemResumeRecoveryTimeouts.forEach((timeoutId) =>
+    window.clearTimeout(timeoutId)
+  );
+  systemResumeRecoveryTimeouts.clear();
+  systemLifecycleGeneration += 1;
+  systemSuspending = false;
+};
+
 const startAutoPlaybackCoordinator = () => {
   if (autoPlaybackStarted) {
     return;
@@ -4010,6 +4155,7 @@ const startAutoPlaybackCoordinator = () => {
   ambientInterruptionModeRuntime = readAmbientInterruptionModeSetting();
   launchStopModeRuntime = readLaunchStopModeSetting();
   masterVolumeRuntime = readMasterVolumeSetting() / 100;
+  startSystemLifecycleWatcher();
   startDesktopModeWatcher();
   startRunningGameWatcher();
   refreshAutoPlaybackTrackCache();
@@ -4048,6 +4194,7 @@ const stopAutoPlaybackCoordinator = () => {
     return;
   }
   autoPlaybackStarted = false;
+  stopSystemLifecycleWatcher();
   stopRunningGameWatcher();
   stopAutoPlaybackSubscription?.();
   stopAutoPlaybackSubscription = null;
