@@ -22,7 +22,8 @@ from typing import Any
 
 import decky
 
-SUPPORTED_AUDIO_EXTENSIONS = {"mp3", "aac", "flac", "ogg", "wav", "m4a"}
+SUPPORTED_AUDIO_EXTENSIONS = {"mp3", "aac", "flac", "ogg", "wav", "m4a", "webm", "opus", "weba"}
+STREAM_URL_CACHE_TTL_SECONDS = 3 * 60 * 60
 YTDLP_RELEASE_URLS = (
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
     "https://yt-dlp.org/downloads/latest/yt-dlp",
@@ -59,6 +60,9 @@ class Plugin:
         self._playback_started_at: float = 0.0
         self._playback_start_offset: float = 0.0
         self._playback_log_file = self._settings_dir / "backend-player.log"
+        # video key -> (resolved at, direct stream URL); YouTube stream URLs
+        # stay valid for ~6 hours, so a short cache makes repeat previews instant.
+        self._stream_url_cache: dict[str, tuple[float, str]] = {}
 
     async def _main(self) -> None:
         self._settings_dir.mkdir(parents=True, exist_ok=True)
@@ -371,6 +375,9 @@ class Plugin:
             "ogg": "audio/ogg",
             "wav": "audio/wav",
             "m4a": "audio/mp4",
+            "webm": "audio/webm",
+            "weba": "audio/webm",
+            "opus": "audio/ogg",
         }.get(suffix, "application/octet-stream")
 
         encoded = base64.b64encode(data).decode("ascii")
@@ -718,6 +725,18 @@ class Plugin:
             payload["path"] = str(cached_path)
             return payload
 
+        # Fast path: hand the frontend a direct audio stream URL so the
+        # preview starts within seconds, instead of downloading and
+        # re-encoding the whole track first.
+        stream_url = await self._resolve_youtube_stream_url(
+            yt_dlp, normalized_url, preview_key
+        )
+        if stream_url:
+            return {"stream_url": stream_url}
+        self._log_warning(
+            f"youtube preview stream resolve failed, falling back to download key={preview_key}"
+        )
+
         command = [
             *yt_dlp["command"],
             "--no-warnings",
@@ -772,16 +791,16 @@ class Plugin:
             f"video_id={video_id} source={yt_dlp.get('source')} path={yt_dlp.get('path')}"
         )
 
+        # Download the native audio container (m4a preferred) instead of
+        # re-encoding to mp3 — skipping the ffmpeg transcode makes downloads
+        # several times faster with no quality loss.
         command = [
             *yt_dlp["command"],
             "--no-warnings",
             "--no-check-certificate",
             "--no-playlist",
-            "--extract-audio",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "0",
+            "-f",
+            "bestaudio[ext=m4a]/bestaudio",
             "--restrict-filenames",
             "--force-overwrites",
             "--paths",
@@ -1231,6 +1250,52 @@ class Plugin:
         if not cleaned:
             return None
         return cleaned
+
+    async def _resolve_youtube_stream_url(
+        self, yt_dlp: dict[str, Any], url: str, cache_key: str
+    ) -> str | None:
+        cached = self._stream_url_cache.get(cache_key)
+        if cached:
+            resolved_at, cached_url = cached
+            if time.time() - resolved_at < STREAM_URL_CACHE_TTL_SECONDS:
+                self._log_info(f"youtube stream url cache hit key={cache_key}")
+                return cached_url
+            self._stream_url_cache.pop(cache_key, None)
+
+        command = [
+            *yt_dlp["command"],
+            "--no-warnings",
+            "--no-check-certificate",
+            "--no-playlist",
+            "--skip-download",
+            "--dump-json",
+            "-f",
+            "bestaudio[protocol^=http][protocol!*=m3u8]/bestaudio/best",
+            url,
+        ]
+        result = await self._run_command(command, timeout=60, env=yt_dlp["env"])
+        if result.returncode != 0:
+            return None
+        lines = [
+            line.strip() for line in (result.stdout or "").splitlines() if line.strip()
+        ]
+        if not lines:
+            return None
+        try:
+            entry = json.loads(lines[-1])
+        except Exception:
+            self._log_warning(
+                f"youtube stream resolve returned unparseable output key={cache_key}"
+            )
+            return None
+        if not isinstance(entry, dict):
+            return None
+        stream_url = str(entry.get("url") or "").strip()
+        if not stream_url.startswith(("http://", "https://")):
+            return None
+        self._stream_url_cache[cache_key] = (time.time(), stream_url)
+        self._log_info(f"youtube stream url resolved key={cache_key}")
+        return stream_url
 
     def _resolve_yt_dlp_invocation(self) -> dict[str, Any] | None:
         if self._yt_venv_yt_dlp.exists() and os.access(self._yt_venv_yt_dlp, os.X_OK):

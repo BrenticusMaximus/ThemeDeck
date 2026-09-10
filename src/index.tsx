@@ -6875,29 +6875,34 @@ const ChangeTheme = () => {
     }
   };
 
-  const handleYouTubeDownload = async (result: YouTubeSearchResult) => {
+  const handleYouTubeDownload = (result: YouTubeSearchResult) => {
     if (!appId) return;
+    const targetAppId = appId;
     setDownloadingVideoId(result.id);
-    try {
-      const response = await downloadYouTubeAudio(appId, result.webpage_url);
-      const normalized = normalizeTracks(response?.tracks);
-      setTrack(normalized[appId] ?? null);
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-      toaster.toast({
-        title: "ThemeDeck",
-        body: `Saved "${response.filename}" for ${getDisplayName(appId)}`,
+    // Run the download in the background so browsing and previewing can
+    // continue; the track is assigned and announced when it lands.
+    downloadYouTubeAudio(targetAppId, result.webpage_url)
+      .then((response) => {
+        const normalized = normalizeTracks(response?.tracks);
+        setTrack(normalized[targetAppId] ?? null);
+        window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+        toaster.toast({
+          title: "ThemeDeck",
+          body: `Saved "${response.filename}" for ${getDisplayName(targetAppId)}`,
+        });
+      })
+      .catch((error) => {
+        console.error("[ThemeDeck] youtube download failed", error);
+        const message = getErrorMessage(error, "Unknown download error");
+        toaster.toast({
+          title: "ThemeDeck",
+          body: `YouTube download failed: ${message}`,
+        });
+      })
+      .finally(() => {
+        setDownloadingVideoId(null);
+        refreshYtDlpStatus(true);
       });
-    } catch (error) {
-      console.error("[ThemeDeck] youtube download failed", error);
-      const message = getErrorMessage(error, "Unknown download error");
-      toaster.toast({
-        title: "ThemeDeck",
-        body: `YouTube download failed: ${message}`,
-      });
-    } finally {
-      setDownloadingVideoId(null);
-      refreshYtDlpStatus(true);
-    }
   };
 
   const joinPath = (base: string, child: string) =>
