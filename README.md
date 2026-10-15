@@ -42,6 +42,7 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 - Prevent all plugin music from playing in Desktop Mode.
 - Prevent all plugin music from playing while a game is launched/running.
 - Bulk auto-assign music to games that don’t have tracks yet.
+- Optionally include non-Steam shortcuts in bulk auto-assign, skipping launcher/app shortcuts like Battle.net or EA App.
 - See live bulk progress and stop the process anytime.
 - View a list of games still missing music.
 - See live name-loading progress while that missing-games list is built.

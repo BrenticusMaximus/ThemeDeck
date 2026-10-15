@@ -29,6 +29,177 @@ YTDLP_RELEASE_URLS = (
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
 )
 
+# Names of non-Steam shortcuts that are launchers, stores or apps rather than games.
+# Matched case-insensitively against the cleaned shortcut name. Game shortcuts that
+# launch *through* one of these (e.g. NonSteamLaunchers entries) keep their own name,
+# so they are not affected.
+NON_STEAM_LAUNCHER_NAMES = {
+    "amazon games",
+    "amazon luna",
+    "antstream arcade",
+    "arc launcher",
+    "artix game launcher",
+    "battle.net",
+    "big fish games manager",
+    "bottles",
+    "decky loader",
+    "discord",
+    "ea app",
+    "emudeck",
+    "epic games",
+    "epic games launcher",
+    "faugus launcher",
+    "game jolt client",
+    "geforce now",
+    "glyph launcher",
+    "gog galaxy",
+    "google chrome",
+    "gryphlink",
+    "heroic games launcher",
+    "hoyoplay",
+    "humble games collection",
+    "humble app",
+    "indiegala",
+    "itch.io",
+    "legacy games",
+    "lutris",
+    "microsoft edge",
+    "minecraft launcher",
+    "moonlight",
+    "moonlight game streaming",
+    "mozilla firefox",
+    "netflix",
+    "nexon launcher",
+    "nonsteamlaunchers",
+    "nvidia geforce now",
+    "origin",
+    "playstation plus",
+    "plarium play",
+    "purple launcher",
+    "remoteplaywhatever",
+    "remote play whatever",
+    "repair ea app",
+    "retroarch",
+    "rockstar games launcher",
+    "spotify",
+    "steam rom manager",
+    "stove client",
+    "tempo launcher",
+    "twitch",
+    "ubisoft connect",
+    "uplay",
+    "vfun launcher",
+    "vk play",
+    "waydroid",
+    "xbox cloud gaming",
+    "xbox game pass",
+    "youtube",
+    "youtube tv",
+}
+NON_STEAM_LAUNCHER_PATTERN = re.compile(
+    r"(launchers?|client)$|^(repair|uninstall)\b", re.IGNORECASE
+)
+NON_STEAM_TRAILING_TAG_PATTERN = re.compile(r"\s*[\(\[\{][^\(\)\[\]\{\}]*[\)\]\}]\s*$")
+NON_STEAM_TRADEMARK_PATTERN = re.compile(r"[™®©]")
+
+
+def parse_binary_vdf(data: bytes) -> dict[str, Any]:
+    """Parse Valve's binary KeyValues format (used by shortcuts.vdf)."""
+
+    def read_cstring(offset: int) -> tuple[str, int]:
+        end = data.index(b"\x00", offset)
+        return data[offset:end].decode("utf-8", errors="replace"), end + 1
+
+    def read_map(offset: int) -> tuple[dict[str, Any], int]:
+        result: dict[str, Any] = {}
+        while offset < len(data):
+            value_type = data[offset]
+            offset += 1
+            if value_type in (0x08, 0x0B):  # end of map
+                return result, offset
+            key, offset = read_cstring(offset)
+            if value_type == 0x00:
+                result[key], offset = read_map(offset)
+            elif value_type == 0x01:
+                result[key], offset = read_cstring(offset)
+            elif value_type in (0x02, 0x04, 0x06):  # int32, pointer, color
+                result[key] = int.from_bytes(data[offset : offset + 4], "little", signed=True)
+                offset += 4
+            elif value_type == 0x03:  # float32
+                result[key] = data[offset : offset + 4]
+                offset += 4
+            elif value_type in (0x07, 0x0A):  # uint64, int64
+                result[key] = int.from_bytes(data[offset : offset + 8], "little", signed=value_type == 0x0A)
+                offset += 8
+            else:
+                raise ValueError(f"Unsupported binary VDF type 0x{value_type:02x} at {offset - 1}")
+        return result, offset
+
+    parsed, _ = read_map(0)
+    return parsed
+
+
+def extract_non_steam_shortcuts(data: bytes) -> list[dict[str, Any]]:
+    """Return [{appid, name}] for every entry in a shortcuts.vdf blob."""
+    root = parse_binary_vdf(data)
+    shortcuts = next(
+        (value for key, value in root.items() if key.lower() == "shortcuts"),
+        root,
+    )
+    if not isinstance(shortcuts, dict):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for entry in shortcuts.values():
+        if not isinstance(entry, dict):
+            continue
+        fields = {str(key).lower(): value for key, value in entry.items()}
+        raw_app_id = fields.get("appid")
+        name = str(fields.get("appname") or "").strip()
+        if not isinstance(raw_app_id, int) or not name:
+            continue
+        # Stored as a signed int32; Steam's UI uses the unsigned value.
+        entries.append({"appid": raw_app_id & 0xFFFFFFFF, "name": name})
+    return entries
+
+
+def clean_game_search_name(name: str) -> str:
+    """Strip tags like "(USA)", "[GOG]" and trademark symbols from a game name."""
+    cleaned = NON_STEAM_TRADEMARK_PATTERN.sub("", str(name or ""))
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = NON_STEAM_TRAILING_TAG_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_:|")
+    return cleaned or str(name or "").strip()
+
+
+def _compact_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+# Shortcut tools often save names without spaces ("EAapp", "RockstarGamesLauncher"),
+# so launcher names are also compared with spaces and punctuation removed.
+NON_STEAM_LAUNCHER_COMPACT_NAMES = {
+    _compact_name(launcher) for launcher in NON_STEAM_LAUNCHER_NAMES
+}
+# Long launcher names are distinctive enough to match as a prefix, which catches
+# stray suffixes such as "UbisoftConnectx".
+NON_STEAM_LAUNCHER_PREFIX_MIN_LENGTH = 10
+
+
+def is_launcher_shortcut_name(name: str) -> bool:
+    normalized = clean_game_search_name(name).lower()
+    compact = _compact_name(normalized)
+    if normalized in NON_STEAM_LAUNCHER_NAMES or compact in NON_STEAM_LAUNCHER_COMPACT_NAMES:
+        return True
+    if any(
+        len(launcher) >= NON_STEAM_LAUNCHER_PREFIX_MIN_LENGTH and compact.startswith(launcher)
+        for launcher in NON_STEAM_LAUNCHER_COMPACT_NAMES
+    ):
+        return True
+    return bool(NON_STEAM_LAUNCHER_PATTERN.search(normalized))
+
 
 def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
     return max(minimum, min(maximum, value))
@@ -266,6 +437,10 @@ class Plugin:
             "games": games,
             "installed_app_ids": sorted(installed_app_ids),
         }
+
+    async def get_non_steam_shortcuts(self) -> dict[str, Any]:
+        shortcuts = await asyncio.to_thread(self._read_non_steam_shortcuts)
+        return {"shortcuts": shortcuts}
 
     async def resolve_store_app_names(self, app_ids: list[int]) -> dict[str, str]:
         unique_ids = sorted(
@@ -1015,6 +1190,42 @@ class Plugin:
             f"Steam library filesystem scan found games={len(games)} installed={len(installed_app_ids)}"
         )
         return games, installed_app_ids
+
+    def _read_non_steam_shortcuts(self) -> list[dict[str, Any]]:
+        by_id: dict[int, dict[str, Any]] = {}
+        for steam_root in self._get_steam_roots():
+            userdata = steam_root / "userdata"
+            if not userdata.exists():
+                continue
+            try:
+                shortcut_files = list(userdata.glob("*/config/shortcuts.vdf"))
+            except Exception as error:
+                decky.logger.error(f"Failed listing shortcuts.vdf under {userdata}: {error}")
+                continue
+            for shortcut_file in shortcut_files:
+                try:
+                    entries = extract_non_steam_shortcuts(shortcut_file.read_bytes())
+                except Exception as error:
+                    decky.logger.error(f"Failed reading non-Steam shortcuts {shortcut_file}: {error}")
+                    continue
+                for entry in entries:
+                    app_id = int(entry["appid"])
+                    if app_id <= 0 or app_id in by_id:
+                        continue
+                    name = self._trim_message(entry["name"], 180)
+                    by_id[app_id] = {
+                        "appid": app_id,
+                        "name": name,
+                        "search_name": clean_game_search_name(name),
+                        "launcher": is_launcher_shortcut_name(name),
+                    }
+
+        shortcuts = sorted(by_id.values(), key=lambda item: str(item["name"]).lower())
+        self._log_info(
+            "Non-Steam shortcut scan found "
+            f"shortcuts={len(shortcuts)} launchers={sum(1 for item in shortcuts if item['launcher'])}"
+        )
+        return shortcuts
 
     def _get_steam_roots(self) -> list[Path]:
         candidates = [

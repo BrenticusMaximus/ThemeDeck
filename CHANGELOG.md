@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- Bulk auto-assign can now include non-Steam shortcuts (read from `userdata/*/config/shortcuts.vdf`), behind an "Include non-Steam shortcuts" toggle (on by default).
+- Adds a "Skip launcher and app shortcuts" toggle (on by default) so shortcuts like Battle.net, EA App or Ubisoft Connect are not given game music.
+- Cleans shortcut names before searching YouTube (drops tags like "(USA)" or "[GOG]" and trademark symbols).
+
 ## 3.0.2 - 2026-09-06
 - Stops and releases browser audio and visualizer resources before system sleep.
 - Rebuilds playback state after wake and resumes eligible global ambient music.

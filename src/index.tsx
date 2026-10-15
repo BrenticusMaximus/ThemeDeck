@@ -128,6 +128,15 @@ type SteamLibraryGamesResponse = {
   installed_app_ids?: number[];
 };
 
+type NonSteamShortcut = GameOption & {
+  search_name: string;
+  launcher: boolean;
+};
+
+type NonSteamShortcutsResponse = {
+  shortcuts?: NonSteamShortcut[];
+};
+
 type YouTubePreviewResponse = {
   stream_url?: string;
   data?: string;
@@ -390,6 +399,9 @@ const logClientEvent = callable<
 const getSteamLibraryGames = callable<[], SteamLibraryGamesResponse>(
   "get_steam_library_games"
 );
+const getNonSteamShortcuts = callable<[], NonSteamShortcutsResponse>(
+  "get_non_steam_shortcuts"
+);
 
 const TRACKS_UPDATED_EVENT = "themedeck:tracks-updated";
 const AUDIO_EXTENSIONS = ["mp3", "aac", "flac", "ogg", "wav", "m4a"];
@@ -419,6 +431,13 @@ const NOW_PLAYING_CARD_WIDTH_STORAGE_KEY = "themedeck:nowPlayingCardWidth";
 const NOW_PLAYING_CARD_WIDTH_EVENT = "themedeck:now-playing-card-width-changed";
 const MASTER_VOLUME_STORAGE_KEY = "themedeck:masterVolume";
 const MASTER_VOLUME_EVENT = "themedeck:master-volume-changed";
+const INCLUDE_NON_STEAM_STORAGE_KEY = "themedeck:bulkIncludeNonSteam";
+const INCLUDE_NON_STEAM_EVENT = "themedeck:bulk-include-non-steam-changed";
+const SKIP_LAUNCHER_SHORTCUTS_STORAGE_KEY = "themedeck:bulkSkipLauncherShortcuts";
+const SKIP_LAUNCHER_SHORTCUTS_EVENT = "themedeck:bulk-skip-launcher-shortcuts-changed";
+// Non-Steam shortcut app IDs always have the high bit set; Steam app IDs never do.
+const NON_STEAM_APP_ID_MIN = 0x80000000;
+const isNonSteamAppId = (appId: number): boolean => appId >= NON_STEAM_APP_ID_MIN;
 const GLOBAL_AMBIENT_APP_ID = -1;
 const STORE_TRACK_APP_ID = -2;
 const UI_MODE_GAMEPAD = 4;
@@ -581,6 +600,22 @@ const persistStoreTrackEnabledSetting = (value: boolean) =>
   persistPreference(
     STORE_TRACK_ENABLED_STORAGE_KEY,
     STORE_TRACK_ENABLED_EVENT,
+    value
+  );
+
+const readIncludeNonSteamSetting = (): boolean =>
+  readPreference(INCLUDE_NON_STEAM_STORAGE_KEY, true);
+
+const persistIncludeNonSteamSetting = (value: boolean) =>
+  persistPreference(INCLUDE_NON_STEAM_STORAGE_KEY, INCLUDE_NON_STEAM_EVENT, value);
+
+const readSkipLauncherShortcutsSetting = (): boolean =>
+  readPreference(SKIP_LAUNCHER_SHORTCUTS_STORAGE_KEY, true);
+
+const persistSkipLauncherShortcutsSetting = (value: boolean) =>
+  persistPreference(
+    SKIP_LAUNCHER_SHORTCUTS_STORAGE_KEY,
+    SKIP_LAUNCHER_SHORTCUTS_EVENT,
     value
   );
 
@@ -4410,6 +4445,20 @@ const useAutoPlaySetting = (): [boolean, (value: boolean) => void] =>
     AUTO_PLAY_EVENT
   );
 
+const useIncludeNonSteamSetting = (): [boolean, (value: boolean) => void] =>
+  useBooleanPreference(
+    readIncludeNonSteamSetting,
+    persistIncludeNonSteamSetting,
+    INCLUDE_NON_STEAM_EVENT
+  );
+
+const useSkipLauncherShortcutsSetting = (): [boolean, (value: boolean) => void] =>
+  useBooleanPreference(
+    readSkipLauncherShortcutsSetting,
+    persistSkipLauncherShortcutsSetting,
+    SKIP_LAUNCHER_SHORTCUTS_EVENT
+  );
+
 const useAmbientDisableStoreSetting = (): [boolean, (value: boolean) => void] =>
   useBooleanPreference(
     readAmbientDisableStoreSetting,
@@ -4612,9 +4661,13 @@ const Content = () => {
     setStoreTrack,
   } = useTrackState();
   const [library, setLibrary] = useState<GameOption[]>([]);
+  const [nonSteamShortcuts, setNonSteamShortcuts] = useState<NonSteamShortcut[]>([]);
   const [installedLibraryAppIds, setInstalledLibraryAppIds] = useState<Set<number>>(
     new Set()
   );
+  const [includeNonSteam, setIncludeNonSteam] = useIncludeNonSteamSetting();
+  const [skipLauncherShortcuts, setSkipLauncherShortcuts] =
+    useSkipLauncherShortcutsSetting();
   const [autoPlay, setAutoPlay] = useAutoPlaySetting();
   const [globalAmbientEnabled, setGlobalAmbientEnabled] =
     useGlobalAmbientEnabledSetting();
@@ -4673,10 +4726,26 @@ const Content = () => {
     },
     [tracks, library]
   );
+  const eligibleNonSteamShortcuts = useMemo(
+    () =>
+      includeNonSteam
+        ? nonSteamShortcuts.filter(
+            (shortcut) => !(skipLauncherShortcuts && shortcut.launcher)
+          )
+        : [],
+    [includeNonSteam, nonSteamShortcuts, skipLauncherShortcuts]
+  );
+  const nonSteamSearchNames = useMemo(() => {
+    const names = new Map<number, string>();
+    for (const shortcut of eligibleNonSteamShortcuts) {
+      names.set(shortcut.appid, shortcut.search_name || shortcut.name);
+    }
+    return names;
+  }, [eligibleNonSteamShortcuts]);
   const libraryGames = useMemo(() => {
     const seen = new Set<number>();
     const unique: GameOption[] = [];
-    for (const game of library) {
+    for (const game of [...library, ...eligibleNonSteamShortcuts]) {
       if (!game || !Number.isFinite(game.appid) || game.appid <= 0) {
         continue;
       }
@@ -4684,10 +4753,10 @@ const Content = () => {
         continue;
       }
       seen.add(game.appid);
-      unique.push(game);
+      unique.push({ appid: game.appid, name: game.name });
     }
     return unique;
-  }, [library]);
+  }, [library, eligibleNonSteamShortcuts]);
   const filteredLibraryGames = useMemo(() => {
     const isInstalled = (appId: number) => installedLibraryAppIds.has(appId);
     if (bulkAssignMode === "installed") {
@@ -4944,6 +5013,11 @@ const Content = () => {
         if (LIBRARY_EXCLUDED_APP_IDS.has(appid)) {
           return;
         }
+        // Non-Steam shortcuts are loaded separately so they follow the
+        // "Include non-Steam shortcuts" toggle.
+        if (isNonSteamAppId(appid)) {
+          return;
+        }
         const overview =
           appStore?.GetAppOverviewByAppID?.(appid) ||
           appStore?.GetAppOverviewByGameID?.(appid);
@@ -5042,6 +5116,28 @@ const Content = () => {
         console.error("[ThemeDeck] backend library scan failed", error);
         logClient("warning", "library_backend_scan_failed", {
           error: getErrorMessage(error, "Unknown library scan error"),
+        });
+      }
+
+      try {
+        const shortcutsResponse = await getNonSteamShortcuts();
+        const shortcuts = (shortcutsResponse?.shortcuts || []).filter(
+          (shortcut) =>
+            Number.isFinite(shortcut?.appid) &&
+            isNonSteamAppId(shortcut.appid) &&
+            !!String(shortcut?.name || "").trim()
+        );
+        // Shortcuts point at something already on disk, so treat them as installed.
+        shortcuts.forEach((shortcut) => detectedInstalledAppIds.add(shortcut.appid));
+        setNonSteamShortcuts(shortcuts);
+        logClient("info", "library_non_steam_scan", {
+          shortcuts: shortcuts.length,
+          launchers: shortcuts.filter((shortcut) => shortcut.launcher).length,
+        });
+      } catch (error) {
+        console.error("[ThemeDeck] non-Steam shortcut scan failed", error);
+        logClient("warning", "library_non_steam_scan_failed", {
+          error: getErrorMessage(error, "Unknown non-Steam scan error"),
         });
       }
 
@@ -5269,7 +5365,9 @@ const Content = () => {
 
       const gameName = getSearchName(game);
       const isUnknownName = unknownNamePattern.test(gameName.trim());
-      const baseSearchName = isUnknownName ? `Steam app ${game.appid}` : gameName;
+      const baseSearchName =
+        nonSteamSearchNames.get(game.appid) ||
+        (isUnknownName ? `Steam app ${game.appid}` : gameName);
       const queryCandidates = Array.from(
         new Set(
           isUnknownName
@@ -5468,6 +5566,7 @@ const Content = () => {
     installedLibraryAppIds,
     getGameName,
     libraryGames,
+    nonSteamSearchNames,
     tracks,
     ytDlpBusy,
     ytDlpStatus.installed,
@@ -6128,6 +6227,30 @@ const Content = () => {
       </div>
       <PanelSection title="Auto-assign missing game tracks (yt-dlp)">
         <PanelSectionRow>
+          <ToggleField
+            checked={includeNonSteam}
+            label="Include non-Steam shortcuts"
+            description="Also download music for games added to Steam as shortcuts (e.g. NonSteamLaunchers, Heroic, Lutris)."
+            disabled={bulkAssign.running}
+            onChange={(value) => setIncludeNonSteam(value)}
+          />
+        </PanelSectionRow>
+        {includeNonSteam && (
+          <PanelSectionRow>
+            <ToggleField
+              checked={skipLauncherShortcuts}
+              label="Skip launcher and app shortcuts"
+              description={`Ignore shortcuts like Battle.net, EA App or Ubisoft Connect${
+                nonSteamShortcuts.some((shortcut) => shortcut.launcher)
+                  ? ` (${nonSteamShortcuts.filter((shortcut) => shortcut.launcher).length} found)`
+                  : ""
+              }.`}
+              disabled={bulkAssign.running}
+              onChange={(value) => setSkipLauncherShortcuts(value)}
+            />
+          </PanelSectionRow>
+        )}
+        <PanelSectionRow>
           <div style={{ width: "100%" }}>
             <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
               Uses first YouTube result per game and only targets games with no assigned track.
@@ -6138,6 +6261,9 @@ const Content = () => {
             </div>
             <div style={{ opacity: 0.75, fontSize: "0.8rem", marginTop: "0.15rem" }}>
               Total library games detected: {libraryGames.length}
+              {eligibleNonSteamShortcuts.length > 0
+                ? ` (including ${eligibleNonSteamShortcuts.length} non-Steam)`
+                : ""}
             </div>
             <div
               style={{
