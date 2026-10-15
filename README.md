@@ -26,7 +26,9 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 - Use either local music files or YouTube search to find tracks.
 - Preview tracks before assigning them.
 - One-tap "Download & Assign" from YouTube results.
-- Auto-fill search terms based on the game you selected.
+- Auto-fill search terms based on the game you selected, using the game's own name from Wikidata (e.g. "Crimson Desert" instead of "Crimson Desert Enhanced").
+- Search results are ranked so the likeliest main/menu theme comes first; games without music search automatically when you open the music page.
+- See the current track's thumbnail and title on the music page.
 - Highlight which YouTube result is already assigned.
 - Set per-game volume.
 - Master volume control to override all game music.

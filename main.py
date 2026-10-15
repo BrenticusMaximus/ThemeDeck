@@ -4,6 +4,7 @@ import asyncio
 import base64
 import html as html_lib
 import json
+import math
 import os
 import re
 import shutil
@@ -28,6 +29,228 @@ YTDLP_RELEASE_URLS = (
     "https://yt-dlp.org/downloads/latest/yt-dlp",
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
 )
+
+# --- Smart theme search -------------------------------------------------------
+# Steam store names often carry an edition ("Crimson Desert Enhanced"), which makes
+# YouTube searches worse. For Steam games we look up the game's own name on Wikidata
+# by Steam app ID (property P1733), which needs no API key. If Wikidata has no entry
+# we keep the full Steam name and never trim words from it.
+WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
+WIKIDATA_USER_AGENT = "ThemeDeck (+https://github.com/BrenticusMaximus/ThemeDeck)"
+WIKIDATA_BATCH_SIZE = 50
+SYSTEM_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",  # Arch, SteamOS, CachyOS, Debian, Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora, Bazzite
+    "/etc/ssl/cert.pem",
+)
+WIKIDATA_MISS_TTL_SECONDS = 30 * 24 * 60 * 60
+# Same count as the manual search on the game page, so both rank the same results.
+THEME_SEARCH_RESULTS_PER_QUERY = 20
+THEME_MIN_ACCEPT_SCORE = 25
+THEME_CONFIDENT_SCORE = 60
+THEME_MAX_CANDIDATES = 5
+THEME_MAX_VIEW_BONUS = 8.0
+TRADEMARK_SYMBOL_PATTERN = re.compile(r"[™®©]")
+WIKIDATA_ENTITY_ID_PATTERN = re.compile(r"^Q\d+$")
+THEME_NAME_STOPWORDS = {"the", "of", "and", "a", "an", "to", "in", "on", "for", "edition"}
+THEME_STRONG_KEYWORDS = (
+    "main theme",
+    "main menu",
+    "menu theme",
+    "menu music",
+    "title theme",
+    "title screen",
+    "opening theme",
+)
+THEME_KEYWORDS = ("theme", "ost", "soundtrack", "original score", "score")
+THEME_HARD_NEGATIVE_KEYWORDS = (
+    "trailer",
+    "gameplay",
+    "walkthrough",
+    "playthrough",
+    "longplay",
+    "let's play",
+    "lets play",
+    "review",
+    "reaction",
+    "speedrun",
+    "tutorial",
+    "guide",
+    "teaser",
+    "announcement",
+    "interview",
+    "unboxing",
+)
+THEME_SOFT_NEGATIVE_KEYWORDS = (
+    "cover",
+    "remix",
+    "piano",
+    "lofi",
+    "lo-fi",
+    "8-bit",
+    "8 bit",
+    "metal version",
+    "guitar",
+    "violin",
+    "fan made",
+    "fanmade",
+    "nightcore",
+    "slowed",
+    "reverb",
+    "hour",
+    "extended",
+    "full album",
+    "full soundtrack",
+    "complete soundtrack",
+    "full ost",
+    "compilation",
+    "all songs",
+    "ambience",
+    "ambient mix",
+    "asmr",
+)
+
+
+def strip_trademark_symbols(name: str) -> str:
+    """Remove ™/®/© only; these are never part of a game's actual name."""
+    cleaned = TRADEMARK_SYMBOL_PATTERN.sub("", str(name or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _compact_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", value).lower())
+
+
+def _name_tokens(value: str) -> list[str]:
+    words = re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKD", value).lower())
+    return [word for word in words if word not in THEME_NAME_STOPWORDS]
+
+
+def pick_wikidata_label(steam_name: str, labels: list[str]) -> str | None:
+    """Choose the Wikidata label to search with for one Steam app.
+
+    An app ID can map to several items (base game and an edition). Prefer the
+    shortest label the Steam name starts with, otherwise the shortest label.
+    """
+    usable = sorted(
+        {
+            strip_trademark_symbols(label)
+            for label in labels
+            if label and not WIKIDATA_ENTITY_ID_PATTERN.match(label.strip())
+        },
+        key=lambda label: (len(label), label),
+    )
+    usable = [label for label in usable if label]
+    if not usable:
+        return None
+    steam_compact = _compact_text(steam_name)
+    for label in usable:
+        if steam_compact.startswith(_compact_text(label)):
+            return label
+    return usable[0]
+
+
+def build_theme_queries(name: str) -> list[str]:
+    return [f"{name} main theme", f"{name} main menu music", f"{name} OST"]
+
+
+def score_theme_result(result: dict[str, Any], names: list[str]) -> float:
+    """Score how likely a YouTube search result is the game's main theme."""
+    title = str(result.get("title") or "")
+    uploader = str(result.get("uploader") or "")
+    title_lower = unicodedata.normalize("NFKD", title).lower()
+    title_compact = _compact_text(title)
+    title_tokens = set(_name_tokens(title))
+
+    best_name_match = 0.0
+    for name in names:
+        name_compact = _compact_text(name)
+        if name_compact and name_compact in title_compact:
+            best_name_match = 1.0
+            break
+        tokens = _name_tokens(name)
+        if tokens:
+            best_name_match = max(
+                best_name_match,
+                sum(1 for token in tokens if token in title_tokens) / len(tokens),
+            )
+    if best_name_match < 0.6:
+        # Results that don't name the game are almost always a different game.
+        return -100.0
+
+    names_lower = " ".join(unicodedata.normalize("NFKD", name).lower() for name in names)
+
+    def contains_word(text: str, keyword: str) -> bool:
+        # Whole-word match so "ost" doesn't match "Ghost" or "Lost".
+        return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}s?(?![a-z0-9])", text) is not None
+
+    def has_keyword(keywords: tuple[str, ...]) -> bool:
+        # Ignore keywords that are part of the game's own name ("Darkest Hour").
+        return any(
+            contains_word(title_lower, keyword) and not contains_word(names_lower, keyword)
+            for keyword in keywords
+        )
+
+    score = 20.0 * best_name_match
+    if has_keyword(THEME_STRONG_KEYWORDS):
+        score += 30
+    elif has_keyword(THEME_KEYWORDS):
+        score += 15
+    if has_keyword(THEME_HARD_NEGATIVE_KEYWORDS):
+        score -= 40
+    if has_keyword(THEME_SOFT_NEGATIVE_KEYWORDS):
+        score -= 25
+    if "official" in title_lower:
+        score += 5
+    if uploader.endswith(" - Topic"):
+        score += 10
+
+    duration = result.get("duration")
+    if isinstance(duration, (int, float)):
+        # Menu music is often a long loop, so up to 12 minutes still counts as a track.
+        if 60 <= duration <= 12 * 60:
+            score += 15
+        elif duration < 30:
+            score -= 30
+        elif duration > 15 * 60:
+            # Hour-long loops and full-album uploads, never a single theme.
+            score -= 40
+
+    # Small tie-breaker: widely watched uploads tend to be the right, clean track.
+    # Log-scaled and capped so it can never outweigh the title rules above.
+    views = result.get("view_count")
+    if isinstance(views, (int, float)) and views > 1000:
+        score += min(THEME_MAX_VIEW_BONUS, 2.0 * math.log10(views / 1000))
+    return score
+
+
+def sort_theme_results(
+    results: list[dict[str, Any]], names: list[str]
+) -> list[dict[str, Any]]:
+    """Order every result by score, best first, without dropping any.
+
+    Used for searches the user runs: they decide, we only put likely matches on top.
+    Ties keep YouTube's order.
+    """
+    scored = [
+        (score_theme_result(result, names), index, result)
+        for index, result in enumerate(results)
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [{**result, "score": round(score, 1)} for score, _, result in scored]
+
+
+def rank_theme_results(
+    results: list[dict[str, Any]], names: list[str]
+) -> list[dict[str, Any]]:
+    """Return results that pass the score threshold, best first."""
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for index, result in enumerate(results):
+        score = score_theme_result(result, names)
+        if score >= THEME_MIN_ACCEPT_SCORE:
+            scored.append((score, index, {**result, "score": round(score, 1)}))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [result for _, _, result in scored]
 
 
 def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -702,6 +925,91 @@ class Plugin:
             self._log_error(traceback.format_exc())
             raise
 
+    async def get_theme_search_name(self, app_id: int, game_name: str) -> dict[str, Any]:
+        """Name to pre-fill the manual YouTube search with."""
+        steam_name = strip_trademark_symbols(game_name)
+        canonical_name = await self._lookup_canonical_name(app_id, steam_name)
+        return {
+            "name": canonical_name or steam_name,
+            "source": "wikidata" if canonical_name else "steam",
+        }
+
+    async def search_youtube_ranked(
+        self, query: str, limit: int, app_id: int, game_name: str
+    ) -> dict[str, Any]:
+        """search_youtube, with results sorted so the likeliest theme comes first."""
+        response = await self.search_youtube(query, limit)
+        results = response.get("results", [])
+        steam_name = strip_trademark_symbols(game_name)
+        names = [steam_name] if steam_name else []
+        canonical_name = await self._lookup_canonical_name(app_id, steam_name)
+        if canonical_name:
+            names.insert(0, canonical_name)
+        if not names:
+            return {"results": results}
+        return {"results": sort_theme_results(results, names)}
+
+    async def _lookup_canonical_name(self, app_id: int, steam_name: str) -> str | None:
+        if not steam_name or not 0 < int(app_id) < 0x80000000:  # skip non-Steam shortcuts
+            return None
+        try:
+            canonical = await asyncio.to_thread(
+                self._resolve_canonical_names, {int(app_id): steam_name}
+            )
+        except Exception as error:
+            self._log_warning(f"canonical name lookup failed app={app_id}: {error}")
+            return None
+        return canonical.get(int(app_id))
+
+    async def find_theme_candidates(self, app_id: int, game_name: str) -> dict[str, Any]:
+        """Smart theme search for one game.
+
+        Returns ranked candidates, or an empty list when nothing scored well enough,
+        in which case the caller falls back to its original search.
+        """
+        steam_name = strip_trademark_symbols(game_name)
+        canonical_name = await self._lookup_canonical_name(app_id, steam_name)
+        query_name = canonical_name or steam_name
+        if not query_name:
+            return {"query_name": "", "source": "none", "candidates": []}
+        names = [name for name in dict.fromkeys([query_name, steam_name]) if name]
+
+        candidates: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for query in build_theme_queries(query_name):
+            try:
+                response = await self.search_youtube(query, THEME_SEARCH_RESULTS_PER_QUERY)
+            except Exception as error:
+                self._log_warning(f"theme search query failed query={query!r}: {error}")
+                continue
+            fresh = [
+                result
+                for result in response.get("results", [])
+                if result.get("id") and result["id"] not in seen_ids
+            ]
+            seen_ids.update(result["id"] for result in fresh)
+            candidates = rank_theme_results(
+                [*candidates, *fresh], names
+            )
+            if candidates and candidates[0]["score"] >= THEME_CONFIDENT_SCORE:
+                break
+
+        candidates = candidates[:THEME_MAX_CANDIDATES]
+        self._log_info(
+            f"theme search app={app_id} steam_name={steam_name!r} query_name={query_name!r} "
+            f"source={'wikidata' if canonical_name else 'steam'} candidates="
+            + ", ".join(
+                f"{c['score']}:{self._trim_message(c['title'], 60)!r}"
+                f"({c.get('duration')}s,{c.get('view_count')}v,{self._trim_message(c.get('uploader') or '', 30)})"
+                for c in candidates
+            )
+        )
+        return {
+            "query_name": query_name,
+            "source": "wikidata" if canonical_name else "steam",
+            "candidates": candidates,
+        }
+
     async def get_youtube_preview_stream(self, video_url: str) -> dict[str, Any]:
         yt_dlp = self._require_yt_dlp_invocation()
         normalized_url = self._normalize_youtube_url(video_url)
@@ -1131,6 +1439,110 @@ class Plugin:
 
         return app_ids
 
+    def _resolve_canonical_names(self, steam_names: dict[int, str]) -> dict[int, str]:
+        """Map Steam app IDs to Wikidata game names, using a persistent cache."""
+        cache_file = self._settings_dir / "wikidata-names.json"
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8"))
+            if not isinstance(cache, dict):
+                cache = {}
+        except Exception:
+            cache = {}
+
+        now = time.time()
+        resolved: dict[int, str] = {}
+        pending: list[int] = []
+        for app_id in steam_names:
+            entry = cache.get(str(app_id))
+            if isinstance(entry, dict) and entry.get("name"):
+                resolved[app_id] = str(entry["name"])
+            elif isinstance(entry, dict) and now - float(entry.get("checked", 0)) < WIKIDATA_MISS_TTL_SECONDS:
+                continue
+            else:
+                pending.append(app_id)
+
+        if pending:
+            for start in range(0, len(pending), WIKIDATA_BATCH_SIZE):
+                batch = pending[start : start + WIKIDATA_BATCH_SIZE]
+                labels_by_id = self._fetch_wikidata_labels(batch)
+                for app_id in batch:
+                    name = pick_wikidata_label(steam_names[app_id], labels_by_id.get(app_id, []))
+                    cache[str(app_id)] = {"name": name, "checked": now}
+                    if name:
+                        resolved[app_id] = name
+            try:
+                cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+            except Exception as error:
+                self._log_warning(f"failed writing {cache_file}: {error}")
+        return resolved
+
+    def _urlopen_with_tls_fallback(self, request: urllib.request.Request, timeout: int) -> bytes:
+        """Fetch a URL, coping with Decky's bundled Python having no CA bundle.
+
+        Tries the default certificates, then the system CA bundle, and only then an
+        unverified connection (as the rest of this plugin does). Only used for public,
+        read-only data such as game names.
+        """
+        contexts: list[tuple[str, ssl.SSLContext | None]] = [("default", None)]
+        for cafile in SYSTEM_CA_BUNDLES:
+            if os.path.isfile(cafile):
+                try:
+                    contexts.append((cafile, ssl.create_default_context(cafile=cafile)))
+                except Exception:
+                    pass
+                break
+        contexts.append(("unverified", ssl._create_unverified_context()))
+
+        last_error: Exception | None = None
+        for label, context in contexts:
+            try:
+                with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+                    return response.read()
+            except (ssl.SSLError, urllib.error.URLError) as error:
+                reason = getattr(error, "reason", error)
+                if not isinstance(reason, ssl.SSLError) and not isinstance(error, ssl.SSLError):
+                    raise
+                last_error = error
+                if label != "unverified":
+                    self._log_info(f"TLS verification with {label} certificates failed: {reason}")
+        assert last_error is not None
+        raise last_error
+
+    def _fetch_wikidata_labels(self, app_ids: list[int]) -> dict[int, list[str]]:
+        values = " ".join(f'"{app_id}"' for app_id in app_ids)
+        # "mul" holds the language-independent name many game items use instead of "en".
+        query = (
+            "SELECT ?appid ?label WHERE { "
+            f"VALUES ?appid {{ {values} }} "
+            "?item wdt:P1733 ?appid. "
+            "OPTIONAL { ?item rdfs:label ?en. FILTER(LANG(?en) = \"en\") } "
+            "OPTIONAL { ?item rdfs:label ?mul. FILTER(LANG(?mul) = \"mul\") } "
+            "BIND(COALESCE(?en, ?mul) AS ?label) "
+            "}"
+        )
+        url = f"{WIKIDATA_SPARQL_URL}?{urllib.parse.urlencode({'query': query, 'format': 'json'})}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": WIKIDATA_USER_AGENT,
+                "Accept": "application/sparql-results+json",
+            },
+        )
+        # Network errors propagate so a failed lookup isn't cached as a miss.
+        raw = self._urlopen_with_tls_fallback(request, timeout=15)
+        payload = json.loads(raw.decode("utf-8", errors="ignore"))
+
+        labels: dict[int, list[str]] = {}
+        for binding in payload.get("results", {}).get("bindings", []):
+            try:
+                app_id = int(binding["appid"]["value"])
+            except (KeyError, ValueError):
+                continue
+            label = binding.get("label", {}).get("value")
+            if label:
+                labels.setdefault(app_id, []).append(label)
+        return labels
+
     def _resolve_store_app_names_chunk(self, app_ids: list[int]) -> dict[str, str]:
         if not app_ids:
             return {}
@@ -1442,6 +1854,12 @@ class Plugin:
             else:
                 webpage_url = f"https://www.youtube.com/watch?v={video_id}"
 
+            view_count: int | None = None
+            try:
+                view_count = int(item["view_count"]) if item.get("view_count") is not None else None
+            except (TypeError, ValueError):
+                view_count = None
+
             seen_ids.add(video_id)
             results.append(
                 {
@@ -1449,6 +1867,7 @@ class Plugin:
                     "title": title,
                     "uploader": uploader,
                     "duration": duration,
+                    "view_count": view_count,
                     "webpage_url": webpage_url,
                 }
             )

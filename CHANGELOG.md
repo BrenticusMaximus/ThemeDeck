@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+- Smarter theme search: Steam games are searched by their own name from Wikidata (looked up by Steam app ID, no API key, cached); games not on Wikidata keep their full Steam name, only dropping ™/®/©.
+- YouTube results are scored (main/menu theme, 1–12 minute length, view count) and trailers, gameplay, covers, remixes and hour-long loops are ranked down. Bulk auto-assign picks the best-scoring result and falls back to the previous search if nothing scores well.
+- Manual searches on the music page are sorted by the same score (nothing is hidden), the search box is pre-filled with "<game> main theme", and games without music search automatically when the page opens (online only).
+- The music page shows the current track's YouTube thumbnail and title, or a music icon for local files.
+
 ## 3.0.2 - 2026-09-06
 - Stops and releases browser audio and visualizer resources before system sleep.
 - Rebuilds playback state after wake and resumes eligible global ambient music.

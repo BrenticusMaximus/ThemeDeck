@@ -366,6 +366,18 @@ const searchYouTube = callable<
   [query: string, limit?: number],
   YouTubeSearchResponse
 >("search_youtube");
+const searchYouTubeRanked = callable<
+  [query: string, limit: number, appId: number, gameName: string],
+  YouTubeSearchResponse
+>("search_youtube_ranked");
+const getThemeSearchName = callable<
+  [appId: number, gameName: string],
+  { name: string; source: string }
+>("get_theme_search_name");
+const findThemeCandidates = callable<
+  [appId: number, gameName: string],
+  { query_name: string; source: string; candidates: YouTubeSearchResult[] }
+>("find_theme_candidates");
 const downloadYouTubeAudio = callable<
   [appId: number, videoUrl: string],
   YouTubeDownloadResponse
@@ -3304,6 +3316,18 @@ const formatYtDlpVersion = (version?: string | null): string => {
   return `${match[1]}, ${monthName} ${match[3]}${match[4] || ""}`;
 };
 
+// "Crimson_Desert_-_Main_Menu_Theme [abc123XYZ_-].opus" -> "Crimson Desert - Main Menu Theme"
+const getTrackDisplayTitle = (fileNameOrPath: string): string => {
+  const fileName = String(fileNameOrPath || "").split("/").pop() || "";
+  const title = fileName
+    .replace(/\.[a-z0-9]{2,5}$/i, "")
+    .replace(/\s*\[[A-Za-z0-9_-]{11}\]$/, "")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return title || fileName;
+};
+
 const sanitizeYouTubeQuery = (value: string): string => {
   return String(value || "")
     .normalize("NFKD")
@@ -5310,7 +5334,30 @@ const Content = () => {
       const seenVideoIds = new Set<string>();
       let hadSearchError = false;
       let searchErrorSummary = "";
-      for (const query of queryCandidates) {
+
+      // Smart search first: the game's real name (Wikidata) and scored results.
+      // If it finds nothing convincing, fall back to the original queries below.
+      if (!isUnknownName) {
+        setBulkAssign((prev) => ({
+          ...prev,
+          currentGame: gameName,
+          message: `Searching YouTube for ${gameName} main theme...`,
+        }));
+        try {
+          const smart = await findThemeCandidates(game.appid, baseSearchName);
+          for (const result of smart?.candidates || []) {
+            if (!result?.id || seenVideoIds.has(result.id)) {
+              continue;
+            }
+            seenVideoIds.add(result.id);
+            candidateResults.push(result);
+          }
+        } catch (error) {
+          console.error("[ThemeDeck] smart theme search failed", error);
+        }
+      }
+
+      for (const query of candidateResults.length ? [] : queryCandidates) {
         if (
           bulkAssignRunIdRef.current !== runId ||
           bulkAssignStopRequestedRef.current
@@ -6130,7 +6177,7 @@ const Content = () => {
         <PanelSectionRow>
           <div style={{ width: "100%" }}>
             <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-              Uses first YouTube result per game and only targets games with no assigned track.
+              Picks the best-matching main theme on YouTube for each game (falling back to the first result) and only targets games with no assigned track.
             </div>
             <div style={{ opacity: 0.95, fontSize: "0.88rem", marginTop: "0.25rem", fontWeight: 600 }}>
               Games currently without music assigned:{" "}
@@ -6583,6 +6630,12 @@ const ChangeTheme = () => {
   });
   const [ytDlpBusy, setYtDlpBusy] = useState(false);
   const [youtubeQuery, setYoutubeQuery] = useState("");
+  const youtubeQueryEditedRef = useRef(false);
+  const [autoSearchRequest, setAutoSearchRequest] = useState<{
+    appId: number;
+    query: string;
+  } | null>(null);
+  const autoSearchedAppIdRef = useRef<number | null>(null);
   const [youtubeLoading, setYoutubeLoading] = useState(false);
   const [youtubeResults, setYoutubeResults] = useState<YouTubeSearchResult[]>([]);
   const [youtubeError, setYoutubeError] = useState("");
@@ -6607,6 +6660,20 @@ const ChangeTheme = () => {
     }
     return ids;
   }, [track?.filename, track?.path, track?.youtubeId]);
+  const assignedThumbnailUrl = useMemo(() => {
+    // Only trust the saved ID or yt-dlp's "[videoID]" file-name tag, so local
+    // files never get a broken YouTube thumbnail.
+    const videoId =
+      track?.youtubeId ||
+      String(track?.filename || "").match(/\[([A-Za-z0-9_-]{11})\]\.[A-Za-z0-9]+$/)?.[1];
+    return videoId
+      ? `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/hqdefault.jpg`
+      : "";
+  }, [track?.filename, track?.youtubeId]);
+  const assignedTrackTitle = useMemo(
+    () => getTrackDisplayTitle(track?.filename || track?.path || ""),
+    [track?.filename, track?.path]
+  );
   const [previewLoadingVideoId, setPreviewLoadingVideoId] = useState<string | null>(
     null
   );
@@ -6653,12 +6720,37 @@ const ChangeTheme = () => {
     setYoutubeError("");
     setYoutubeResults([]);
     setYoutubeQuery("");
-    const nextQuery = sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} theme music`);
+    youtubeQueryEditedRef.current = false;
+    let cancelled = false;
+    const nextQuery = sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} main theme`);
     setYoutubeQuery(nextQuery);
     const delayedRefresh = window.setTimeout(() => {
-      setYoutubeQuery(sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} theme music`));
+      if (!youtubeQueryEditedRef.current) {
+        setYoutubeQuery(sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} main theme`));
+      }
+      // Swap in the game's own name (e.g. without "Enhanced") once it's known,
+      // unless the user has started typing.
+      getThemeSearchName(targetAppId, getDisplayName(targetAppId))
+        .then((response) => {
+          const name = String(response?.name || "").trim();
+          if (!cancelled && name && !youtubeQueryEditedRef.current) {
+            const query = sanitizeYouTubeQuery(`${name} main theme`);
+            setYoutubeQuery(query);
+            setAutoSearchRequest({ appId: targetAppId, query });
+          }
+        })
+        .catch((error) => {
+          console.error("[ThemeDeck] theme search name lookup failed", error);
+          if (!cancelled && !youtubeQueryEditedRef.current) {
+            setAutoSearchRequest({
+              appId: targetAppId,
+              query: sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} main theme`),
+            });
+          }
+        });
     }, 250);
     return () => {
+      cancelled = true;
       window.clearTimeout(delayedRefresh);
     };
   }, [appId, routePathname]);
@@ -6788,7 +6880,11 @@ const ChangeTheme = () => {
     setYoutubeLoading(true);
     setYoutubeError("");
     try {
-      const response = await searchYouTube(query, 20);
+      const targetAppId = appId || getThemeDeckRouteAppId(routePathname);
+      // Ranked by the same scoring as auto-assign; nothing is hidden, only sorted.
+      const response = targetAppId
+        ? await searchYouTubeRanked(query, 20, targetAppId, getDisplayName(targetAppId))
+        : await searchYouTube(query, 20);
       setYoutubeResults(
         (response?.results ?? []).filter(
           (result) => !result.duration || result.duration <= 15 * 60
@@ -6807,6 +6903,18 @@ const ChangeTheme = () => {
       refreshYtDlpStatus(true);
     }
   };
+
+  // Search automatically, once per visit, only for games with no music yet.
+  // Games with a track usually come here to tweak volume or loop settings.
+  useEffect(() => {
+    if (!autoSearchRequest || loading || track || youtubeLoading) return;
+    if (!ytDlpStatus.installed || navigator.onLine === false) return;
+    const targetAppId = appId || getThemeDeckRouteAppId(routePathname);
+    if (autoSearchRequest.appId !== targetAppId) return;
+    if (autoSearchedAppIdRef.current === targetAppId || youtubeQueryEditedRef.current) return;
+    autoSearchedAppIdRef.current = targetAppId;
+    void handleYouTubeSearch(autoSearchRequest.query);
+  }, [autoSearchRequest, loading, track, ytDlpStatus.installed]);
 
   const stopPreview = () => {
     const preview = previewAudioRef.current;
@@ -7144,12 +7252,52 @@ const ChangeTheme = () => {
                 <Spinner />
               ) : track ? (
                 <>
-                  <div style={{ fontWeight: 700 }}>{track.filename}</div>
+                  <div style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
+                    {assignedThumbnailUrl ? (
+                      <img
+                        src={assignedThumbnailUrl}
+                        alt={assignedTrackTitle}
+                        style={{
+                          width: "8rem",
+                          height: "4.5rem",
+                          flexShrink: 0,
+                          objectFit: "cover",
+                          borderRadius: "0.35rem",
+                          background: "rgba(0,0,0,0.25)",
+                        }}
+                      />
+                    ) : (
+                      <div
+                        style={{
+                          width: "4.5rem",
+                          height: "4.5rem",
+                          flexShrink: 0,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          borderRadius: "0.35rem",
+                          background: "rgba(255,255,255,0.08)",
+                          fontSize: "1.6rem",
+                          opacity: 0.8,
+                        }}
+                      >
+                        <FaMusic />
+                      </div>
+                    )}
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: "0.75rem", opacity: 0.7 }}>
+                        {assignedThumbnailUrl ? "Current track (YouTube)" : "Current track (local file)"}
+                      </div>
+                      <div style={{ fontWeight: 700, lineHeight: 1.25, wordBreak: "break-word" }}>
+                        {assignedTrackTitle}
+                      </div>
+                    </div>
+                  </div>
                   <div
                     style={{
-                      opacity: 0.8,
+                      opacity: 0.6,
                       fontFamily: "monospace",
-                      fontSize: "0.78rem",
+                      fontSize: "0.72rem",
                       lineHeight: 1.35,
                       wordBreak: "break-word",
                     }}
@@ -7330,7 +7478,10 @@ const ChangeTheme = () => {
             >
               <TextField
                 value={youtubeQuery}
-                onChange={(event) => setYoutubeQuery(event.target.value)}
+                onChange={(event) => {
+                  youtubeQueryEditedRef.current = true;
+                  setYoutubeQuery(event.target.value);
+                }}
                 style={{ width: "100%", minWidth: "22rem" }}
               />
               <ControllerButton
