@@ -27,6 +27,11 @@ import {
   beforePatch,
   DialogButton,
   GamepadButton,
+  playSectionClasses,
+  Field,
+  ButtonItem,
+  ConfirmModal,
+  showModal,
 } from "@decky/ui";
 import {
   callable,
@@ -38,6 +43,7 @@ import {
 import {
   ReactElement,
   ReactNode,
+  Fragment,
   CSSProperties,
   useCallback,
   useEffect,
@@ -45,6 +51,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   FaMusic,
   FaPause,
@@ -151,6 +158,9 @@ type NowPlayingCardAnchor =
   | "top_right"
   | "bottom_left"
   | "bottom_right";
+// How the game page shows the current track. "card" is the original floating card.
+type NowPlayingStyle = "card" | "playbar";
+
 type NowPlayingCardSettings = {
   enabled: boolean;
   anchor: NowPlayingCardAnchor;
@@ -366,8 +376,10 @@ const searchYouTube = callable<
   [query: string, limit?: number],
   YouTubeSearchResponse
 >("search_youtube");
+// source: "manual" (picked on the game's music page, the default) or "auto"
+// (bulk/automatic download); used to tell downloads apart when cleaning up.
 const downloadYouTubeAudio = callable<
-  [appId: number, videoUrl: string],
+  [appId: number, videoUrl: string, source?: "manual" | "auto"],
   YouTubeDownloadResponse
 >("download_youtube_audio");
 const getYouTubePreviewStream = callable<
@@ -390,6 +402,43 @@ const logClientEvent = callable<
 const getSteamLibraryGames = callable<[], SteamLibraryGamesResponse>(
   "get_steam_library_games"
 );
+type MusicStorage = {
+  game_tracks: number;
+  downloaded_files: number;
+  downloaded_bytes: number;
+  downloaded_auto_bytes: number;
+  downloaded_manual_bytes: number;
+  unused_files: number;
+  unused_bytes: number;
+  unused_auto_files: number;
+  unused_auto_bytes: number;
+  unused_manual_files: number;
+  unused_manual_bytes: number;
+  preview_bytes: number;
+};
+// What "Remove music from all games" deletes besides the assignments.
+type RemoveDeleteMode = "none" | "auto" | "all";
+const getMusicStorage = callable<[], MusicStorage>("get_music_storage");
+const removeAllGameTracks = callable<
+  [deleteMode: RemoveDeleteMode],
+  { result: { removed: number; deleted_files: number; freed_bytes: number }; tracks: RawTrackMap }
+>("remove_all_game_tracks");
+const deleteUnusedDownloads = callable<
+  [mode: "auto" | "all"],
+  { deleted_files: number; freed_bytes: number }
+>("delete_unused_downloads");
+
+// 1536 -> "1.5 KB"
+const formatBytes = (bytes: number): string => {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Math.max(0, bytes || 0);
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+};
 
 const TRACKS_UPDATED_EVENT = "themedeck:tracks-updated";
 const AUDIO_EXTENSIONS = ["mp3", "aac", "flac", "ogg", "wav", "m4a"];
@@ -410,6 +459,10 @@ const LAUNCH_STOP_MODE_EVENT = "themedeck:launch-stop-mode-changed";
 const NOW_PLAYING_CARD_ENABLED_STORAGE_KEY = "themedeck:nowPlayingCardEnabled";
 const NOW_PLAYING_CARD_ENABLED_EVENT = "themedeck:now-playing-card-enabled-changed";
 const NOW_PLAYING_CARD_ANCHOR_STORAGE_KEY = "themedeck:nowPlayingCardAnchor";
+const NOW_PLAYING_STYLE_STORAGE_KEY = "themedeck:nowPlayingStyle";
+const NOW_PLAYING_STYLE_EVENT = "themedeck:now-playing-style-changed";
+const NOW_PLAYING_PLAYBAR_MODE_STORAGE_KEY = "themedeck:nowPlayingPlayBarMode";
+const NOW_PLAYING_PLAYBAR_MODE_EVENT = "themedeck:now-playing-playbar-mode-changed";
 const NOW_PLAYING_CARD_ANCHOR_EVENT = "themedeck:now-playing-card-anchor-changed";
 const NOW_PLAYING_CARD_OFFSET_X_STORAGE_KEY = "themedeck:nowPlayingCardOffsetX";
 const NOW_PLAYING_CARD_OFFSET_X_EVENT = "themedeck:now-playing-card-offsetx-changed";
@@ -713,6 +766,75 @@ const persistNowPlayingCardEnabledSetting = (value: boolean) =>
     NOW_PLAYING_CARD_ENABLED_EVENT,
     value
   );
+
+// Earlier test builds stored "pill" / "row" / "badge"; they become the play bar button.
+const parseNowPlayingStyle = (value: unknown): NowPlayingStyle =>
+  value === "playbar" || value === "pill" || value === "row" || value === "badge"
+    ? "playbar"
+    : "card";
+
+const readNowPlayingStyleSetting = (): NowPlayingStyle => {
+  try {
+    return parseNowPlayingStyle(window.localStorage?.getItem(NOW_PLAYING_STYLE_STORAGE_KEY));
+  } catch (_ignored) {
+    return "card";
+  }
+};
+
+const useNowPlayingStyleSetting = (): [NowPlayingStyle, (value: NowPlayingStyle) => void] => {
+  const [value, setValue] = useState<NowPlayingStyle>(() => readNowPlayingStyleSetting());
+  useEffect(() => {
+    const handler = () => setValue(readNowPlayingStyleSetting());
+    window.addEventListener(NOW_PLAYING_STYLE_EVENT, handler);
+    return () => window.removeEventListener(NOW_PLAYING_STYLE_EVENT, handler);
+  }, []);
+  const update = useCallback((next: NowPlayingStyle) => {
+    setValue(next);
+    try {
+      window.localStorage?.setItem(NOW_PLAYING_STYLE_STORAGE_KEY, next);
+    } catch (error) {
+      console.error("[ThemeDeck] unable to store now playing style", error);
+    }
+    window.dispatchEvent(new CustomEvent<NowPlayingStyle>(NOW_PLAYING_STYLE_EVENT, { detail: next }));
+  }, []);
+  return [value, update];
+};
+
+// How the play bar button shows itself:
+// "expanded"  always the pill (artwork, title, play state); press = pause/resume
+// "on_press"  a music note; press once to expand into the pill, again to pause/resume
+type NowPlayingPlayBarMode = "expanded" | "on_press";
+
+const readNowPlayingPlayBarModeSetting = (): NowPlayingPlayBarMode => {
+  try {
+    const stored = window.localStorage?.getItem(NOW_PLAYING_PLAYBAR_MODE_STORAGE_KEY);
+    return stored === "on_press" ? stored : "expanded";
+  } catch (_ignored) {
+    return "expanded";
+  }
+};
+
+const useNowPlayingPlayBarModeSetting = (): [
+  NowPlayingPlayBarMode,
+  (value: NowPlayingPlayBarMode) => void
+] => {
+  const [value, setValue] = useState<NowPlayingPlayBarMode>(() => readNowPlayingPlayBarModeSetting());
+  useEffect(() => {
+    const handler = () => setValue(readNowPlayingPlayBarModeSetting());
+    window.addEventListener(NOW_PLAYING_PLAYBAR_MODE_EVENT, handler);
+    return () => window.removeEventListener(NOW_PLAYING_PLAYBAR_MODE_EVENT, handler);
+  }, []);
+  const update = useCallback((next: NowPlayingPlayBarMode) => {
+    setValue(next);
+    try {
+      window.localStorage?.setItem(NOW_PLAYING_PLAYBAR_MODE_STORAGE_KEY, next);
+    } catch (error) {
+      console.error("[ThemeDeck] unable to store play bar mode", error);
+    }
+    window.dispatchEvent(new Event(NOW_PLAYING_PLAYBAR_MODE_EVENT));
+  }, []);
+  return [value, update];
+};
 
 const readNowPlayingCardAnchorSetting = (): NowPlayingCardAnchor => {
   try {
@@ -2913,6 +3035,9 @@ const GameFocusBridge = () => {
       window.setTimeout(() => {
         if (activeDetailBridgeCount === 0) {
           activeDetailRouteAppId = null;
+          if (userPausedAppId !== null) {
+            setUserPaused(null);
+          }
           notifyFocus(null);
         }
       }, 120);
@@ -2921,6 +3046,14 @@ const GameFocusBridge = () => {
 
   const playback = usePlaybackStateValue();
   const [cardSettings] = useNowPlayingCardSettings();
+  const [nowPlayingStyle] = useNowPlayingStyleSetting();
+  // Re-render when the play bar button gives up, so the card fallback appears.
+  const [, setPlacementVersion] = useState(0);
+  useEffect(() => {
+    const handler = () => setPlacementVersion((value) => value + 1);
+    window.addEventListener(PLAYBAR_PLACEMENT_EVENT, handler);
+    return () => window.removeEventListener(PLAYBAR_PLACEMENT_EVENT, handler);
+  }, []);
 
   const playingTrack = useMemo(() => {
     if (!appId || !cardSettings.enabled) {
@@ -2979,11 +3112,18 @@ const GameFocusBridge = () => {
     textOverflow: "ellipsis",
   };
 
-  if (!parsedNowPlaying) {
-    return null;
+  const playBarButtons =
+    cardSettings.enabled && nowPlayingStyle === "playbar" && appId ? (
+      <NowPlayingPlayBarButtons appId={appId} />
+    ) : null;
+  // The play bar button falls back to the card if it couldn't be placed.
+  if (!parsedNowPlaying || (nowPlayingStyle === "playbar" && nowPlayingPlayBarPlacement !== "failed")) {
+    return playBarButtons;
   }
 
   return (
+    <>
+    {playBarButtons}
     <div style={anchorStyle}>
       <style>{`
         @keyframes themedeck-nowplaying-marquee {
@@ -3025,6 +3165,456 @@ const GameFocusBridge = () => {
         </div>
       </div>
     </div>
+    </>
+  );
+};
+
+// --- Now playing: shared info + row / badge styles -------------------------------
+type GamePageNowPlaying = {
+  trackName: string;
+  albumName: string;
+  paused: boolean;
+  // YouTube thumbnail for downloaded tracks, "" for local files.
+  thumbnailUrl: string;
+};
+
+// What the game page should show for appId, or null (nothing playing / turned off).
+const useGamePageNowPlaying = (appId: number | null): GamePageNowPlaying | null => {
+  const playback = usePlaybackStateValue();
+  const pausedAppId = useUserPausedAppId();
+  const [cardSettings] = useNowPlayingCardSettings();
+  return useMemo(() => {
+    if (!appId || !cardSettings.enabled) return null;
+    const paused = pausedAppId === appId;
+    const playing = playback.status === "playing" && playback.appId === appId;
+    if (!paused && !playing) return null;
+    const track = latestTracksForAutoPlay[appId];
+    if (!track) return null;
+    const sourceName =
+      toHumanReadableTrackName(track.filename || "") ||
+      toHumanReadableTrackName(track.path.split("/").pop() || "");
+    const resolved = resolveNowPlayingText(sourceName, getDisplayName(appId));
+    const videoId =
+      track.youtubeId ||
+      String(track.filename || "").match(/\[([A-Za-z0-9_-]{11})\]\.[A-Za-z0-9]+$/)?.[1];
+    return {
+      trackName: resolved.trackName,
+      albumName: resolved.albumName,
+      paused,
+      thumbnailUrl: videoId
+        ? `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/mqdefault.jpg`
+        : "",
+    };
+  }, [appId, cardSettings.enabled, pausedAppId, playback.appId, playback.status]);
+};
+
+// Drawn with plain shapes, not an SVG icon: Steam's button CSS resizes and recolors
+// any SVG inside the cloned controller button.
+const NowPlayingPauseIcon = ({ paused }: { paused: boolean }) =>
+  paused ? (
+    <span
+      style={{
+        width: 0,
+        height: 0,
+        marginLeft: 2,
+        borderStyle: "solid",
+        borderWidth: "5px 0 5px 8px",
+        borderColor: "transparent transparent transparent #ffffff",
+      }}
+    />
+  ) : (
+    <span style={{ display: "flex", gap: 3 }}>
+      <span style={{ width: 3, height: 10, borderRadius: 1, background: "#ffffff" }} />
+      <span style={{ width: 3, height: 10, borderRadius: 1, background: "#ffffff" }} />
+    </span>
+  );
+
+// The "play bar button" style, done the way NonSteamLaunchers adds its buttons: clone
+// Steam's controller button (so it looks like Steam's own), insert the clone right
+// before it, and register it in Steam's gamepad navigation tree next to the
+// controller button's node so the D-pad reaches it. The controller button is found by
+// Steam's class name (Decky's playSectionClasses), not by its (translated) label.
+const PLAYBAR_PLACEMENT_EVENT = "themedeck:playbar-placement-changed";
+let nowPlayingPlayBarPlacement: "unknown" | "placed" | "failed" = "unknown";
+
+const setPlayBarPlacement = (next: "unknown" | "placed" | "failed") => {
+  if (nowPlayingPlayBarPlacement === next) return;
+  nowPlayingPlayBarPlacement = next;
+  window.dispatchEvent(new Event(PLAYBAR_PLACEMENT_EVENT));
+};
+
+type SteamNavNode = any;
+const navElement = (node: SteamNavNode): Element | null => node?.Element ?? node?.m_element ?? null;
+const navChildren = (node: SteamNavNode): SteamNavNode[] =>
+  Array.isArray(node?.m_rgChildren) ? node.m_rgChildren : [];
+const navParent = (node: SteamNavNode): SteamNavNode | null => node?.Parent ?? node?.m_Parent ?? null;
+
+// Steam's navigation node for an element, and the tree it belongs to.
+const findNavNodeFor = (element: Element): { tree: any; node: SteamNavNode } | null => {
+  const coordinator =
+    (window as any).g_WindowFocusCoordinator ?? (window as any).opener?.g_WindowFocusCoordinator;
+  const trees: any[] = coordinator?.m_rgTrees ?? [];
+  for (const entry of trees) {
+    const tree = entry?.tree;
+    const stack: SteamNavNode[] = tree?.Root ? [tree.Root] : [];
+    const seen = new Set<SteamNavNode>();
+    while (stack.length) {
+      const node = stack.pop();
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      if (navElement(node) === element) return { tree, node };
+      stack.push(...navChildren(node));
+    }
+  }
+  return null;
+};
+
+// A copy of Steam's button with our own content, registered for D-pad navigation.
+const createPlayBarButton = (
+  source: HTMLElement,
+  label: string,
+  onPress: () => void,
+  nav: { tree: any; node: SteamNavNode } | null,
+  signal: AbortSignal,
+  navNodes: SteamNavNode[],
+  navKey: string,
+  onFocusChange?: (focused: boolean) => void
+): HTMLElement => {
+  const button = source.cloneNode(true) as HTMLElement;
+  button.removeAttribute("id");
+  button.tabIndex = 0;
+  button.setAttribute("aria-label", label);
+  button.removeAttribute("aria-describedby");
+  button.removeAttribute("disabled");
+  button.removeAttribute("aria-disabled");
+  button.querySelectorAll("[id],[aria-label]").forEach((node) => {
+    node.removeAttribute("id");
+    node.removeAttribute("aria-label");
+  });
+  button.replaceChildren();
+  button.dataset.themedeck = navKey;
+  button.style.display = "flex";
+  button.style.alignItems = "center";
+  button.style.justifyContent = "center";
+  button.addEventListener("click", onPress, { signal });
+  button.addEventListener(
+    "vgp_onbuttondown",
+    (event: Event) => {
+      const detail = (event as CustomEvent<{ button?: number; is_repeat?: boolean }>).detail;
+      if (detail?.button === 1 && detail.is_repeat !== true) onPress(); // A
+    },
+    { signal }
+  );
+  ["vgp_onfocus", "focus", "mouseenter"].forEach((name) =>
+    button.addEventListener(name, () => onFocusChange?.(true), { signal })
+  );
+  ["vgp_onblur", "blur", "mouseleave"].forEach((name) =>
+    button.addEventListener(name, () => onFocusChange?.(false), { signal })
+  );
+  if (nav) {
+    try {
+      const parentNode = navParent(nav.node);
+      const node = new nav.node.constructor(nav.tree, parentNode, null);
+      node.SetProperties({
+        layout: nav.node.m_Properties?.layout ?? 0,
+        focusable: true,
+        preferredFocus: false,
+        autoFocus: false,
+        noFocusRing: nav.node.m_Properties?.noFocusRing ?? true,
+        navKey,
+      });
+      node.OnMount(button);
+      navNodes.push(node);
+      (button as any).__themedeckNavNode = node;
+    } catch (error) {
+      logClient("warning", "now_playing_playbar_nav_failed", { error: toErrorMessage(error) });
+    }
+  }
+  return button;
+};
+
+// Round thumbnail (YouTube) or a gradient music icon (local files).
+const NowPlayingArtwork = ({
+  url,
+  size,
+  radius = "50%",
+}: {
+  url: string;
+  size: number;
+  radius?: string;
+}) =>
+  url ? (
+    <img
+      src={url}
+      alt=""
+      style={{
+        width: size,
+        height: size,
+        borderRadius: radius,
+        objectFit: "cover",
+        flexShrink: 0,
+        boxShadow: "0 0 0 1px rgba(255,255,255,0.18)",
+      }}
+    />
+  ) : (
+    <span
+      style={{
+        width: size,
+        height: size,
+        borderRadius: radius,
+        flexShrink: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: "#ffffff",
+        background: "linear-gradient(135deg, #3d7bfd 0%, #8a4dff 100%)",
+      }}
+    >
+      <FaMusic size={Math.round(size * 0.42)} />
+    </span>
+  );
+
+// One button left of the controller button, shown as the pill (artwork, title, play
+// state) or a music note depending on the play bar mode. See NowPlayingPlayBarMode.
+const NowPlayingPlayBarButtons = ({ appId }: { appId: number }) => {
+  const liveInfo = useGamePageNowPlaying(appId);
+  // Resuming clears the pause before playback reports "playing", so the info is briefly
+  // null. Keep the last info for a moment so the button isn't removed (which would
+  // move the D-pad focus away) during that gap.
+  const [lastInfo, setLastInfo] = useState<GamePageNowPlaying | null>(liveInfo);
+  useEffect(() => {
+    if (liveInfo) {
+      setLastInfo(liveInfo);
+      return;
+    }
+    const timeoutId = window.setTimeout(() => setLastInfo(null), 2500);
+    return () => window.clearTimeout(timeoutId);
+  }, [liveInfo]);
+  const info = liveInfo ?? (lastInfo ? { ...lastInfo, paused: false } : null);
+  const [mode] = useNowPlayingPlayBarModeSetting();
+  const markerRef = useRef<HTMLSpanElement | null>(null);
+  const [button, setButton] = useState<HTMLElement | null>(null);
+  const [focused, setFocused] = useState(false);
+  // "on_press" mode: expanded after the first press, until focus leaves the button.
+  const [open, setOpen] = useState(false);
+  const showDetails = mode === "expanded" || (mode === "on_press" && open);
+  const active = !!info;
+
+  // The press/focus handlers are created once per attach; they read these refs.
+  const modeRef = useRef(mode);
+  const openRef = useRef(open);
+  modeRef.current = mode;
+  openRef.current = open;
+  const handlePress = useCallback(() => {
+    if (modeRef.current === "on_press" && !openRef.current) {
+      setOpen(true);
+      return;
+    }
+    toggleGamePagePause(appId);
+  }, [appId]);
+  const handleFocusChange = useCallback((value: boolean) => {
+    setFocused(value);
+    if (!value) setOpen(false);
+  }, []);
+
+  useEffect(() => {
+    if (!active) return;
+    const listeners = new AbortController();
+    const navNodes: SteamNavNode[] = [];
+    let mounted: { button: HTMLElement; controller: HTMLElement } | null = null;
+    let parentStyle: { element: HTMLElement; style: string | null } | null = null;
+    let lastLog = "";
+    const log = (event: string, payload: Record<string, unknown>) => {
+      if (lastLog === event) return;
+      lastLog = event;
+      logClient(event.endsWith("_attached") ? "info" : "warning", event, payload);
+    };
+
+    const teardown = () => {
+      navNodes.splice(0).forEach((node) => {
+        try {
+          node.OnUnmount?.();
+        } catch (_ignored) {
+          // already gone
+        }
+      });
+      mounted?.button.remove();
+      mounted = null;
+      if (parentStyle) {
+        if (parentStyle.style === null) parentStyle.element.removeAttribute("style");
+        else parentStyle.element.setAttribute("style", parentStyle.style);
+        parentStyle = null;
+      }
+      setButton(null);
+      setFocused(false);
+    };
+
+    const attach = () => {
+      if (mounted?.button.isConnected && mounted.button.nextElementSibling === mounted.controller) return;
+      teardown();
+      // The game page this ThemeDeck element lives in (not the plugin's own document).
+      const innerClass = appDetailsClasses?.InnerContainer;
+      const controllerClass = playSectionClasses?.ControllerConfigButton;
+      const page = innerClass ? markerRef.current?.closest(`.${innerClass}`) : null;
+      const controller =
+        page && controllerClass
+          ? (page.querySelector(`.${controllerClass}`) as HTMLElement | null)
+          : null;
+      if (!controller?.parentElement) {
+        log("now_playing_playbar_not_found", { page: !!page, controllerClass: controllerClass ?? null });
+        return;
+      }
+      const parent = controller.parentElement;
+      parentStyle = { element: parent, style: parent.getAttribute("style") };
+      parent.style.display = "flex";
+      parent.style.alignItems = "center";
+
+      const nav = findNavNodeFor(controller);
+      const created = createPlayBarButton(
+        controller,
+        "Now playing",
+        handlePress,
+        nav,
+        listeners.signal,
+        navNodes,
+        "themedeck-nowplaying",
+        handleFocusChange
+      );
+      parent.insertBefore(created, controller);
+      mounted = { button: created, controller };
+      setButton(created);
+      setPlayBarPlacement("placed");
+      log("now_playing_playbar_attached", { className: controller.className, navigation: !!nav });
+    };
+
+    attach();
+    const intervalId = window.setInterval(attach, 1000);
+    const fallbackId = window.setTimeout(() => {
+      if (!mounted) setPlayBarPlacement("failed");
+    }, 3000);
+    return () => {
+      window.clearInterval(intervalId);
+      window.clearTimeout(fallbackId);
+      listeners.abort();
+      teardown();
+    };
+  }, [appId, active]);
+
+  // Pill shape and Steam-style highlight (light fill, dark text) when expanded.
+  useEffect(() => {
+    if (!button) return;
+    const pill = button.style;
+    if (showDetails) {
+      Object.assign(pill, {
+        width: "auto",
+        minWidth: "0",
+        maxWidth: "18rem",
+        padding: "0 0.75rem 0 0.25rem",
+        gap: "0.55rem",
+        justifyContent: "flex-start",
+        // Steam's own corner radius, so the pill matches the buttons beside it.
+        borderRadius: "",
+        overflow: "",
+        color: focused ? "#0e141b" : "#ffffff",
+        background: focused ? "rgba(255, 255, 255, 0.94)" : "rgba(22, 28, 38, 0.72)",
+        boxShadow: focused ? "0 0 0 3px rgba(255, 255, 255, 0.28), 0 0 16px rgba(255, 255, 255, 0.3)" : "",
+        filter: "",
+      });
+    } else {
+      Object.assign(pill, {
+        width: "",
+        minWidth: "",
+        maxWidth: "",
+        padding: info?.thumbnailUrl ? "0" : "",
+        gap: "",
+        justifyContent: "center",
+        borderRadius: "",
+        overflow: info?.thumbnailUrl ? "hidden" : "",
+        color: "",
+        background: "",
+        boxShadow: focused && info?.thumbnailUrl ? "0 0 0 2px #ffffff, 0 0 12px rgba(255, 255, 255, 0.35)" : "",
+        filter: focused && !info?.thumbnailUrl ? "brightness(1.2)" : "",
+      });
+    }
+    pill.marginRight = "0.4rem";
+  }, [button, showDetails, focused, info?.thumbnailUrl]);
+
+  const content = !info ? null : showDetails ? (
+    <>
+      <NowPlayingArtwork url={info.thumbnailUrl} size={28} radius="3px" />
+      <span style={{ display: "flex", flexDirection: "column", minWidth: 0, flex: 1, textAlign: "left" }}>
+        <span style={{ fontSize: "0.58rem", letterSpacing: "0.12em", opacity: 0.7, lineHeight: 1.15 }}>
+          {info.paused ? "PAUSED" : "NOW PLAYING"}
+        </span>
+        <span
+          style={{
+            fontSize: "0.8rem",
+            fontWeight: 600,
+            lineHeight: 1.2,
+            minWidth: 0,
+            maxWidth: "13rem",
+            overflow: "hidden",
+            whiteSpace: "nowrap",
+          }}
+        >
+          <MarqueeText text={info.trackName} />
+        </span>
+      </span>
+      <span
+        style={{
+          width: 24,
+          height: 24,
+          borderRadius: "50%",
+          flexShrink: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          // Inverted against the pill: dark badge on the light focused pill.
+          color: "#ffffff",
+          background: focused ? "#0e141b" : "rgba(255, 255, 255, 0.16)",
+        }}
+      >
+        <NowPlayingPauseIcon paused={info.paused} />
+      </span>
+    </>
+  ) : info.thumbnailUrl ? (
+    // Compact: the video thumbnail, dimmed under a play/pause mark.
+    <span style={{ position: "relative", display: "block", width: "100%", height: "100%" }}>
+      <img
+        src={info.thumbnailUrl}
+        alt=""
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          display: "block",
+          filter: info.paused ? "brightness(0.45)" : "brightness(0.7)",
+        }}
+      />
+      <span
+        style={{
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          filter: "drop-shadow(0 0 2px rgba(0, 0, 0, 0.8))",
+        }}
+      >
+        <NowPlayingPauseIcon paused={info.paused} />
+      </span>
+    </span>
+  ) : info.paused ? (
+    <FaPlay size={16} />
+  ) : (
+    <FaMusic size={18} />
+  );
+
+  return (
+    <>
+      <span ref={markerRef} style={{ display: "none" }} />
+      {button && content ? createPortal(content, button) : null}
+    </>
   );
 };
 
@@ -3728,6 +4318,48 @@ const refreshStoreContext = async () => {
   }
 };
 
+// --- Pause from the game page (row / badge) ------------------------------------
+// A paused game stays paused while its page is open; leaving the page clears it.
+let userPausedAppId: number | null = null;
+let userPausedPosition = 0;
+const userPauseListeners = new Set<() => void>();
+
+const setUserPaused = (appId: number | null, position = 0) => {
+  userPausedAppId = appId;
+  userPausedPosition = position;
+  userPauseListeners.forEach((listener) => listener());
+};
+
+const useUserPausedAppId = (): number | null => {
+  const [value, setValue] = useState<number | null>(userPausedAppId);
+  useEffect(() => {
+    const listener = () => setValue(userPausedAppId);
+    userPauseListeners.add(listener);
+    return () => {
+      userPauseListeners.delete(listener);
+    };
+  }, []);
+  return value;
+};
+
+const toggleGamePagePause = (appId: number) => {
+  if (userPausedAppId === appId) {
+    const track = latestTracksForAutoPlay[appId];
+    const position = userPausedPosition;
+    setUserPaused(null);
+    if (track) {
+      void playTrack({ ...track, resumeTime: position }, "auto");
+    }
+    return;
+  }
+  if (playbackState.appId === appId && playbackState.status === "playing") {
+    const position =
+      sharedAudio && Number.isFinite(sharedAudio.currentTime) ? sharedAudio.currentTime : 0;
+    setUserPaused(appId, position);
+    stopPlayback(true, "gamePage_userPause");
+  }
+};
+
 const resolveAutoTrackFromContext = (): GameTrack | null => {
   if (runningGameAppId !== null) {
     return null;
@@ -3965,6 +4597,10 @@ const applyAutoPlaybackFromContext = () => {
         !sharedAudio.ended &&
         !!(sharedAudio.currentSrc || sharedAudio.src)))
   ) {
+    return;
+  }
+  if (nextTrack.appId === userPausedAppId) {
+    // Paused from the game page: stay paused until resumed or the page is left.
     return;
   }
   playTrack(nextTrack, "auto");
@@ -4602,6 +5238,99 @@ const useNowPlayingCardSettings = (): [
 };
 
 
+// `content` is shown indented under its choice, only while that choice is selected.
+type ChoiceOption = { value: string; label: string; hint?: string; content?: ReactNode };
+
+// A titled list of choices with radio bullets. Each choice is a focusable Field, so the
+// D-pad moves through them like any other settings row and A selects.
+const ChoiceGroup = ({
+  label,
+  description,
+  options,
+  value,
+  onChange,
+  indent = false,
+  disabled = false,
+}: {
+  label: string;
+  description?: string;
+  options: ChoiceOption[];
+  value: string;
+  onChange: (value: string) => void;
+  indent?: boolean;
+  disabled?: boolean;
+}) => (
+  <div
+    style={{
+      width: "100%",
+      paddingLeft: indent ? "0.9rem" : 0,
+      boxSizing: "border-box",
+      opacity: disabled ? 0.4 : 1,
+      transition: "opacity 0.15s ease",
+    }}
+  >
+    <Field
+      label={label}
+      description={description}
+      bottomSeparator="none"
+      padding="compact"
+      focusable={false}
+    />
+    {options.map((option, index) => {
+      const selected = option.value === value;
+      const last = index === options.length - 1;
+      return (
+        <Fragment key={option.value}>
+        <Field
+          focusable
+          highlightOnFocus
+          disabled={disabled}
+          padding="compact"
+          bottomSeparator={last && !(option.content && selected) ? "standard" : "none"}
+          onActivate={() => !disabled && onChange(option.value)}
+          onClick={() => !disabled && onChange(option.value)}
+          label={
+            <span style={{ display: "flex", alignItems: "flex-start", gap: "0.6rem" }}>
+              <span
+                style={{
+                  width: 14,
+                  height: 14,
+                  marginTop: 2,
+                  flexShrink: 0,
+                  borderRadius: "50%",
+                  boxSizing: "border-box",
+                  border: `2px solid ${selected ? "#1a9fff" : "rgba(255, 255, 255, 0.5)"}`,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                {selected ? (
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#1a9fff" }} />
+                ) : null}
+              </span>
+              <span style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+                <span style={{ fontSize: "0.9rem", fontWeight: selected ? 600 : 400 }}>
+                  {option.label}
+                </span>
+                {option.hint ? (
+                  <span style={{ fontSize: "0.75rem", opacity: 0.65, lineHeight: 1.25, whiteSpace: "normal" }}>
+                    {option.hint}
+                  </span>
+                ) : null}
+              </span>
+            </span>
+          }
+        />
+        {option.content && selected ? (
+          <div style={{ paddingLeft: "1.6rem" }}>{option.content}</div>
+        ) : null}
+        </Fragment>
+      );
+    })}
+  </div>
+);
+
 const Content = () => {
   const {
     tracks,
@@ -4620,6 +5349,89 @@ const Content = () => {
     useGlobalAmbientEnabledSetting();
   const [storeTrackEnabled, setStoreTrackEnabled] = useStoreTrackEnabledSetting();
   const [masterVolume, setMasterVolume] = useMasterVolumeSetting();
+  const [musicStorage, setMusicStorage] = useState<MusicStorage | null>(null);
+  const [removeDeleteMode, setRemoveDeleteMode] = useState<RemoveDeleteMode>("auto");
+  const [manageMusicBusy, setManageMusicBusy] = useState(false);
+  const refreshMusicStorage = useCallback(async () => {
+    try {
+      setMusicStorage(await getMusicStorage());
+    } catch (error) {
+      console.error("[ThemeDeck] reading music storage failed", error);
+    }
+  }, []);
+  useEffect(() => {
+    void refreshMusicStorage();
+    window.addEventListener(TRACKS_UPDATED_EVENT, refreshMusicStorage);
+    return () => window.removeEventListener(TRACKS_UPDATED_EVENT, refreshMusicStorage);
+  }, [refreshMusicStorage]);
+
+  const removeAllMusic = async (deleteMode: RemoveDeleteMode) => {
+    setManageMusicBusy(true);
+    try {
+      if (playbackState.appId && playbackState.appId > 0) {
+        stopPlayback(true, "removeAllGameTracks");
+      }
+      const response = await removeAllGameTracks(deleteMode);
+      const normalized = normalizeTracks(response?.tracks);
+      setTracks(normalized);
+      latestTracksForAutoPlay = normalized;
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+      const result = response?.result;
+      toaster.toast({
+        title: "ThemeDeck",
+        body:
+          `Removed music from ${result?.removed ?? 0} games` +
+          (deleteMode !== "none" ? `, freed ${formatBytes(result?.freed_bytes ?? 0)}` : ""),
+      });
+    } catch (error) {
+      console.error("[ThemeDeck] remove all music failed", error);
+      toaster.toast({ title: "ThemeDeck", body: "Couldn't remove music from all games" });
+    } finally {
+      setManageMusicBusy(false);
+      void refreshMusicStorage();
+    }
+  };
+
+  const confirmRemoveAllMusic = () => {
+    const count = musicStorage?.game_tracks ?? 0;
+    const deleteMode = removeDeleteMode;
+    const deleteText =
+      deleteMode === "all"
+        ? ` and deletes all ${formatBytes(musicStorage?.downloaded_bytes ?? 0)} ThemeDeck downloaded, including hand-picked tracks.`
+        : deleteMode === "auto"
+          ? ` and deletes ${formatBytes(musicStorage?.downloaded_auto_bytes ?? 0)} of auto-picked downloads. Hand-picked tracks stay on disk.`
+          : ". All downloaded files stay on disk.";
+    showModal(
+      <ConfirmModal
+        strTitle="Remove music from all games?"
+        strDescription={
+          `This removes the music from ${count} game${count === 1 ? "" : "s"}` +
+          deleteText +
+          " Your own music files and the global and store tracks are kept. This can't be undone."
+        }
+        strOKButtonText="Remove"
+        bDestructiveWarning
+        onOK={() => void removeAllMusic(deleteMode)}
+      />
+    );
+  };
+
+  const handleDeleteUnusedDownloads = async (mode: "auto" | "all") => {
+    setManageMusicBusy(true);
+    try {
+      const result = await deleteUnusedDownloads(mode);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: `Deleted ${result?.deleted_files ?? 0} unused files, freed ${formatBytes(result?.freed_bytes ?? 0)}`,
+      });
+    } catch (error) {
+      console.error("[ThemeDeck] delete unused downloads failed", error);
+      toaster.toast({ title: "ThemeDeck", body: "Couldn't delete unused downloads" });
+    } finally {
+      setManageMusicBusy(false);
+      void refreshMusicStorage();
+    }
+  };
   const [ambientDisableStore, setAmbientDisableStore] =
     useAmbientDisableStoreSetting();
   const [ambientInterruptionMode, setAmbientInterruptionMode] =
@@ -4627,6 +5439,8 @@ const Content = () => {
   const [launchStopMode, setLaunchStopMode] = useLaunchStopModeSetting();
   const [nowPlayingCardSettings, updateNowPlayingCardSettings] =
     useNowPlayingCardSettings();
+  const [nowPlayingStyle, setNowPlayingStyle] = useNowPlayingStyleSetting();
+  const [playBarMode, setPlayBarMode] = useNowPlayingPlayBarModeSetting();
   const [ytDlpStatus, setYtDlpStatus] = useState<YtDlpStatus>({
     installed: false,
   });
@@ -5406,7 +6220,7 @@ const Content = () => {
         }));
 
         try {
-          const response = await downloadYouTubeAudio(game.appid, result.webpage_url);
+          const response = await downloadYouTubeAudio(game.appid, result.webpage_url, "auto");
           const normalized = normalizeTracks(response?.tracks);
           latestTracks = normalized;
           setTracks(normalized);
@@ -5790,67 +6604,15 @@ const Content = () => {
             />
           </PanelSectionRow>
           <PanelSectionRow>
-            <div style={{ width: "100%" }}>
-              <div style={{ fontWeight: 600 }}>
-                Stop music after pressing Play
-              </div>
-              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                Choose when ThemeDeck music should stop during game launch:
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.35rem",
-                  marginTop: "0.45rem",
-                }}
-                role="radiogroup"
-                aria-label="Stop music timing on launch"
-              >
-                {(
-                  [
-                    {
-                      value: "launch_start",
-                      label: "At launch start",
-                    },
-                    {
-                      value: "game_started",
-                      label: "At launch finish",
-                    },
-                  ] as Array<{ value: LaunchStopMode; label: string }>
-                ).map((option) => (
-                  <button
-                    key={option.value}
-                    className="DialogButton themedeck-fit themedeck-wrap"
-                    onClick={() => setLaunchStopMode(option.value)}
-                    role="radio"
-                    aria-checked={launchStopMode === option.value}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "0.5rem",
-                      justifyContent: "flex-start",
-                      width: "100%",
-                      boxSizing: "border-box",
-                      whiteSpace: "normal",
-                      textAlign: "left",
-                      fontSize: "0.92rem",
-                      paddingRight: "0.65rem",
-                      paddingLeft: "0.65rem",
-                      border:
-                        launchStopMode === option.value
-                          ? "1px solid rgba(120, 180, 255, 0.85)"
-                          : undefined,
-                    }}
-                  >
-                    <span style={{ minWidth: "1.4rem", textAlign: "center" }}>
-                      {launchStopMode === option.value ? "(x)" : "( )"}
-                    </span>
-                    <span>{option.label}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
+            <ChoiceGroup
+              label="Stop music after pressing Play"
+              options={[
+                { value: "launch_start", label: "At launch start" },
+                { value: "game_started", label: "At launch finish" },
+              ]}
+              value={launchStopMode}
+              onChange={(value) => setLaunchStopMode(value as LaunchStopMode)}
+            />
           </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField
@@ -5860,107 +6622,100 @@ const Content = () => {
               onChange={(value) => updateNowPlayingCardSettings({ enabled: value })}
             />
           </PanelSectionRow>
-          <PanelSectionRow>
-            <div style={{ width: "100%" }}>
-              <div style={{ fontWeight: 600 }}>Now playing card anchor</div>
-              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                Choose where the card starts before fine-tuning offsets.
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.35rem",
-                  marginTop: "0.45rem",
-                }}
-                role="radiogroup"
-                aria-label="Now playing card anchor"
-              >
-                {(
-                  [
-                    { value: "top_left", label: "Top left" },
-                    { value: "top_right", label: "Top right" },
-                    { value: "bottom_left", label: "Bottom left" },
-                    { value: "bottom_right", label: "Bottom right" },
-                  ] as Array<{ value: NowPlayingCardAnchor; label: string }>
-                ).map((option) => (
-                  <button
-                    key={option.value}
-                    className="DialogButton themedeck-fit themedeck-wrap"
-                    onClick={() =>
-                      updateNowPlayingCardSettings({ anchor: option.value })
-                    }
-                    role="radio"
-                    aria-checked={nowPlayingCardSettings.anchor === option.value}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "0.5rem",
-                      justifyContent: "flex-start",
-                      width: "100%",
-                      boxSizing: "border-box",
-                      whiteSpace: "normal",
-                      textAlign: "left",
-                      fontSize: "0.92rem",
-                      paddingRight: "0.65rem",
-                      paddingLeft: "0.65rem",
-                      border:
-                        nowPlayingCardSettings.anchor === option.value
-                          ? "1px solid rgba(120, 180, 255, 0.85)"
-                          : undefined,
-                    }}
-                  >
-                    <span style={{ minWidth: "1.4rem", textAlign: "center" }}>
-                      {nowPlayingCardSettings.anchor === option.value ? "(x)" : "( )"}
-                    </span>
-                    <span>{option.label}</span>
-                  </button>
-                ))}
-              </div>
-              <div style={{ marginTop: "0.35rem" }}>
-                <SliderField
-                  value={Math.round(nowPlayingCardSettings.offsetX)}
-                  label="Horizontal offset"
-                  min={-300}
-                  max={300}
-                  step={1}
-                  valueSuffix="px"
-                  showValue
-                  onChange={(value) =>
-                    updateNowPlayingCardSettings({ offsetX: clamp(value, -300, 300) })
-                  }
-                />
-              </div>
-              <div style={{ marginTop: "0.35rem" }}>
-                <SliderField
-                  value={Math.round(nowPlayingCardSettings.offsetY)}
-                  label="Vertical offset"
-                  min={-300}
-                  max={300}
-                  step={1}
-                  valueSuffix="px"
-                  showValue
-                  onChange={(value) =>
-                    updateNowPlayingCardSettings({ offsetY: clamp(value, -300, 300) })
-                  }
-                />
-              </div>
-              <div style={{ marginTop: "0.35rem" }}>
-                <SliderField
-                  value={Math.round(nowPlayingCardSettings.width)}
-                  label="Card max width"
-                  min={220}
-                  max={620}
-                  step={5}
-                  valueSuffix="px"
-                  showValue
-                  onChange={(value) =>
-                    updateNowPlayingCardSettings({ width: clamp(value, 220, 620) })
-                  }
-                />
-              </div>
-            </div>
-          </PanelSectionRow>
+          {nowPlayingCardSettings.enabled ? (
+            <PanelSectionRow>
+              <ChoiceGroup
+                label="Now playing style"
+                description="If the play bar button can't be placed, the card is shown instead."
+                options={[
+                  {
+                    value: "card",
+                    label: "Card",
+                    hint: "A floating card over the game page.",
+                    content: (
+                      <>
+                        <ChoiceGroup
+                          label="Card anchor"
+                          options={[
+                            { value: "top_left", label: "Top left" },
+                            { value: "top_right", label: "Top right" },
+                            { value: "bottom_left", label: "Bottom left" },
+                            { value: "bottom_right", label: "Bottom right" },
+                          ]}
+                          value={nowPlayingCardSettings.anchor}
+                          onChange={(value) =>
+                            updateNowPlayingCardSettings({ anchor: value as NowPlayingCardAnchor })
+                          }
+                        />
+                        <SliderField
+                          value={Math.round(nowPlayingCardSettings.offsetX)}
+                          label="Horizontal offset"
+                          min={-300}
+                          max={300}
+                          step={1}
+                          valueSuffix="px"
+                          showValue
+                          onChange={(value) =>
+                            updateNowPlayingCardSettings({ offsetX: clamp(value, -300, 300) })
+                          }
+                        />
+                        <SliderField
+                          value={Math.round(nowPlayingCardSettings.offsetY)}
+                          label="Vertical offset"
+                          min={-300}
+                          max={300}
+                          step={1}
+                          valueSuffix="px"
+                          showValue
+                          onChange={(value) =>
+                            updateNowPlayingCardSettings({ offsetY: clamp(value, -300, 300) })
+                          }
+                        />
+                        <SliderField
+                          value={Math.round(nowPlayingCardSettings.width)}
+                          label="Card max width"
+                          min={220}
+                          max={620}
+                          step={5}
+                          valueSuffix="px"
+                          showValue
+                          onChange={(value) =>
+                            updateNowPlayingCardSettings({ width: clamp(value, 220, 620) })
+                          }
+                        />
+                      </>
+                    ),
+                  },
+                  {
+                    value: "playbar",
+                    label: "Play bar button",
+                    hint: "Left of the controller icon. Press it to pause or resume.",
+                    content: (
+                      <ChoiceGroup
+                        label="Play bar button display"
+                        options={[
+                          {
+                            value: "expanded",
+                            label: "Always expanded",
+                            hint: "Artwork, title and play state. Press to pause or resume.",
+                          },
+                          {
+                            value: "on_press",
+                            label: "Expand on press",
+                            hint: "A music note. Press to expand, again to pause or resume.",
+                          },
+                        ]}
+                        value={playBarMode}
+                        onChange={(value) => setPlayBarMode(value as NowPlayingPlayBarMode)}
+                      />
+                    ),
+                  },
+                ]}
+                value={nowPlayingStyle}
+                onChange={(value) => setNowPlayingStyle(value as NowPlayingStyle)}
+              />
+            </PanelSectionRow>
+          ) : null}
           <PanelSectionRow>
             <ToggleField
               checked={globalAmbientEnabled}
@@ -5995,134 +6750,51 @@ const Content = () => {
             />
           </PanelSectionRow>
           <PanelSectionRow>
-            <div style={{ width: "100%" }}>
-              <div style={{ fontWeight: 600 }}>
-                Global/ambient interruption behavior
-              </div>
-              <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                When game/store music interrupts global ambient:
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.35rem",
-                  marginTop: "0.45rem",
-                }}
-                role="radiogroup"
-                aria-label="Global ambient interruption behavior"
-              >
-                {(
-                  [
-                    {
-                      value: "stop",
-                      label: "Stop (restart)",
-                    },
-                    {
-                      value: "pause",
-                      label: "Pause",
-                    },
-                    {
-                      value: "mute",
-                      label: "Mute",
-                    },
-                  ] as Array<{ value: AmbientInterruptionMode; label: string }>
-                ).map((option) => (
-                  <button
-                    key={option.value}
-                    className="DialogButton themedeck-fit themedeck-wrap"
-                    onClick={() => setAmbientInterruptionMode(option.value)}
-                    role="radio"
-                    aria-checked={ambientInterruptionMode === option.value}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "0.5rem",
-                      justifyContent: "flex-start",
-                      width: "100%",
-                      boxSizing: "border-box",
-                      whiteSpace: "normal",
-                      textAlign: "left",
-                      fontSize: "0.92rem",
-                      paddingRight: "0.65rem",
-                      paddingLeft: "0.65rem",
-                      border:
-                        ambientInterruptionMode === option.value
-                          ? "1px solid rgba(120, 180, 255, 0.85)"
-                          : undefined,
-                    }}
-                  >
-                    <span style={{ minWidth: "1.4rem", textAlign: "center" }}>
-                      {ambientInterruptionMode === option.value ? "(x)" : "( )"}
-                    </span>
-                    <span>{option.label}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
+            <ChoiceGroup
+              label="Global/ambient interruption behavior"
+              description="When game/store music interrupts global ambient."
+              options={[
+                { value: "stop", label: "Stop (restart)" },
+                { value: "pause", label: "Pause" },
+                { value: "mute", label: "Mute" },
+              ]}
+              value={ambientInterruptionMode}
+              onChange={(value) => setAmbientInterruptionMode(value as AmbientInterruptionMode)}
+            />
+          </PanelSectionRow>
+
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={() => Navigation.Navigate("/themedeck/global")}>
+              Choose global/ambient track…
+            </ButtonItem>
           </PanelSectionRow>
           <PanelSectionRow>
-            <button
-              className="DialogButton themedeck-fit themedeck-wrap"
-              onClick={() => Navigation.Navigate("/themedeck/global")}
-              style={{
-                textAlign: "left",
-                fontSize: "0.92rem",
-                paddingRight: "0.65rem",
-                paddingLeft: "0.65rem",
-              }}
-            >
-              Choose global/ambient track...
-            </button>
+            <ButtonItem layout="below" onClick={() => Navigation.Navigate("/themedeck/store")}>
+              Choose store-only track…
+            </ButtonItem>
           </PanelSectionRow>
           <PanelSectionRow>
-            <button
-              className="DialogButton themedeck-fit themedeck-wrap"
-              onClick={() => Navigation.Navigate("/themedeck/store")}
-              style={{
-                textAlign: "left",
-                fontSize: "0.92rem",
-                paddingRight: "0.65rem",
-                paddingLeft: "0.65rem",
-              }}
+            <ButtonItem
+              layout="below"
+              label="yt-dlp"
+              description={
+                <>
+                  <span>
+                    {ytDlpStatus.installed
+                      ? `Installed: ${formatYtDlpVersion(ytDlpStatus.version) || "unknown version"}`
+                      : "Not installed"}
+                  </span>
+                  <br />
+                  <span style={{ color: "#ff8f8f" }}>
+                    Only update yt-dlp if YouTube search doesn't work.
+                  </span>
+                </>
+              }
+              disabled={ytDlpBusy}
+              onClick={handleUpdateYtDlp}
             >
-              Choose store-only track...
-            </button>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div
-              style={{
-                width: "100%",
-                display: "flex",
-                flexDirection: "column",
-                gap: "0.4rem",
-                alignItems: "stretch",
-              }}
-            >
-              <div style={{ color: "#ff6b6b", fontWeight: 700, fontSize: "0.86rem" }}>
-                Only update yt-dlp if YouTube search doesn't work.
-              </div>
-              <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
-                {ytDlpStatus.installed
-                  ? `yt-dlp ${formatYtDlpVersion(ytDlpStatus.version) || ""}`.trim()
-                  : "yt-dlp not installed"}
-              </div>
-              <button
-                className="DialogButton themedeck-fit themedeck-wrap"
-                onClick={handleUpdateYtDlp}
-                disabled={ytDlpBusy}
-                style={{
-                  textAlign: "left",
-                  fontSize: "0.92rem",
-                  paddingRight: "0.65rem",
-                  paddingLeft: "0.65rem",
-                  color: "#ff6b6b",
-                  border: "1px solid rgba(255, 107, 107, 0.7)",
-                }}
-              >
-                {ytDlpBusy ? "Updating..." : "Update yt-dlp"}
-              </button>
-            </div>
+              {ytDlpBusy ? "Updating…" : "Update yt-dlp"}
+            </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
       </div>
@@ -6139,14 +6811,7 @@ const Content = () => {
             <div style={{ opacity: 0.75, fontSize: "0.8rem", marginTop: "0.15rem" }}>
               Total library games detected: {libraryGames.length}
             </div>
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "0.35rem",
-                marginTop: "0.5rem",
-              }}
-            >
+            <div style={{ marginTop: "0.5rem" }}>
               {(
                 [
                   { value: "all", label: "Download music for all games" },
@@ -6160,43 +6825,28 @@ const Content = () => {
                   },
                 ] as Array<{ value: BulkAssignMode; label: string }>
               ).map((option) => (
-                <button
+                <ButtonItem
                   key={option.value}
-                  className="DialogButton themedeck-fit themedeck-wrap"
+                  layout="below"
+                  bottomSeparator="none"
+                  disabled={bulkAssign.running}
                   onClick={() => {
                     void handleBulkAssign(option.value);
                   }}
-                  style={{
-                    textAlign: "left",
-                    fontSize: "0.92rem",
-                    paddingRight: "0.8rem",
-                    paddingLeft: "0.8rem",
-                    minHeight: "2.8rem",
-                    display: "block",
-                    border:
-                      bulkAssignMode === option.value
-                        ? "1px solid rgba(98, 168, 255, 0.9)"
-                        : "1px solid rgba(255, 255, 255, 0.12)",
-                  }}
                 >
                   {option.label}
-                </button>
+                </ButtonItem>
               ))}
-            </div>
-            <div style={{ marginTop: "0.5rem" }}>
-              <button
-                className="DialogButton themedeck-fit themedeck-wrap"
-                onClick={handleStopBulkAssign}
-                disabled={!bulkAssign.running}
-                style={{
-                  fontSize: "0.92rem",
-                  paddingRight: "0.65rem",
-                  paddingLeft: "0.65rem",
-                  width: "100%",
-                }}
-              >
-                STOP
-              </button>
+              {bulkAssign.running ? (
+                <ButtonItem
+                  layout="below"
+                  bottomSeparator="none"
+                  disabled={bulkAssign.stopRequested}
+                  onClick={handleStopBulkAssign}
+                >
+                  {bulkAssign.stopRequested ? "Stopping…" : "Stop"}
+                </ButtonItem>
+              ) : null}
             </div>
             {(bulkAssign.running || bulkAssign.message) && (
               <div style={{ marginTop: "0.55rem" }}>
@@ -6257,18 +6907,9 @@ const Content = () => {
               gap: "0.45rem",
             }}
           >
-            <button
-              className="DialogButton themedeck-fit themedeck-wrap"
-              onClick={() => setShowMissingGames((prev) => !prev)}
-              style={{
-                textAlign: "left",
-                fontSize: "0.92rem",
-                paddingRight: "0.65rem",
-                paddingLeft: "0.65rem",
-              }}
-            >
+            <ButtonItem layout="below" bottomSeparator="none" onClick={() => setShowMissingGames((prev) => !prev)}>
               {showMissingGames ? "Hide games without music" : "Show games without music"}
-            </button>
+            </ButtonItem>
             {showMissingGames ? (
               <div
                 style={{
@@ -6365,22 +7006,16 @@ const Content = () => {
                   flexWrap: "nowrap",
                 }}
               >
-                <button
-                  className="DialogButton"
+                <DialogButton
                   style={{
                     width: "3rem",
+                    minWidth: 0,
                     height: "2.6rem",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
                     padding: 0,
                   }}
-                  title={
-                    playback.appId === GLOBAL_AMBIENT_APP_ID &&
-                    playback.status === "playing"
-                      ? "Pause preview"
-                      : "Preview track"
-                  }
                   onClick={handleGlobalPreviewToggle}
                 >
                   {playback.appId === GLOBAL_AMBIENT_APP_ID &&
@@ -6389,22 +7024,21 @@ const Content = () => {
                   ) : (
                     <FaPlay />
                   )}
-                </button>
-                <button
-                  className="DialogButton"
+                </DialogButton>
+                <DialogButton
                   style={{
                     width: "3rem",
+                    minWidth: 0,
                     height: "2.6rem",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
                     padding: 0,
                   }}
-                  title="Remove global ambient music"
                   onClick={handleRemoveGlobalTrack}
                 >
                   <FaTrash />
-                </button>
+                </DialogButton>
               </div>
               <div style={{ marginTop: "0.5rem" }}>
                 <SliderField
@@ -6464,22 +7098,16 @@ const Content = () => {
                   flexWrap: "nowrap",
                 }}
               >
-                <button
-                  className="DialogButton"
+                <DialogButton
                   style={{
                     width: "3rem",
+                    minWidth: 0,
                     height: "2.6rem",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
                     padding: 0,
                   }}
-                  title={
-                    playback.appId === STORE_TRACK_APP_ID &&
-                    playback.status === "playing"
-                      ? "Pause preview"
-                      : "Preview track"
-                  }
                   onClick={handleStorePreviewToggle}
                 >
                   {playback.appId === STORE_TRACK_APP_ID &&
@@ -6488,22 +7116,21 @@ const Content = () => {
                   ) : (
                     <FaPlay />
                   )}
-                </button>
-                <button
-                  className="DialogButton"
+                </DialogButton>
+                <DialogButton
                   style={{
                     width: "3rem",
+                    minWidth: 0,
                     height: "2.6rem",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
                     padding: 0,
                   }}
-                  title="Remove store-only music"
                   onClick={handleRemoveStoreTrack}
                 >
                   <FaTrash />
-                </button>
+                </DialogButton>
               </div>
               <div style={{ marginTop: "0.5rem" }}>
                 <SliderField
@@ -6540,6 +7167,73 @@ const Content = () => {
             </Focusable>
           </PanelSectionRow>
         )}
+      </PanelSection>
+      <PanelSection title="Manage music">
+        <PanelSectionRow>
+          <div style={{ width: "100%", fontSize: "0.85rem", opacity: 0.85, lineHeight: 1.4 }}>
+            {musicStorage ? (
+              <>
+                <div>
+                  {musicStorage.game_tracks} game{musicStorage.game_tracks === 1 ? "" : "s"} with music
+                </div>
+                <div>
+                  Downloaded music: {formatBytes(musicStorage.downloaded_bytes)} (
+                  {formatBytes(musicStorage.downloaded_auto_bytes)} auto-picked,{" "}
+                  {formatBytes(musicStorage.downloaded_manual_bytes)} hand-picked)
+                </div>
+                {musicStorage.unused_files > 0 ? (
+                  <div>Not used by any game: {formatBytes(musicStorage.unused_bytes)}</div>
+                ) : null}
+              </>
+            ) : (
+              <div>Reading storage...</div>
+            )}
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ChoiceGroup
+            label="When removing music from all games, delete"
+            description="Only files ThemeDeck downloaded are ever deleted, never your own music files."
+            options={[
+              { value: "auto", label: "Auto-picked downloads", hint: "Recommended" },
+              { value: "all", label: "All ThemeDeck downloads" },
+              { value: "none", label: "Nothing", hint: "Keep all files" },
+            ]}
+            value={removeDeleteMode}
+            onChange={(value) => setRemoveDeleteMode(value as RemoveDeleteMode)}
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={manageMusicBusy || !musicStorage?.game_tracks}
+            onClick={confirmRemoveAllMusic}
+          >
+            Remove music from all games…
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={manageMusicBusy || !musicStorage?.unused_auto_files}
+            onClick={() => void handleDeleteUnusedDownloads("auto")}
+          >
+            Delete unused auto-picked downloads
+            {musicStorage?.unused_auto_files ? ` (${formatBytes(musicStorage.unused_auto_bytes)})` : ""}
+          </ButtonItem>
+        </PanelSectionRow>
+        {musicStorage?.unused_manual_files ? (
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              description="Includes hand-picked downloads."
+              disabled={manageMusicBusy}
+              onClick={() => void handleDeleteUnusedDownloads("all")}
+            >
+              Delete all unused downloads ({formatBytes(musicStorage.unused_bytes)})
+            </ButtonItem>
+          </PanelSectionRow>
+        ) : null}
       </PanelSection>
       <PanelSection title="ThemeDeck master volume">
         <PanelSectionRow>
@@ -7895,21 +8589,19 @@ const ChangeGlobalTheme = () => {
               }}
             >
               {track ? (
-                <button
-                  className="DialogButton"
+                <DialogButton
                   onClick={handleRemove}
                   style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
                 >
                   Remove music
-                </button>
+                </DialogButton>
               ) : null}
-              <button
-                className="DialogButton"
+              <DialogButton
                 onClick={() => Navigation.NavigateBack()}
                 style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
               >
                 Done
-              </button>
+              </DialogButton>
             </div>
           </PanelSectionRow>
         </PanelSection>
@@ -7924,9 +8616,9 @@ const ChangeGlobalTheme = () => {
                 alignItems: "center",
               }}
             >
-              <button className="DialogButton" onClick={goUp}>
+              <DialogButton onClick={goUp}>
                 Up
-              </button>
+              </DialogButton>
               <div style={{ flexGrow: 1, fontFamily: "monospace" }}>
                 {currentDir}
               </div>
@@ -7953,9 +8645,9 @@ const ChangeGlobalTheme = () => {
               }}
               style={{ width: "100%", minWidth: "20rem" }}
             />
-              <button className="DialogButton" onClick={handleManualGo}>
+              <DialogButton onClick={handleManualGo}>
                 Go
-              </button>
+              </DialogButton>
             </div>
           </PanelSectionRow>
           <PanelSectionRow>
@@ -7972,14 +8664,13 @@ const ChangeGlobalTheme = () => {
                 }}
               >
                 {browser.dirs.map((dir) => (
-                  <button
+                  <DialogButton
                     key={`dir-${dir}`}
-                    className="DialogButton"
                     onClick={() => handleDirClick(dir)}
                     style={{ justifyContent: "flex-start" }}
                   >
                     📁 {dir}
-                  </button>
+                  </DialogButton>
                 ))}
                 {browser.files
                   .filter((file) =>
@@ -7988,14 +8679,13 @@ const ChangeGlobalTheme = () => {
                     )
                   )
                   .map((file) => (
-                    <button
+                    <DialogButton
                       key={`file-${file}`}
-                      className="DialogButton"
                       onClick={() => handleFileClick(file)}
                       style={{ justifyContent: "flex-start" }}
                     >
                       🎵 {file}
-                    </button>
+                    </DialogButton>
                   ))}
                 {!browser.dirs.length && !browser.files.length && (
                   <div style={{ opacity: 0.6 }}>Folder is empty.</div>
@@ -8166,21 +8856,19 @@ const ChangeStoreTheme = () => {
               }}
             >
               {track ? (
-                <button
-                  className="DialogButton"
+                <DialogButton
                   onClick={handleRemove}
                   style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
                 >
                   Remove music
-                </button>
+                </DialogButton>
               ) : null}
-              <button
-                className="DialogButton"
+              <DialogButton
                 onClick={() => Navigation.NavigateBack()}
                 style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
               >
                 Done
-              </button>
+              </DialogButton>
             </div>
           </PanelSectionRow>
         </PanelSection>
@@ -8195,9 +8883,9 @@ const ChangeStoreTheme = () => {
                 alignItems: "center",
               }}
             >
-              <button className="DialogButton" onClick={goUp}>
+              <DialogButton onClick={goUp}>
                 Up
-              </button>
+              </DialogButton>
               <div style={{ flexGrow: 1, fontFamily: "monospace" }}>
                 {currentDir}
               </div>
@@ -8224,9 +8912,9 @@ const ChangeStoreTheme = () => {
               }}
               style={{ width: "100%", minWidth: "20rem" }}
             />
-              <button className="DialogButton" onClick={handleManualGo}>
+              <DialogButton onClick={handleManualGo}>
                 Go
-              </button>
+              </DialogButton>
             </div>
           </PanelSectionRow>
           <PanelSectionRow>
@@ -8243,14 +8931,13 @@ const ChangeStoreTheme = () => {
                 }}
               >
                 {browser.dirs.map((dir) => (
-                  <button
+                  <DialogButton
                     key={`dir-${dir}`}
-                    className="DialogButton"
                     onClick={() => handleDirClick(dir)}
                     style={{ justifyContent: "flex-start" }}
                   >
                     📁 {dir}
-                  </button>
+                  </DialogButton>
                 ))}
                 {browser.files
                   .filter((file) =>
@@ -8259,14 +8946,13 @@ const ChangeStoreTheme = () => {
                     )
                   )
                   .map((file) => (
-                    <button
+                    <DialogButton
                       key={`file-${file}`}
-                      className="DialogButton"
                       onClick={() => handleFileClick(file)}
                       style={{ justifyContent: "flex-start" }}
                     >
                       🎵 {file}
-                    </button>
+                    </DialogButton>
                   ))}
                 {!browser.dirs.length && !browser.files.length && (
                   <div style={{ opacity: 0.6 }}>Folder is empty.</div>

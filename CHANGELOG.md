@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+- Now playing on the game page can be shown as a play bar button left of the controller icon (Steam's own button style, reachable with the D-pad) instead of the floating card. Press it to pause or resume the game's music; it stays paused until resumed or the page is left. Falls back to the card if the button can't be placed.
+- Play bar button display: "Always expanded" (artwork, title and play state) or "Expand on press" (thumbnail with a play/pause mark; first press expands, the next pauses or resumes).
+- Settings: choices use bulleted rows that work with the D-pad, sub-options only show under the selected choice, and the general section's buttons use Steam's own button rows.
+- "Manage music" section: shows how many games have music and how much space downloads use (auto-picked vs hand-picked, and unused).
+- "Remove music from all games…" with a confirmation and a choice of what to delete: auto-picked downloads (default), all ThemeDeck downloads, or nothing. Global/store tracks and the user's own music files are never touched.
+- "Delete unused auto-picked downloads" and "Delete all unused downloads" free space without changing any game's music.
+- Downloads are recorded in `downloads/index.json` with their game, video and whether they were picked by hand or by bulk/automatic download (older files count as auto-picked).
+
 ## 3.0.2 - 2026-09-06
 - Stops and releases browser audio and visualizer resources before system sleep.
 - Rebuilds playback state after wake and resumes eligible global ambient music.

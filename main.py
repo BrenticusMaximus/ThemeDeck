@@ -408,6 +408,211 @@ class Plugin:
         self._save_tracks()
         return self._tracks
 
+    async def get_music_storage(self) -> dict[str, Any]:
+        """Counts and disk usage for the "Manage music" section."""
+        return await asyncio.to_thread(self._music_storage)
+
+    def _music_storage(self) -> dict[str, Any]:
+        index = self._read_downloads_index()
+        used = self._paths_in_use()
+        summary: dict[str, Any] = {"game_tracks": len(self._game_track_keys())}
+        for prefix in ("downloaded", "unused"):
+            for source in ("auto", "manual"):
+                summary[f"{prefix}_{source}_files"] = 0
+                summary[f"{prefix}_{source}_bytes"] = 0
+        for path in self._downloaded_files():
+            source = self._download_source(path, index)
+            size = self._file_size(path)
+            summary[f"downloaded_{source}_files"] += 1
+            summary[f"downloaded_{source}_bytes"] += size
+            if str(path.resolve()) not in used:
+                summary[f"unused_{source}_files"] += 1
+                summary[f"unused_{source}_bytes"] += size
+        for prefix in ("downloaded", "unused"):
+            summary[f"{prefix}_files"] = summary[f"{prefix}_auto_files"] + summary[f"{prefix}_manual_files"]
+            summary[f"{prefix}_bytes"] = summary[f"{prefix}_auto_bytes"] + summary[f"{prefix}_manual_bytes"]
+        preview_files = (
+            [path for path in self._preview_dir.rglob("*") if path.is_file()]
+            if self._preview_dir.exists()
+            else []
+        )
+        summary["preview_bytes"] = sum(self._file_size(path) for path in preview_files)
+        return summary
+
+    async def remove_all_game_tracks(self, delete_mode: str = "none") -> dict[str, Any]:
+        """Remove the music from every game (global and store tracks are kept).
+
+        delete_mode: "none" keeps all downloaded files, "auto" deletes files picked by
+        bulk/automatic download (hand-picked ones are kept), "all" deletes everything
+        ThemeDeck downloaded. The user's own local music files are never deleted.
+        """
+        removed = 0
+        for key in self._game_track_keys():
+            self._tracks.pop(key, None)
+            removed += 1
+        self._save_tracks()
+        result: dict[str, Any] = {"removed": removed, "deleted_files": 0, "freed_bytes": 0}
+        if delete_mode in ("auto", "all"):
+            result.update(
+                await asyncio.to_thread(
+                    self._delete_downloads,
+                    False,
+                    {"auto"} if delete_mode == "auto" else {"auto", "manual"},
+                )
+            )
+        self._log_info(f"remove_all_game_tracks mode={delete_mode} {result}")
+        return {"result": result, "tracks": self._tracks}
+
+    async def delete_unused_downloads(self, mode: str = "all") -> dict[str, Any]:
+        """Delete downloaded files no game uses any more (assignments are kept).
+
+        mode "auto" only deletes auto-picked files; "all" also hand-picked ones.
+        """
+        sources = {"auto"} if mode == "auto" else {"auto", "manual"}
+        result = await asyncio.to_thread(self._delete_downloads, True, sources)
+        self._log_info(f"delete_unused_downloads mode={mode} {result}")
+        return result
+
+    # --- Downloads index ------------------------------------------------------
+    # downloads/index.json remembers, per downloaded file, which game it was for and
+    # whether it was picked by hand ("manual") or by bulk/automatic download ("auto").
+    # Files downloaded before the index existed have no entry and count as "auto".
+
+    def _downloads_index_path(self) -> Path:
+        return self._downloads_dir / "index.json"
+
+    def _read_downloads_index(self) -> dict[str, dict[str, Any]]:
+        try:
+            data = json.loads(self._downloads_index_path().read_text(encoding="utf-8"))
+            files = data.get("files") if isinstance(data, dict) else None
+            return files if isinstance(files, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as error:
+            self._log_warning(f"failed reading downloads index: {error}")
+            return {}
+
+    def _write_downloads_index(self, files: dict[str, dict[str, Any]]) -> None:
+        try:
+            self._downloads_dir.mkdir(parents=True, exist_ok=True)
+            self._downloads_index_path().write_text(
+                json.dumps({"version": 1, "files": files}, indent=2), encoding="utf-8"
+            )
+        except Exception as error:
+            self._log_warning(f"failed writing downloads index: {error}")
+
+    def _index_key(self, path: Path) -> str | None:
+        try:
+            return str(path.resolve().relative_to(self._downloads_dir.resolve()))
+        except (ValueError, OSError):
+            return None
+
+    def _record_download(
+        self, path: Path, *, app_id: int, youtube_id: str, source: str
+    ) -> None:
+        key = self._index_key(path)
+        if not key:
+            return
+        files = self._read_downloads_index()
+        files[key] = {
+            "app_id": int(app_id),
+            "youtube_id": youtube_id,
+            "title": path.stem,
+            "source": source,
+            "downloaded_at": int(time.time()),
+        }
+        self._write_downloads_index(files)
+
+    def _download_source(self, path: Path, index: dict[str, dict[str, Any]]) -> str:
+        key = self._index_key(path)
+        entry = index.get(key) if key else None
+        source = entry.get("source") if isinstance(entry, dict) else None
+        return "manual" if source == "manual" else "auto"
+
+    def _game_track_keys(self) -> list[str]:
+        return [
+            key
+            for key in self._tracks
+            if key not in (self._global_track_key, self._store_track_key)
+        ]
+
+    def _downloaded_files(self) -> list[Path]:
+        if not self._downloads_dir.exists():
+            return []
+        index_path = self._downloads_index_path()
+        return [
+            path
+            for path in self._downloads_dir.rglob("*")
+            if path.is_file() and path != index_path
+        ]
+
+    def _paths_in_use(self) -> set[str]:
+        used: set[str] = set()
+        for track in self._tracks.values():
+            path = track.get("path") if isinstance(track, dict) else None
+            if path:
+                try:
+                    used.add(str(Path(path).expanduser().resolve()))
+                except Exception:
+                    used.add(str(path))
+        return used
+
+    @staticmethod
+    def _file_size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    def _delete_downloads(self, only_unused: bool, sources: set[str]) -> dict[str, int]:
+        """Delete files inside ThemeDeck's downloads folder whose source is in sources.
+
+        Files still used by a track are always kept. The preview cache is cleared
+        only when removing all music (not only_unused).
+        """
+        downloads_root = self._downloads_dir.resolve()
+        used = self._paths_in_use()
+        index = self._read_downloads_index()
+        deleted = 0
+        freed = 0
+        for path in self._downloaded_files():
+            resolved = path.resolve()
+            # Never touch anything outside ThemeDeck's own downloads folder.
+            if downloads_root not in resolved.parents or str(resolved) in used:
+                continue
+            if self._download_source(path, index) not in sources:
+                continue
+            size = self._file_size(resolved)
+            try:
+                resolved.unlink()
+                deleted += 1
+                freed += size
+                key = self._index_key(path)
+                if key:
+                    index.pop(key, None)
+            except OSError as error:
+                self._log_warning(f"failed deleting {resolved}: {error}")
+        self._write_downloads_index(index)
+        for folder in sorted(
+            (p for p in self._downloads_dir.rglob("*") if p.is_dir()),
+            key=lambda p: len(p.parts),
+            reverse=True,
+        ):
+            try:
+                folder.rmdir()  # only removes empty folders
+            except OSError:
+                pass
+        if not only_unused and self._preview_dir.exists():
+            for path in self._preview_dir.rglob("*"):
+                if path.is_file():
+                    size = self._file_size(path)
+                    try:
+                        path.unlink()
+                        freed += size
+                    except OSError:
+                        pass
+        return {"deleted_files": deleted, "freed_bytes": freed}
+
     async def remove_track(self, app_id: int) -> dict[str, dict[str, Any]]:
         self._tracks.pop(str(app_id), None)
         self._save_tracks()
@@ -757,8 +962,13 @@ class Plugin:
         return payload
 
     async def download_youtube_audio(
-        self, app_id: int, video_url: str
+        self, app_id: int, video_url: str, source: str = "manual"
     ) -> dict[str, Any]:
+        """Download a YouTube video's audio and assign it to a game.
+
+        source: "manual" (picked on the game's music page) or "auto" (bulk or
+        automatic download); recorded in the downloads index.
+        """
         if app_id <= 0:
             raise ValueError("Invalid app id")
 
@@ -810,7 +1020,15 @@ class Plugin:
         tracks = await self.set_track(app_id, str(downloaded_path), downloaded_path.name)
         self._tracks[str(app_id)]["youtube_id"] = video_id
         self._save_tracks()
-        self._log_info(f"youtube download assigned app={app_id} file={downloaded_path}")
+        self._record_download(
+            downloaded_path,
+            app_id=app_id,
+            youtube_id=video_id,
+            source="auto" if source == "auto" else "manual",
+        )
+        self._log_info(
+            f"youtube download assigned app={app_id} file={downloaded_path} source={source}"
+        )
         return {
             "tracks": tracks,
             "path": str(downloaded_path),
