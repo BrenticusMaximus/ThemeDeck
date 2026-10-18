@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+- Clip loop: play only a section of a game's track, starting at its start skip, with ~1.5 s fades. A general "Loop only part of each song" switch and "Default loop length" (5 s–5 min, default 1 min) apply to every game; each game's "Loop length" slider overrides it (0 = use the general setting, far right = full song). With "Loop track" off the section plays once and fades out. Sections longer than the rest of the song end at the song's end, still with fades.
+- Game start skip can now go up to the song's length (was 30 s).
+- Start skip is applied once the song's metadata has loaded and verified afterwards; before, the seek could be silently ignored and the song started from 0:00.
+- Logs each change in the playback decision (`playback_decision` in themedeck-debug.log) to make unexpected starts/stops traceable.
+
 ## 3.0.2 - 2026-09-06
 - Stops and releases browser audio and visualizer resources before system sleep.
 - Rebuilds playback state after wake and resumes eligible global ambient music.

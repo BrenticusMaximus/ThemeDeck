@@ -38,6 +38,11 @@ def clamp_seconds(value: float, minimum: float = 0.0, maximum: float = 30.0) -> 
     return max(minimum, min(maximum, value))
 
 
+# Upper bound for game-track start skip and clip length; the UI limits both to the
+# song's actual length.
+GAME_TRACK_MAX_SECONDS = 6 * 60 * 60
+
+
 class Plugin:
     def __init__(self) -> None:
         self._tracks: dict[str, dict[str, Any]] = {}
@@ -335,6 +340,7 @@ class Plugin:
                 resolved.open("rb").close()
             except PermissionError as error:
                 raise PermissionError(f"Permission denied: {resolved}") from error
+            previous = self._tracks.get(key, {})
             self._tracks[key] = {
                 "app_id": app_id,
                 "path": str(resolved),
@@ -343,6 +349,8 @@ class Plugin:
                 "start_offset": self._tracks.get(key, {}).get("start_offset", 0.0),
                 "loop": bool(self._tracks.get(key, {}).get("loop", True)),
             }
+            if "clip_length" in previous:
+                self._tracks[key]["clip_length"] = previous["clip_length"]
             self._save_tracks()
             decky.logger.info(f"set_track stored app={app_id} path={resolved}")
             return self._tracks
@@ -396,7 +404,32 @@ class Plugin:
         key = str(app_id)
         if key not in self._tracks:
             raise ValueError(f"No track found for app {app_id}")
-        self._tracks[key]["start_offset"] = clamp_seconds(start_offset)
+        # Game tracks can start anywhere in the song (used with clip loops).
+        self._tracks[key]["start_offset"] = clamp_seconds(
+            start_offset, maximum=GAME_TRACK_MAX_SECONDS
+        )
+        self._save_tracks()
+        return self._tracks
+
+    async def set_clip_length(
+        self, app_id: int, clip_length: float | None
+    ) -> dict[str, dict[str, Any]]:
+        """Per-game clip loop length.
+
+        None = follow the general setting, 0 = always play the full song,
+        > 0 = loop this many seconds from the start skip.
+        """
+        key = str(app_id)
+        if key not in self._tracks:
+            raise ValueError(f"No track found for app {app_id}")
+        if clip_length is None:
+            self._tracks[key].pop("clip_length", None)
+        elif float(clip_length) <= 0:
+            self._tracks[key]["clip_length"] = 0
+        else:
+            self._tracks[key]["clip_length"] = clamp_seconds(
+                clip_length, minimum=1.0, maximum=GAME_TRACK_MAX_SECONDS
+            )
         self._save_tracks()
         return self._tracks
 

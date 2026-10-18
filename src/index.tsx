@@ -61,6 +61,7 @@ type BackendTrack = {
   start_offset?: number;
   loop?: boolean;
   youtube_id?: string;
+  clip_length?: number;
 };
 
 type RawTrackMap = Record<string, BackendTrack>;
@@ -74,6 +75,8 @@ type GameTrack = {
   loop: boolean;
   youtubeId?: string;
   resumeTime?: number;
+  // undefined = follow the general clip loop setting, 0 = full song, > 0 = seconds.
+  clipLength?: number;
 };
 
 type TrackMap = Record<number, GameTrack>;
@@ -348,6 +351,10 @@ const updateTrackStartOffset = callable<
 const updateTrackLoop = callable<[appId: number, loop: boolean], RawTrackMap>(
   "set_loop"
 );
+const updateTrackClipLength = callable<
+  [appId: number, clipLength: number | null],
+  RawTrackMap
+>("set_clip_length");
 const updateGlobalStartOffset = callable<[startOffset: number], BackendTrack>(
   "set_global_start_offset"
 );
@@ -419,6 +426,17 @@ const NOW_PLAYING_CARD_WIDTH_STORAGE_KEY = "themedeck:nowPlayingCardWidth";
 const NOW_PLAYING_CARD_WIDTH_EVENT = "themedeck:now-playing-card-width-changed";
 const MASTER_VOLUME_STORAGE_KEY = "themedeck:masterVolume";
 const MASTER_VOLUME_EVENT = "themedeck:master-volume-changed";
+const CLIP_LOOP_ENABLED_STORAGE_KEY = "themedeck:clipLoopEnabled";
+const CLIP_LOOP_ENABLED_EVENT = "themedeck:clip-loop-enabled-changed";
+const CLIP_LOOP_LENGTH_STORAGE_KEY = "themedeck:clipLoopLength";
+const CLIP_LOOP_LENGTH_EVENT = "themedeck:clip-loop-length-changed";
+const CLIP_LOOP_DEFAULT_LENGTH = 60;
+const CLIP_LOOP_GENERAL_MIN = 5;
+const CLIP_LOOP_GENERAL_MAX = 300;
+const CLIP_LOOP_FADE_SECONDS = 1.5;
+const CLIP_LOOP_TICK_MS = 50;
+// Matches the backend limit; the game page limits sliders to the song's length.
+const GAME_TRACK_MAX_SECONDS = 6 * 60 * 60;
 const GLOBAL_AMBIENT_APP_ID = -1;
 const STORE_TRACK_APP_ID = -2;
 const UI_MODE_GAMEPAD = 4;
@@ -702,6 +720,43 @@ const persistNumericPreference = (key: string, event: string, value: number) => 
     console.error("[ThemeDeck] unable to store numeric preference", { key, error });
   }
   window.dispatchEvent(new CustomEvent<number>(event, { detail: value }));
+};
+
+const readClipLoopEnabledSetting = (): boolean =>
+  readPreference(CLIP_LOOP_ENABLED_STORAGE_KEY, false);
+
+const persistClipLoopEnabledSetting = (value: boolean) =>
+  persistPreference(CLIP_LOOP_ENABLED_STORAGE_KEY, CLIP_LOOP_ENABLED_EVENT, value);
+
+const normalizeClipLoopLength = (value: number): number =>
+  Math.round(clamp(value, CLIP_LOOP_GENERAL_MIN, CLIP_LOOP_GENERAL_MAX));
+
+const readClipLoopLengthSetting = (): number =>
+  normalizeClipLoopLength(
+    readNumericPreference(CLIP_LOOP_LENGTH_STORAGE_KEY, CLIP_LOOP_DEFAULT_LENGTH)
+  );
+
+const persistClipLoopLengthSetting = (value: number) =>
+  persistNumericPreference(
+    CLIP_LOOP_LENGTH_STORAGE_KEY,
+    CLIP_LOOP_LENGTH_EVENT,
+    normalizeClipLoopLength(value)
+  );
+
+// The game's own setting wins; otherwise the general setting applies. 0 = full song.
+const getEffectiveClipLength = (track: Pick<GameTrack, "clipLength">): number => {
+  if (typeof track.clipLength === "number") {
+    return Math.max(0, track.clipLength);
+  }
+  return readClipLoopEnabledSetting() ? readClipLoopLengthSetting() : 0;
+};
+
+// 75 -> "1:15", 30 -> "30 s"
+const formatClipLength = (seconds: number): string => {
+  const total = Math.max(0, Math.round(seconds));
+  if (total < 60) return `${total} s`;
+  const minutes = Math.floor(total / 60);
+  return `${minutes}:${String(total % 60).padStart(2, "0")}`;
 };
 
 const readNowPlayingCardEnabledSetting = (): boolean =>
@@ -1154,9 +1209,15 @@ const seekAudioToOffset = async (
   };
 
   const tryApply = () => {
+    // Before the metadata is loaded the browser can silently ignore the new
+    // position, so only seek once it is known.
+    if (audio.readyState < HTMLMediaElement.HAVE_METADATA) {
+      return false;
+    }
     try {
-      audio.currentTime = resolveTargetTime();
-      return true;
+      const target = resolveTargetTime();
+      audio.currentTime = target;
+      return Math.abs(audio.currentTime - target) < 1;
     } catch (_ignored) {
       return false;
     }
@@ -1204,6 +1265,7 @@ const seekAudioToOffset = async (
 
 const stopPlayback = (fade: boolean, reason = "unspecified") => {
   const token = ++stopPlaybackToken;
+  stopClipLoop();
   if (stopPlaybackFadeInterval) {
     window.clearInterval(stopPlaybackFadeInterval);
     stopPlaybackFadeInterval = null;
@@ -1335,7 +1397,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       if (sameTrack) {
         return;
       }
-      const configuredOffset = clamp(track.startOffset ?? 0, 0, 30);
+      const configuredOffset = clamp(track.startOffset ?? 0, 0, GAME_TRACK_MAX_SECONDS);
       const offset =
         typeof track.resumeTime === "number" && Number.isFinite(track.resumeTime)
           ? Math.max(0, track.resumeTime)
@@ -1403,7 +1465,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     audio.loop = track.loop !== false;
     audio.muted = false;
     audio.volume = getEffectiveTrackVolume(track.volume);
-    const configuredOffset = clamp(track.startOffset ?? 0, 0, 30);
+    const configuredOffset = clamp(track.startOffset ?? 0, 0, GAME_TRACK_MAX_SECONDS);
     const offset =
       typeof track.resumeTime === "number" && Number.isFinite(track.resumeTime)
         ? Math.max(0, track.resumeTime)
@@ -1432,9 +1494,25 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       contextState: visualizerAudioContext?.state ?? null,
       src: nextUrl,
     });
+    const clipLength =
+      track.appId > 0 && typeof track.resumeTime !== "number"
+        ? getEffectiveClipLength(track)
+        : 0;
+    if (clipLength > 0 && !sameTrack) {
+      audio.volume = 0;
+    }
     await audio.play();
-    if (offset > 0 && !seekApplied) {
-      await seekAudioToOffset(audio, offset);
+    if (offset > 0 && (!seekApplied || Math.abs(audio.currentTime - offset) > 1)) {
+      seekApplied = await seekAudioToOffset(audio, offset);
+    }
+    if (offset > 0) {
+      logClient(seekApplied ? "info" : "warning", "start_skip_seek", {
+        appId: track.appId,
+        offset,
+        currentTime: Number.isFinite(audio.currentTime) ? audio.currentTime : null,
+        readyState: audio.readyState,
+        applied: seekApplied,
+      });
     }
     if (invocationId !== playInvocationCounter) {
       return;
@@ -1489,6 +1567,15 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     window.setTimeout(() => emitProbe("play_probe_8000ms"), 8000);
     window.setTimeout(() => emitProbe("play_probe_15000ms"), 15000);
     notifyPlayback({ appId: track.appId, reason, status: "playing" });
+    // After notifyPlayback: the clip loop only runs while this track is "playing".
+    if (clipLength > 0) {
+      startClipLoop(track, configuredOffset);
+    } else {
+      stopClipLoop();
+      if (audio.volume === 0 && !audio.muted) {
+        audio.volume = getEffectiveTrackVolume(track.volume);
+      }
+    }
   } catch (error) {
     if (invocationId !== playInvocationCounter) {
       return;
@@ -1527,6 +1614,164 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
   }
 };
 
+// --- Clip loop ------------------------------------------------------------------
+// Plays only [start, start + length] of a game track: fades in at the start, fades
+// out before the end, then jumps back (or stops when "Loop track" is off). The fade
+// level is derived from the playback position, so re-applying the loop mid-song or
+// seeking never causes a jump in volume.
+type ClipLoopState = {
+  appId: number;
+  start: number;
+  length: number;
+  loop: boolean;
+  trackVolume: number;
+  // Consecutive ticks spent before the start skip, waiting for a seek to land.
+  pendingSeekTicks: number;
+};
+// About one second of failed seeking before the clip loop gives up.
+const CLIP_LOOP_MAX_PENDING_SEEK_TICKS = 20;
+let clipLoopState: ClipLoopState | null = null;
+let clipLoopInterval: number | null = null;
+
+const stopClipLoop = () => {
+  if (clipLoopInterval !== null) {
+    window.clearInterval(clipLoopInterval);
+    clipLoopInterval = null;
+  }
+  clipLoopState = null;
+};
+
+const getClipFadeSeconds = (length: number): number =>
+  Math.min(CLIP_LOOP_FADE_SECONDS, length / 2);
+
+const clipLoopTick = () => {
+  const audio = sharedAudio;
+  const state = clipLoopState;
+  if (!audio || !state) {
+    stopClipLoop();
+    return;
+  }
+  if (playbackState.appId !== state.appId || playbackState.status !== "playing") {
+    stopClipLoop();
+    if (!audio.paused && playbackState.status === "playing") {
+      // Another track took over without a stop: restore its volume.
+      audio.volume = getEffectiveTrackVolume(getTrackVolumeForPlaybackState(playbackState));
+    }
+    return;
+  }
+  if (audio.paused || stopPlaybackFadeInterval) {
+    // Let stopPlayback's own fade-out control the volume.
+    return;
+  }
+  const position = audio.currentTime;
+  if (!Number.isFinite(position)) {
+    return;
+  }
+  const duration = audio.duration;
+  if (Number.isFinite(duration) && state.start + state.length > duration - 0.1) {
+    // Song length became known after the loop started.
+    state.length = Math.max(1, duration - state.start - 0.1);
+  }
+  if (position < state.start - 0.5) {
+    // Before the start skip (song just loaded, or wrapped to 0:00 on its own).
+    state.pendingSeekTicks += 1;
+    if (state.pendingSeekTicks > CLIP_LOOP_MAX_PENDING_SEEK_TICKS) {
+      // The jump isn't taking: play normally rather than stay silent.
+      logClient("warning", "clip_loop_seek_failed", {
+        appId: state.appId,
+        start: state.start,
+        currentTime: position,
+        readyState: audio.readyState,
+      });
+      stopClipLoop();
+      audio.volume = getEffectiveTrackVolume(state.trackVolume);
+      return;
+    }
+    audio.volume = 0;
+    if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      try {
+        audio.currentTime = state.start;
+      } catch (_ignored) {
+        // no-op
+      }
+    }
+    return;
+  }
+  state.pendingSeekTicks = 0;
+  const end = state.start + state.length;
+  const baseVolume = getEffectiveTrackVolume(state.trackVolume);
+  if (position >= end || audio.ended) {
+    if (!state.loop) {
+      logClient("info", "clip_loop_finished", { appId: state.appId, end });
+      stopClipLoop();
+      stopPlayback(false, "clipLoop_end");
+      return;
+    }
+    audio.volume = 0;
+    try {
+      audio.currentTime = state.start;
+    } catch (_ignored) {
+      // no-op
+    }
+    if (audio.paused) {
+      void audio.play().catch(() => undefined);
+    }
+    return;
+  }
+  const fade = getClipFadeSeconds(state.length);
+  const fadeIn = fade > 0 ? (position - state.start) / fade : 1;
+  const fadeOut = fade > 0 ? (end - position) / fade : 1;
+  audio.volume = baseVolume * clamp(Math.min(fadeIn, fadeOut));
+};
+
+const startClipLoop = (track: GameTrack, startOffset: number) => {
+  const audio = sharedAudio;
+  const length = getEffectiveClipLength(track);
+  if (!audio || track.appId <= 0 || length <= 0) {
+    if (clipLoopState) {
+      stopClipLoop();
+      if (audio && playbackState.status === "playing") {
+        audio.volume = getEffectiveTrackVolume(track.volume);
+      }
+    }
+    return;
+  }
+  // A section longer than what's left of the song ends at the song's end, so it
+  // still fades and jumps back to the start skip (not to 0:00).
+  const duration = audio.duration;
+  const remaining = Number.isFinite(duration) ? duration - startOffset - 0.1 : Infinity;
+  if (remaining < 1) {
+    // Start skip is at (or past) the end of the song: just play normally.
+    stopClipLoop();
+    audio.volume = getEffectiveTrackVolume(track.volume);
+    return;
+  }
+  clipLoopState = {
+    appId: track.appId,
+    start: startOffset,
+    length: Math.min(length, remaining),
+    loop: track.loop !== false,
+    trackVolume: track.volume,
+    pendingSeekTicks: 0,
+  };
+  if (clipLoopInterval === null) {
+    clipLoopInterval = window.setInterval(clipLoopTick, CLIP_LOOP_TICK_MS);
+  }
+  clipLoopTick();
+};
+
+// Re-apply after a setting changes while the game's music is playing.
+const refreshClipLoopForActiveTrack = () => {
+  const appId = playbackState.appId;
+  if (!appId || appId <= 0 || playbackState.status !== "playing") {
+    return;
+  }
+  const track = latestTracksForAutoPlay[appId];
+  if (track) {
+    startClipLoop(track, clamp(track.startOffset ?? 0, 0, GAME_TRACK_MAX_SECONDS));
+  }
+};
+
 const applyVolumeToActiveTrack = (appId: number, volume: number) => {
   if (!sharedAudio) {
     return;
@@ -1535,6 +1780,11 @@ const applyVolumeToActiveTrack = (appId: number, volume: number) => {
     playbackState.appId !== appId ||
     playbackState.status !== "playing"
   ) {
+    return;
+  }
+  if (clipLoopState && clipLoopState.appId === appId) {
+    // The clip loop applies the volume together with its fades.
+    clipLoopState.trackVolume = volume;
     return;
   }
   sharedAudio.volume = getEffectiveTrackVolume(volume);
@@ -1547,8 +1797,12 @@ const applyStartOffsetToActiveTrack = (appId: number, startOffset: number) => {
   if (playbackState.appId !== appId || playbackState.status !== "playing") {
     return;
   }
+  const offset = clamp(startOffset, 0, GAME_TRACK_MAX_SECONDS);
+  if (clipLoopState && clipLoopState.appId === appId) {
+    clipLoopState.start = offset;
+  }
   try {
-    sharedAudio.currentTime = clamp(startOffset, 0, 30);
+    sharedAudio.currentTime = offset;
   } catch (_ignored) {
     // no-op
   }
@@ -1560,6 +1814,9 @@ const applyLoopToActiveTrack = (appId: number, loop: boolean) => {
   }
   if (playbackState.appId !== appId || playbackState.status !== "playing") {
     return;
+  }
+  if (clipLoopState && clipLoopState.appId === appId) {
+    clipLoopState.loop = loop;
   }
   sharedAudio.loop = loop;
 };
@@ -1579,6 +1836,10 @@ const getTrackVolumeForPlaybackState = (state: PlaybackState): number | undefine
 
 const applyMasterVolumeToActiveTrack = () => {
   if (!sharedAudio || playbackState.status !== "playing") {
+    return;
+  }
+  if (clipLoopState) {
+    // Picked up on the clip loop's next tick, together with its fades.
     return;
   }
   sharedAudio.volume = getEffectiveTrackVolume(
@@ -3426,10 +3687,14 @@ const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
         typeof track.volume === "number" ? clamp(track.volume) : 1,
       startOffset:
         typeof track.start_offset === "number"
-          ? clamp(track.start_offset, 0, 30)
+          ? clamp(track.start_offset, 0, GAME_TRACK_MAX_SECONDS)
           : 0,
       loop: track.loop !== false,
       youtubeId: typeof track.youtube_id === "string" ? track.youtube_id : undefined,
+      clipLength:
+        typeof track.clip_length === "number"
+          ? clamp(track.clip_length, 0, GAME_TRACK_MAX_SECONDS)
+          : undefined,
     };
   }
 
@@ -3831,6 +4096,40 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
   };
 };
 
+// Logs what the playback check decided, but only when the decision changes, so
+// unexpected starts/stops can be traced from themedeck-debug.log.
+let lastPlaybackDecisionKey = "";
+const logPlaybackDecision = (
+  decision: string,
+  details: Record<string, unknown> = {}
+) => {
+  const key = `${decision}|${String(details.appId ?? "")}`;
+  if (key === lastPlaybackDecisionKey) {
+    return;
+  }
+  lastPlaybackDecisionKey = key;
+  let routeSignalAppId: number | null = null;
+  let themeDeckRoute = false;
+  try {
+    routeSignalAppId = readAppIdFromRouteSignals();
+    themeDeckRoute = isThemeDeckRouteActive();
+  } catch (_ignored) {
+    // diagnostics only
+  }
+  logClient("info", "playback_decision", {
+    decision,
+    ...details,
+    playingAppId: playbackState.appId,
+    playingReason: playbackState.reason,
+    playingStatus: playbackState.status,
+    themeDeckRoute,
+    detailRouteAppId: activeDetailRouteAppId,
+    routeSignalAppId,
+    focusedAppId,
+    libraryPath: getLibraryPath(),
+  });
+};
+
 const applyAutoPlaybackFromContext = () => {
   if (systemSuspending) {
     return;
@@ -3845,6 +4144,7 @@ const applyAutoPlaybackFromContext = () => {
   }
 
   if (desktopModeActive) {
+    logPlaybackDecision("desktop_mode");
     if (playbackState.status === "playing") {
       stopPlayback(true, "applyAutoPlaybackFromContext_desktopMode");
     }
@@ -3852,6 +4152,7 @@ const applyAutoPlaybackFromContext = () => {
   }
 
   if (runningGameAppId !== null) {
+    logPlaybackDecision("game_running", { runningGameAppId });
     if (playbackState.status === "playing") {
       if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
         captureGlobalAmbientResumeSnapshot();
@@ -3863,6 +4164,7 @@ const applyAutoPlaybackFromContext = () => {
 
   if (isGamepadContextMenuVisible()) {
     // Do not change autoplay track selection while a context menu is open.
+    logPlaybackDecision("skip_context_menu_open");
     return;
   }
 
@@ -3881,11 +4183,13 @@ const applyAutoPlaybackFromContext = () => {
     if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
       captureGlobalAmbientResumeSnapshot();
     }
+    logPlaybackDecision("stop_launch_suppression");
     stopPlayback(true, "applyAutoPlaybackFromContext_launchSuppression");
     return;
   }
 
   if (isThemeDeckRouteActive()) {
+    logPlaybackDecision("themedeck_page");
     if (playbackState.reason === "auto" && playbackState.status === "playing") {
       if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
         captureGlobalAmbientResumeSnapshot();
@@ -3908,6 +4212,7 @@ const applyAutoPlaybackFromContext = () => {
     return;
   }
   if (playbackState.reason === "manual") {
+    logPlaybackDecision("skip_manual_playback");
     return;
   }
 
@@ -3919,6 +4224,7 @@ const applyAutoPlaybackFromContext = () => {
     playbackState.appId > 0
   ) {
     // During launch transition, keep the currently-playing game track alive.
+    logPlaybackDecision("keep_during_launch");
     return;
   }
 
@@ -3935,6 +4241,7 @@ const applyAutoPlaybackFromContext = () => {
       Date.now() - lastGameDetailContextSeenAtMs < 220
     ) {
       // Keep the active game track alive through transient route/context gaps.
+      logPlaybackDecision("keep_through_route_gap");
       return;
     }
     if (playbackState.reason === "auto" && playbackState.status === "playing") {
@@ -3943,6 +4250,7 @@ const applyAutoPlaybackFromContext = () => {
       }
       stopPlayback(true, "applyAutoPlaybackFromContext_noNextTrack");
     }
+    logPlaybackDecision("no_track_for_page");
     return;
   }
 
@@ -3965,8 +4273,10 @@ const applyAutoPlaybackFromContext = () => {
         !sharedAudio.ended &&
         !!(sharedAudio.currentSrc || sharedAudio.src)))
   ) {
+    logPlaybackDecision("keep_playing", { appId: nextTrack.appId });
     return;
   }
+  logPlaybackDecision("play", { appId: nextTrack.appId });
   playTrack(nextTrack, "auto");
 };
 
@@ -4460,6 +4770,41 @@ const useMasterVolumeSetting = (): [number, (value: number) => void] => {
   return [value, update];
 };
 
+const useClipLoopEnabledSetting = (): [boolean, (value: boolean) => void] => {
+  const [value, update] = useBooleanPreference(
+    readClipLoopEnabledSetting,
+    persistClipLoopEnabledSetting,
+    CLIP_LOOP_ENABLED_EVENT
+  );
+  const updateAndApply = useCallback(
+    (next: boolean) => {
+      update(next);
+      refreshClipLoopForActiveTrack();
+    },
+    [update]
+  );
+  return [value, updateAndApply];
+};
+
+const useClipLoopLengthSetting = (): [number, (value: number) => void] => {
+  const [value, setValue] = useState<number>(() => readClipLoopLengthSetting());
+
+  useEffect(() => {
+    const handler = () => setValue(readClipLoopLengthSetting());
+    window.addEventListener(CLIP_LOOP_LENGTH_EVENT, handler);
+    return () => window.removeEventListener(CLIP_LOOP_LENGTH_EVENT, handler);
+  }, []);
+
+  const update = useCallback((next: number) => {
+    const normalized = normalizeClipLoopLength(next);
+    setValue(normalized);
+    persistClipLoopLengthSetting(normalized);
+    refreshClipLoopForActiveTrack();
+  }, []);
+
+  return [value, update];
+};
+
 const useAmbientInterruptionModeSetting = (): [
   AmbientInterruptionMode,
   (value: AmbientInterruptionMode) => void
@@ -4620,6 +4965,8 @@ const Content = () => {
     useGlobalAmbientEnabledSetting();
   const [storeTrackEnabled, setStoreTrackEnabled] = useStoreTrackEnabledSetting();
   const [masterVolume, setMasterVolume] = useMasterVolumeSetting();
+  const [clipLoopEnabled, setClipLoopEnabled] = useClipLoopEnabledSetting();
+  const [clipLoopLength, setClipLoopLength] = useClipLoopLengthSetting();
   const [ambientDisableStore, setAmbientDisableStore] =
     useAmbientDisableStoreSetting();
   const [ambientInterruptionMode, setAmbientInterruptionMode] =
@@ -5790,6 +6137,29 @@ const Content = () => {
             />
           </PanelSectionRow>
           <PanelSectionRow>
+            <ToggleField
+              checked={clipLoopEnabled}
+              label="Loop only part of each song"
+              description="Play a section from each game's start skip, with fades. Games with their own setting keep it."
+              onChange={(value) => setClipLoopEnabled(value)}
+            />
+          </PanelSectionRow>
+          {clipLoopEnabled ? (
+            <PanelSectionRow>
+              <div style={{ width: "100%", paddingLeft: "0.9rem", boxSizing: "border-box" }}>
+                <SliderField
+                  value={clipLoopLength}
+                  label="Default loop length"
+                  description={formatClipLength(clipLoopLength)}
+                  min={CLIP_LOOP_GENERAL_MIN}
+                  max={CLIP_LOOP_GENERAL_MAX}
+                  step={5}
+                  onChange={(value) => setClipLoopLength(value)}
+                />
+              </div>
+            </PanelSectionRow>
+          ) : null}
+          <PanelSectionRow>
             <div style={{ width: "100%" }}>
               <div style={{ fontWeight: 600 }}>
                 Stop music after pressing Play
@@ -6615,6 +6985,46 @@ const ChangeTheme = () => {
   const previewObjectUrlRef = useRef<string | null>(null);
   const playback = usePlaybackStateValue();
   const navigateBack = useCallback(() => Navigation.NavigateBack(), []);
+  const [generalClipLoopEnabled] = useClipLoopEnabledSetting();
+  const [generalClipLoopLength] = useClipLoopLengthSetting();
+  // The song's length, so the start skip and loop length sliders can reach its end.
+  const [trackDuration, setTrackDuration] = useState<number | null>(null);
+  useEffect(() => {
+    setTrackDuration(null);
+    if (!track?.path) return;
+    let cancelled = false;
+    const probe = new Audio();
+    probe.preload = "metadata";
+    const timeoutId = window.setTimeout(() => {
+      probe.removeAttribute("src");
+    }, 15000);
+    probe.onloadedmetadata = () => {
+      if (!cancelled && Number.isFinite(probe.duration) && probe.duration > 0) {
+        setTrackDuration(probe.duration);
+      }
+      window.clearTimeout(timeoutId);
+      probe.removeAttribute("src");
+    };
+    void resolveAudioUrl(track)
+      .then((url) => {
+        if (!cancelled) probe.src = url;
+      })
+      .catch((error) => {
+        console.error("[ThemeDeck] reading track length failed", error);
+      });
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+      probe.onloadedmetadata = null;
+      probe.removeAttribute("src");
+    };
+  }, [track?.path]);
+  const startSkipMax = trackDuration
+    ? Math.max(1, Math.floor(trackDuration) - 1)
+    : Math.max(30, Math.ceil(track?.startOffset ?? 0));
+  const clipLengthMax = trackDuration
+    ? Math.max(1, Math.ceil(trackDuration - (track?.startOffset ?? 0)))
+    : Math.max(CLIP_LOOP_GENERAL_MAX, Math.ceil(track?.clipLength ?? 0));
 
   const loadTrack = useCallback(async () => {
     if (!appId) return;
@@ -6952,9 +7362,36 @@ const ChangeTheme = () => {
     }
   };
 
+  const handleTrackClipLengthChange = async (clipLength: number | null) => {
+    if (!track || !appId) return;
+    const nextTrack: GameTrack = {
+      ...track,
+      clipLength: clipLength === null ? undefined : Math.max(0, Math.round(clipLength)),
+    };
+    setTrack(nextTrack);
+    if (playbackState.appId === appId && playbackState.status === "playing") {
+      startClipLoop(nextTrack, nextTrack.startOffset);
+    }
+    try {
+      const updated = await updateTrackClipLength(
+        appId,
+        clipLength === null ? null : Math.max(0, Math.round(clipLength))
+      );
+      const normalizedTracks = normalizeTracks(updated);
+      setTrack(normalizedTracks[appId] ?? nextTrack);
+      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+    } catch (error) {
+      console.error("[ThemeDeck] route clip length update failed", error);
+      toaster.toast({
+        title: "ThemeDeck",
+        body: "Couldn't save loop length",
+      });
+    }
+  };
+
   const handleTrackStartOffsetChange = async (value: number) => {
     if (!track || !appId) return;
-    const normalizedOffset = clamp(value, 0, 30);
+    const normalizedOffset = clamp(value, 0, GAME_TRACK_MAX_SECONDS);
     const nextTrack = { ...track, startOffset: normalizedOffset };
     setTrack(nextTrack);
     applyStartOffsetToActiveTrack(appId, normalizedOffset);
@@ -7214,13 +7651,12 @@ const ChangeTheme = () => {
                 />
                 <div style={{ marginTop: "0.35rem" }}>
                   <SliderField
-                    value={Math.round(track.startOffset)}
+                    value={Math.round(Math.min(track.startOffset, startSkipMax))}
                     label="Start skip"
+                    description={formatClipLength(track.startOffset)}
                     min={0}
-                    max={30}
+                    max={startSkipMax}
                     step={1}
-                    valueSuffix="s"
-                    showValue
                     onChange={handleTrackStartOffsetChange}
                   />
                 </div>
@@ -7231,6 +7667,41 @@ const ChangeTheme = () => {
                     description="Play continuously when this track is active."
                     onChange={handleTrackLoopChange}
                   />
+                </div>
+                <div style={{ marginTop: "0.35rem" }}>
+                  <SliderField
+                    value={
+                      track.clipLength === undefined
+                        ? 0
+                        : track.clipLength > 0
+                          ? Math.min(Math.round(track.clipLength), clipLengthMax)
+                          : clipLengthMax
+                    }
+                    label="Loop length"
+                    description={
+                      track.clipLength === undefined
+                        ? generalClipLoopEnabled
+                          ? `Using general setting (${formatClipLength(generalClipLoopLength)})`
+                          : "Using general setting (off, full song)"
+                        : track.clipLength > 0 && track.clipLength < clipLengthMax
+                          ? `${formatClipLength(track.clipLength)} from the start skip, with fades`
+                          : "Full song"
+                    }
+                    min={0}
+                    max={clipLengthMax}
+                    step={1}
+                    onChange={(value) =>
+                      // 0 = follow the general setting, far right = full song.
+                      handleTrackClipLengthChange(
+                        value <= 0 ? null : value >= clipLengthMax ? 0 : value
+                      )
+                    }
+                  />
+                  {trackDuration === null ? (
+                    <div style={{ fontSize: "0.75rem", opacity: 0.65 }}>
+                      Reading song length...
+                    </div>
+                  ) : null}
                 </div>
               </Focusable>
             </PanelSectionRow>

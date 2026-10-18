@@ -30,7 +30,8 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 - Highlight which YouTube result is already assigned.
 - Set per-game volume.
 - Master volume control to override all game music.
-- Skip silent intros with per-game "truncate start" timing.
+- Skip silent intros with per-game "truncate start" timing (up to the song's full length).
+- Loop only a section of each song with fades: a general default length, overridable per game (or set to the full song).
 - Remove or change a game's assigned track at any time.
 - Auto-play music when opening game pages.
 - Displays a live "Now Playing" card overlay on game pages.
