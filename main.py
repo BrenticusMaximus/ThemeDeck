@@ -4,6 +4,7 @@ import asyncio
 import base64
 import html as html_lib
 import json
+import math
 import os
 import re
 import shutil
@@ -28,6 +29,451 @@ YTDLP_RELEASE_URLS = (
     "https://yt-dlp.org/downloads/latest/yt-dlp",
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
 )
+
+# --- Smart theme search -------------------------------------------------------
+# Steam store names often carry an edition ("Crimson Desert Enhanced"), which makes
+# YouTube searches worse. For Steam games we look up the game's own name on Wikidata
+# by Steam app ID (property P1733), which needs no API key. If Wikidata has no entry
+# we keep the full Steam name and never trim words from it.
+# Steam tools/runtimes that show up as installed apps but aren't games.
+LIBRARY_TOOL_APP_IDS = {7, 760, 12210, 12211, 12212, 12213, 12218, 228980}
+LIBRARY_TOOL_NAME_PATTERN = re.compile(
+    r"^(proton\b|steam linux runtime|steamworks|steamvr|steam audio|"
+    r"steam controller configs|app \d+$)",
+    re.IGNORECASE,
+)
+
+
+def is_library_tool(app_id: int, name: str) -> bool:
+    """True for Proton, runtimes and other installed apps that aren't games."""
+    return app_id in LIBRARY_TOOL_APP_IDS or bool(
+        LIBRARY_TOOL_NAME_PATTERN.match(str(name or "").strip())
+    )
+WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
+WIKIDATA_USER_AGENT = "ThemeDeck (+https://github.com/BrenticusMaximus/ThemeDeck)"
+WIKIDATA_BATCH_SIZE = 50
+SYSTEM_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",  # Arch, SteamOS, CachyOS, Debian, Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora, Bazzite
+    "/etc/ssl/cert.pem",
+)
+WIKIDATA_MISS_TTL_SECONDS = 30 * 24 * 60 * 60
+# Same count as the manual search on the game page, so both rank the same results.
+THEME_SEARCH_RESULTS_PER_QUERY = 20
+THEME_MIN_ACCEPT_SCORE = 25
+THEME_CONFIDENT_SCORE = 60
+THEME_MAX_CANDIDATES = 5
+THEME_MAX_VIEW_BONUS = 8.0
+TRADEMARK_SYMBOL_PATTERN = re.compile(r"[™®©]")
+WIKIDATA_ENTITY_ID_PATTERN = re.compile(r"^Q\d+$")
+THEME_NAME_STOPWORDS = {"the", "of", "and", "a", "an", "to", "in", "on", "for", "edition"}
+THEME_STRONG_KEYWORDS = (
+    "main theme",
+    "main menu",
+    "menu theme",
+    "menu music",
+    "title theme",
+    "title screen",
+    "opening theme",
+)
+THEME_KEYWORDS = ("theme", "ost", "soundtrack", "original score", "score")
+THEME_HARD_NEGATIVE_KEYWORDS = (
+    "trailer",
+    "gameplay",
+    "walkthrough",
+    "playthrough",
+    "longplay",
+    "let's play",
+    "lets play",
+    "review",
+    "reaction",
+    "speedrun",
+    "tutorial",
+    "guide",
+    "teaser",
+    "announcement",
+    "interview",
+    "unboxing",
+)
+THEME_SOFT_NEGATIVE_KEYWORDS = (
+    "cover",
+    "remix",
+    "piano",
+    "lofi",
+    "lo-fi",
+    "8-bit",
+    "8 bit",
+    "metal version",
+    "guitar",
+    "violin",
+    "fan made",
+    "fanmade",
+    "nightcore",
+    "slowed",
+    "reverb",
+    "hour",
+    "extended",
+    "full album",
+    "full soundtrack",
+    "complete soundtrack",
+    "full ost",
+    "compilation",
+    "all songs",
+    "ambience",
+    "ambient mix",
+    "asmr",
+)
+
+
+def strip_trademark_symbols(name: str) -> str:
+    """Remove ™/®/© only; these are never part of a game's actual name."""
+    cleaned = TRADEMARK_SYMBOL_PATTERN.sub("", str(name or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _compact_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", value).lower())
+
+
+def _name_tokens(value: str) -> list[str]:
+    words = re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKD", value).lower())
+    return [word for word in words if word not in THEME_NAME_STOPWORDS]
+
+
+def pick_wikidata_label(steam_name: str, labels: list[str]) -> str | None:
+    """Choose the Wikidata label to search with for one Steam app.
+
+    An app ID can map to several items (base game and an edition). Prefer the
+    shortest label the Steam name starts with, otherwise the shortest label.
+    """
+    usable = sorted(
+        {
+            strip_trademark_symbols(label)
+            for label in labels
+            if label and not WIKIDATA_ENTITY_ID_PATTERN.match(label.strip())
+        },
+        key=lambda label: (len(label), label),
+    )
+    usable = [label for label in usable if label]
+    if not usable:
+        return None
+    steam_compact = _compact_text(steam_name)
+    for label in usable:
+        if steam_compact.startswith(_compact_text(label)):
+            return label
+    return usable[0]
+
+
+def build_theme_queries(name: str) -> list[str]:
+    return [f"{name} main theme", f"{name} main menu music", f"{name} OST"]
+
+
+def score_theme_result(result: dict[str, Any], names: list[str]) -> float:
+    """Score how likely a YouTube search result is the game's main theme."""
+    title = str(result.get("title") or "")
+    uploader = str(result.get("uploader") or "")
+    title_lower = unicodedata.normalize("NFKD", title).lower()
+    title_compact = _compact_text(title)
+    title_tokens = set(_name_tokens(title))
+
+    best_name_match = 0.0
+    for name in names:
+        name_compact = _compact_text(name)
+        if name_compact and name_compact in title_compact:
+            best_name_match = 1.0
+            break
+        tokens = _name_tokens(name)
+        if tokens:
+            best_name_match = max(
+                best_name_match,
+                sum(1 for token in tokens if token in title_tokens) / len(tokens),
+            )
+    if best_name_match < 0.6:
+        # Results that don't name the game are almost always a different game.
+        return -100.0
+
+    names_lower = " ".join(unicodedata.normalize("NFKD", name).lower() for name in names)
+
+    def contains_word(text: str, keyword: str) -> bool:
+        # Whole-word match so "ost" doesn't match "Ghost" or "Lost".
+        return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}s?(?![a-z0-9])", text) is not None
+
+    def has_keyword(keywords: tuple[str, ...]) -> bool:
+        # Ignore keywords that are part of the game's own name ("Darkest Hour").
+        return any(
+            contains_word(title_lower, keyword) and not contains_word(names_lower, keyword)
+            for keyword in keywords
+        )
+
+    score = 20.0 * best_name_match
+    if has_keyword(THEME_STRONG_KEYWORDS):
+        score += 30
+    elif has_keyword(THEME_KEYWORDS):
+        score += 15
+    if has_keyword(THEME_HARD_NEGATIVE_KEYWORDS):
+        score -= 40
+    if has_keyword(THEME_SOFT_NEGATIVE_KEYWORDS):
+        score -= 25
+    if "official" in title_lower:
+        score += 5
+    if uploader.endswith(" - Topic"):
+        score += 10
+
+    duration = result.get("duration")
+    if isinstance(duration, (int, float)):
+        # Menu music is often a long loop, so up to 12 minutes still counts as a track.
+        if 60 <= duration <= 12 * 60:
+            score += 15
+        elif duration < 30:
+            score -= 30
+        elif duration > 15 * 60:
+            # Hour-long loops and full-album uploads, never a single theme.
+            score -= 40
+
+    # Small tie-breaker: widely watched uploads tend to be the right, clean track.
+    # Log-scaled and capped so it can never outweigh the title rules above.
+    views = result.get("view_count")
+    if isinstance(views, (int, float)) and views > 1000:
+        score += min(THEME_MAX_VIEW_BONUS, 2.0 * math.log10(views / 1000))
+    return score
+
+
+def sort_theme_results(
+    results: list[dict[str, Any]], names: list[str]
+) -> list[dict[str, Any]]:
+    """Order every result by score, best first, without dropping any.
+
+    Used for searches the user runs: they decide, we only put likely matches on top.
+    Ties keep YouTube's order.
+    """
+    scored = [
+        (score_theme_result(result, names), index, result)
+        for index, result in enumerate(results)
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [{**result, "score": round(score, 1)} for score, _, result in scored]
+
+
+def rank_theme_results(
+    results: list[dict[str, Any]], names: list[str]
+) -> list[dict[str, Any]]:
+    """Return results that pass the score threshold, best first."""
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for index, result in enumerate(results):
+        score = score_theme_result(result, names)
+        if score >= THEME_MIN_ACCEPT_SCORE:
+            scored.append((score, index, {**result, "score": round(score, 1)}))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [result for _, _, result in scored]
+
+
+# Names of non-Steam shortcuts that are launchers, stores or apps rather than games.
+# Matched case-insensitively against the cleaned shortcut name. Game shortcuts that
+# launch *through* one of these (e.g. NonSteamLaunchers entries) keep their own name,
+# so they are not affected.
+NON_STEAM_LAUNCHER_NAMES = {
+    "amazon games",
+    "amazon luna",
+    "antstream arcade",
+    "arc launcher",
+    "artix game launcher",
+    "battle.net",
+    "big fish games manager",
+    "bottles",
+    "decky loader",
+    "discord",
+    "ea app",
+    "emudeck",
+    "epic games",
+    "epic games launcher",
+    "faugus launcher",
+    "game jolt client",
+    "geforce now",
+    "glyph launcher",
+    "gog galaxy",
+    "google chrome",
+    "gryphlink",
+    "heroic games launcher",
+    "hoyoplay",
+    "humble games collection",
+    "humble app",
+    "indiegala",
+    "itch.io",
+    "legacy games",
+    "lutris",
+    "microsoft edge",
+    "minecraft launcher",
+    "moonlight",
+    "moonlight game streaming",
+    "mozilla firefox",
+    "netflix",
+    "nexon launcher",
+    "nonsteamlaunchers",
+    "nvidia geforce now",
+    "origin",
+    "playstation plus",
+    "plarium play",
+    "purple launcher",
+    "remoteplaywhatever",
+    "remote play whatever",
+    "repair ea app",
+    "retroarch",
+    "rockstar games launcher",
+    "spotify",
+    "steam rom manager",
+    "stove client",
+    "tempo launcher",
+    "twitch",
+    "ubisoft connect",
+    "uplay",
+    "vfun launcher",
+    "vk play",
+    "waydroid",
+    "xbox cloud gaming",
+    "xbox game pass",
+    "youtube",
+    "youtube tv",
+}
+NON_STEAM_LAUNCHER_PATTERN = re.compile(
+    r"(launchers?|client)$|^(repair|uninstall)\b", re.IGNORECASE
+)
+NON_STEAM_TRAILING_TAG_PATTERN = re.compile(r"\s*[\(\[\{][^\(\)\[\]\{\}]*[\)\]\}]\s*$")
+NON_STEAM_TRADEMARK_PATTERN = re.compile(r"[™®©]")
+
+
+def parse_binary_vdf(data: bytes) -> dict[str, Any]:
+    """Parse Valve's binary KeyValues format (used by shortcuts.vdf)."""
+
+    def read_cstring(offset: int) -> tuple[str, int]:
+        end = data.index(b"\x00", offset)
+        return data[offset:end].decode("utf-8", errors="replace"), end + 1
+
+    def read_map(offset: int) -> tuple[dict[str, Any], int]:
+        result: dict[str, Any] = {}
+        while offset < len(data):
+            value_type = data[offset]
+            offset += 1
+            if value_type in (0x08, 0x0B):  # end of map
+                return result, offset
+            key, offset = read_cstring(offset)
+            if value_type == 0x00:
+                result[key], offset = read_map(offset)
+            elif value_type == 0x01:
+                result[key], offset = read_cstring(offset)
+            elif value_type in (0x02, 0x04, 0x06):  # int32, pointer, color
+                result[key] = int.from_bytes(data[offset : offset + 4], "little", signed=True)
+                offset += 4
+            elif value_type == 0x03:  # float32
+                result[key] = data[offset : offset + 4]
+                offset += 4
+            elif value_type in (0x07, 0x0A):  # uint64, int64
+                result[key] = int.from_bytes(data[offset : offset + 8], "little", signed=value_type == 0x0A)
+                offset += 8
+            else:
+                raise ValueError(f"Unsupported binary VDF type 0x{value_type:02x} at {offset - 1}")
+        return result, offset
+
+    parsed, _ = read_map(0)
+    return parsed
+
+
+def extract_non_steam_shortcuts(data: bytes) -> list[dict[str, Any]]:
+    """Return [{appid, name}] for every entry in a shortcuts.vdf blob."""
+    root = parse_binary_vdf(data)
+    shortcuts = next(
+        (value for key, value in root.items() if key.lower() == "shortcuts"),
+        root,
+    )
+    if not isinstance(shortcuts, dict):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for entry in shortcuts.values():
+        if not isinstance(entry, dict):
+            continue
+        fields = {str(key).lower(): value for key, value in entry.items()}
+        raw_app_id = fields.get("appid")
+        name = str(fields.get("appname") or "").strip()
+        if not isinstance(raw_app_id, int) or not name:
+            continue
+        # Stored as a signed int32; Steam's UI uses the unsigned value.
+        entries.append({"appid": raw_app_id & 0xFFFFFFFF, "name": name})
+    return entries
+
+
+def clean_game_search_name(name: str) -> str:
+    """Strip tags like "(USA)", "[GOG]" and trademark symbols from a game name."""
+    cleaned = NON_STEAM_TRADEMARK_PATTERN.sub("", str(name or ""))
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = NON_STEAM_TRAILING_TAG_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_:|")
+    return cleaned or str(name or "").strip()
+
+
+def _compact_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+# Shortcut tools often save names without spaces ("EAapp", "RockstarGamesLauncher"),
+# so launcher names are also compared with spaces and punctuation removed.
+NON_STEAM_LAUNCHER_COMPACT_NAMES = {
+    _compact_name(launcher) for launcher in NON_STEAM_LAUNCHER_NAMES
+}
+# Long launcher names are distinctive enough to match as a prefix, which catches
+# stray suffixes such as "UbisoftConnectx".
+NON_STEAM_LAUNCHER_PREFIX_MIN_LENGTH = 10
+
+
+def is_launcher_shortcut_name(name: str) -> bool:
+    normalized = clean_game_search_name(name).lower()
+    compact = _compact_name(normalized)
+    if normalized in NON_STEAM_LAUNCHER_NAMES or compact in NON_STEAM_LAUNCHER_COMPACT_NAMES:
+        return True
+    if any(
+        len(launcher) >= NON_STEAM_LAUNCHER_PREFIX_MIN_LENGTH and compact.startswith(launcher)
+        for launcher in NON_STEAM_LAUNCHER_COMPACT_NAMES
+    ):
+        return True
+    return bool(NON_STEAM_LAUNCHER_PATTERN.search(normalized))
+
+
+# --- YouTube errors ---------------------------------------------------------------
+# Errors YouTube usually recovers from within seconds or minutes; retried a few times.
+YOUTUBE_RETRY_DELAYS_SECONDS = (3, 10)
+YOUTUBE_RETRYABLE_PATTERNS = (
+    "http error 403",
+    "http error 429",
+    "http error 5",
+    "not a bot",
+    "timed out",
+    "connection reset",
+    "connection refused",
+    "temporary failure in name resolution",
+    "incompleteread",
+    "unable to download webpage",
+    "unable to download video data",
+)
+# YouTube is limiting this PC; automatic downloads should pause instead of retrying.
+YOUTUBE_RATE_LIMIT_PATTERNS = ("http error 429", "not a bot", "too many requests")
+
+
+def is_retryable_youtube_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return any(pattern in text for pattern in YOUTUBE_RETRYABLE_PATTERNS)
+
+
+def describe_youtube_error(message: str) -> str:
+    """Prefix yt-dlp errors with a short explanation the UI can show."""
+    text = str(message or "").lower()
+    if any(pattern in text for pattern in YOUTUBE_RATE_LIMIT_PATTERNS):
+        return f"YouTube is limiting downloads (rate limited): {message}"
+    if "ffmpeg" in text or "ffprobe" in text:
+        return f"ffmpeg is missing (install it with: sudo pacman -S ffmpeg): {message}"
+    if "video unavailable" in text or "private video" in text:
+        return f"This video can't be downloaded: {message}"
+    return message
 
 
 def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -267,6 +713,10 @@ class Plugin:
             "installed_app_ids": sorted(installed_app_ids),
         }
 
+    async def get_non_steam_shortcuts(self) -> dict[str, Any]:
+        shortcuts = await asyncio.to_thread(self._read_non_steam_shortcuts)
+        return {"shortcuts": shortcuts}
+
     async def resolve_store_app_names(self, app_ids: list[int]) -> dict[str, str]:
         unique_ids = sorted(
             {
@@ -407,6 +857,211 @@ class Plugin:
         self._tracks[key]["loop"] = bool(loop)
         self._save_tracks()
         return self._tracks
+
+    async def get_music_storage(self) -> dict[str, Any]:
+        """Counts and disk usage for the "Manage music" section."""
+        return await asyncio.to_thread(self._music_storage)
+
+    def _music_storage(self) -> dict[str, Any]:
+        index = self._read_downloads_index()
+        used = self._paths_in_use()
+        summary: dict[str, Any] = {"game_tracks": len(self._game_track_keys())}
+        for prefix in ("downloaded", "unused"):
+            for source in ("auto", "manual"):
+                summary[f"{prefix}_{source}_files"] = 0
+                summary[f"{prefix}_{source}_bytes"] = 0
+        for path in self._downloaded_files():
+            source = self._download_source(path, index)
+            size = self._file_size(path)
+            summary[f"downloaded_{source}_files"] += 1
+            summary[f"downloaded_{source}_bytes"] += size
+            if str(path.resolve()) not in used:
+                summary[f"unused_{source}_files"] += 1
+                summary[f"unused_{source}_bytes"] += size
+        for prefix in ("downloaded", "unused"):
+            summary[f"{prefix}_files"] = summary[f"{prefix}_auto_files"] + summary[f"{prefix}_manual_files"]
+            summary[f"{prefix}_bytes"] = summary[f"{prefix}_auto_bytes"] + summary[f"{prefix}_manual_bytes"]
+        preview_files = (
+            [path for path in self._preview_dir.rglob("*") if path.is_file()]
+            if self._preview_dir.exists()
+            else []
+        )
+        summary["preview_bytes"] = sum(self._file_size(path) for path in preview_files)
+        return summary
+
+    async def remove_all_game_tracks(self, delete_mode: str = "none") -> dict[str, Any]:
+        """Remove the music from every game (global and store tracks are kept).
+
+        delete_mode: "none" keeps all downloaded files, "auto" deletes files picked by
+        bulk/automatic download (hand-picked ones are kept), "all" deletes everything
+        ThemeDeck downloaded. The user's own local music files are never deleted.
+        """
+        removed = 0
+        for key in self._game_track_keys():
+            self._tracks.pop(key, None)
+            removed += 1
+        self._save_tracks()
+        result: dict[str, Any] = {"removed": removed, "deleted_files": 0, "freed_bytes": 0}
+        if delete_mode in ("auto", "all"):
+            result.update(
+                await asyncio.to_thread(
+                    self._delete_downloads,
+                    False,
+                    {"auto"} if delete_mode == "auto" else {"auto", "manual"},
+                )
+            )
+        self._log_info(f"remove_all_game_tracks mode={delete_mode} {result}")
+        return {"result": result, "tracks": self._tracks}
+
+    async def delete_unused_downloads(self, mode: str = "all") -> dict[str, Any]:
+        """Delete downloaded files no game uses any more (assignments are kept).
+
+        mode "auto" only deletes auto-picked files; "all" also hand-picked ones.
+        """
+        sources = {"auto"} if mode == "auto" else {"auto", "manual"}
+        result = await asyncio.to_thread(self._delete_downloads, True, sources)
+        self._log_info(f"delete_unused_downloads mode={mode} {result}")
+        return result
+
+    # --- Downloads index ------------------------------------------------------
+    # downloads/index.json remembers, per downloaded file, which game it was for and
+    # whether it was picked by hand ("manual") or by bulk/automatic download ("auto").
+    # Files downloaded before the index existed have no entry and count as "auto".
+
+    def _downloads_index_path(self) -> Path:
+        return self._downloads_dir / "index.json"
+
+    def _read_downloads_index(self) -> dict[str, dict[str, Any]]:
+        try:
+            data = json.loads(self._downloads_index_path().read_text(encoding="utf-8"))
+            files = data.get("files") if isinstance(data, dict) else None
+            return files if isinstance(files, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as error:
+            self._log_warning(f"failed reading downloads index: {error}")
+            return {}
+
+    def _write_downloads_index(self, files: dict[str, dict[str, Any]]) -> None:
+        try:
+            self._downloads_dir.mkdir(parents=True, exist_ok=True)
+            self._downloads_index_path().write_text(
+                json.dumps({"version": 1, "files": files}, indent=2), encoding="utf-8"
+            )
+        except Exception as error:
+            self._log_warning(f"failed writing downloads index: {error}")
+
+    def _index_key(self, path: Path) -> str | None:
+        try:
+            return str(path.resolve().relative_to(self._downloads_dir.resolve()))
+        except (ValueError, OSError):
+            return None
+
+    def _record_download(
+        self, path: Path, *, app_id: int, youtube_id: str, source: str
+    ) -> None:
+        key = self._index_key(path)
+        if not key:
+            return
+        files = self._read_downloads_index()
+        files[key] = {
+            "app_id": int(app_id),
+            "youtube_id": youtube_id,
+            "title": path.stem,
+            "source": source,
+            "downloaded_at": int(time.time()),
+        }
+        self._write_downloads_index(files)
+
+    def _download_source(self, path: Path, index: dict[str, dict[str, Any]]) -> str:
+        key = self._index_key(path)
+        entry = index.get(key) if key else None
+        source = entry.get("source") if isinstance(entry, dict) else None
+        return "manual" if source == "manual" else "auto"
+
+    def _game_track_keys(self) -> list[str]:
+        return [
+            key
+            for key in self._tracks
+            if key not in (self._global_track_key, self._store_track_key)
+        ]
+
+    def _downloaded_files(self) -> list[Path]:
+        if not self._downloads_dir.exists():
+            return []
+        index_path = self._downloads_index_path()
+        return [
+            path
+            for path in self._downloads_dir.rglob("*")
+            if path.is_file() and path != index_path
+        ]
+
+    def _paths_in_use(self) -> set[str]:
+        used: set[str] = set()
+        for track in self._tracks.values():
+            path = track.get("path") if isinstance(track, dict) else None
+            if path:
+                try:
+                    used.add(str(Path(path).expanduser().resolve()))
+                except Exception:
+                    used.add(str(path))
+        return used
+
+    @staticmethod
+    def _file_size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    def _delete_downloads(self, only_unused: bool, sources: set[str]) -> dict[str, int]:
+        """Delete files inside ThemeDeck's downloads folder whose source is in sources.
+
+        Files still used by a track are always kept. The preview cache is cleared
+        only when removing all music (not only_unused).
+        """
+        downloads_root = self._downloads_dir.resolve()
+        used = self._paths_in_use()
+        index = self._read_downloads_index()
+        deleted = 0
+        freed = 0
+        for path in self._downloaded_files():
+            resolved = path.resolve()
+            # Never touch anything outside ThemeDeck's own downloads folder.
+            if downloads_root not in resolved.parents or str(resolved) in used:
+                continue
+            if self._download_source(path, index) not in sources:
+                continue
+            size = self._file_size(resolved)
+            try:
+                resolved.unlink()
+                deleted += 1
+                freed += size
+                key = self._index_key(path)
+                if key:
+                    index.pop(key, None)
+            except OSError as error:
+                self._log_warning(f"failed deleting {resolved}: {error}")
+        self._write_downloads_index(index)
+        for folder in sorted(
+            (p for p in self._downloads_dir.rglob("*") if p.is_dir()),
+            key=lambda p: len(p.parts),
+            reverse=True,
+        ):
+            try:
+                folder.rmdir()  # only removes empty folders
+            except OSError:
+                pass
+        if not only_unused and self._preview_dir.exists():
+            for path in self._preview_dir.rglob("*"):
+                if path.is_file():
+                    size = self._file_size(path)
+                    try:
+                        path.unlink()
+                        freed += size
+                    except OSError:
+                        pass
+        return {"deleted_files": deleted, "freed_bytes": freed}
 
     async def remove_track(self, app_id: int) -> dict[str, dict[str, Any]]:
         self._tracks.pop(str(app_id), None)
@@ -674,10 +1329,14 @@ class Plugin:
                     "--dump-json",
                     f"ytsearch{safe_limit}:{search_query}",
                 ]
-                result = await self._run_command(command, timeout=90, env=yt_dlp["env"])
+                result = await self._run_with_retries(
+                    command, timeout=90, env=yt_dlp["env"], label=f"search {search_query!r}"
+                )
                 last_stdout = result.stdout or ""
                 if result.returncode != 0:
-                    raise RuntimeError(self._command_error(result, "YouTube search failed"))
+                    raise RuntimeError(
+                        describe_youtube_error(self._command_error(result, "YouTube search failed"))
+                    )
 
                 results = self._parse_youtube_search_json_lines(last_stdout)
                 if results:
@@ -701,6 +1360,247 @@ class Plugin:
             self._log_error(f"search_youtube failed query={query!r}: {error}")
             self._log_error(traceback.format_exc())
             raise
+
+    async def check_new_games(self) -> dict[str, Any]:
+        """Games (and non-Steam shortcuts) installed since the last check.
+
+        Includes owned games that were just installed and games reinstalled later.
+
+        The first call only records the current library (so enabling the feature
+        doesn't download music for every game) and returns nothing.
+        """
+        return await asyncio.to_thread(self._check_new_games)
+
+    def _check_new_games(self) -> dict[str, Any]:
+        games, installed_ids = self._read_steam_library_games()
+        names = {int(game["appid"]): str(game["name"]) for game in games}
+        steam = {
+            app_id: names.get(app_id, f"App {app_id}")
+            for app_id in installed_ids
+            if not is_library_tool(app_id, names.get(app_id, ""))
+        }
+        non_steam = {
+            int(shortcut["appid"]): str(shortcut["name"])
+            for shortcut in self._read_non_steam_shortcuts()
+            if not shortcut["launcher"]
+        }
+
+        # {"steam": [...], "non_steam": [...]}; a missing group (first run, or a file
+        # from before non-Steam support) is only recorded, never reported as new.
+        known_file = self._settings_dir / "known-games.json"
+        known: dict[str, set[int] | None] = {"steam": None, "non_steam": None}
+        try:
+            raw = json.loads(known_file.read_text(encoding="utf-8"))
+            if isinstance(raw, list):  # first version: Steam games only
+                known["steam"] = {int(value) for value in raw}
+            elif isinstance(raw, dict):
+                for group in known:
+                    if isinstance(raw.get(group), list):
+                        known[group] = {int(value) for value in raw[group]}
+        except FileNotFoundError:
+            pass
+        except Exception as error:
+            self._log_warning(f"failed reading {known_file}, starting fresh: {error}")
+
+        current = {"steam": steam, "non_steam": non_steam}
+        new_games: list[dict[str, Any]] = []
+        for group, games_by_id in current.items():
+            seen = known[group]
+            if seen is None:
+                self._log_info(f"new-game check: recorded {len(games_by_id)} {group} games")
+                continue
+            new_games.extend(
+                {"appid": app_id, "name": name}
+                for app_id, name in sorted(games_by_id.items())
+                if app_id not in seen
+            )
+
+        first_run = all(value is None for value in known.values())
+        # Store exactly what's installed now, so an uninstalled game that is installed
+        # again later counts as newly installed.
+        snapshot = {group: sorted(current[group]) for group in current}
+        if any(set(snapshot[group]) != (known[group] or set()) or known[group] is None for group in current):
+            try:
+                known_file.write_text(json.dumps(snapshot), encoding="utf-8")
+            except Exception as error:
+                self._log_warning(f"failed writing {known_file}: {error}")
+        if new_games:
+            self._log_info(
+                "new-game check found: "
+                + ", ".join(f"{game['appid']}:{game['name']!r}" for game in new_games)
+            )
+        return {"first_run": first_run, "games": new_games}
+
+    # --- Reusing kept downloads -------------------------------------------
+
+    @staticmethod
+    def _youtube_id_from_name(name: str) -> str | None:
+        match = re.search(r"\[([A-Za-z0-9_-]{11})\]\.[A-Za-z0-9]+$", name or "")
+        return match.group(1) if match else None
+
+    def _resolved_str(self, path: str | Path) -> str:
+        try:
+            return str(Path(path).expanduser().resolve())
+        except Exception:
+            return str(path)
+
+    def _find_kept_file(self, app_id: int) -> dict[str, Any] | None:
+        """Best kept download for a game: hand-picked first, then the newest."""
+        index = self._read_downloads_index()
+        candidates: list[tuple[int, int, Path, str | None, str]] = []
+        seen: set[str] = set()
+        for key, entry in index.items():
+            if not isinstance(entry, dict) or int(entry.get("app_id") or 0) != int(app_id):
+                continue
+            path = self._downloads_dir / key
+            if not path.is_file():
+                continue
+            seen.add(self._resolved_str(path))
+            youtube_id = entry.get("youtube_id")
+            source = "manual" if entry.get("source") == "manual" else "auto"
+            candidates.append(
+                (1 if source == "manual" else 0, int(entry.get("downloaded_at") or 0), path, youtube_id, source)
+            )
+        # Files downloaded before the index existed: auto-picked, dated by mtime.
+        legacy_dir = self._downloads_dir / str(app_id)
+        if legacy_dir.is_dir():
+            for path in legacy_dir.iterdir():
+                resolved = self._resolved_str(path)
+                if not path.is_file() or resolved in seen:
+                    continue
+                if path.suffix.lower().lstrip(".") not in SUPPORTED_AUDIO_EXTENSIONS:
+                    continue
+                youtube_id = self._youtube_id_from_name(path.name)
+                candidates.append((0, int(path.stat().st_mtime), path, youtube_id, "auto"))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _, _, path, youtube_id, source = candidates[0]
+        return {"path": path, "youtube_id": youtube_id, "source": source}
+
+    async def reattach_kept_track(self, app_id: int) -> dict[str, Any]:
+        """Assign a kept download to a game without music, instead of searching again."""
+        if str(app_id) in self._tracks:
+            return {"path": None, "reason": "has_track"}
+        kept = self._find_kept_file(app_id)
+        if not kept:
+            return {"path": None, "reason": "none_kept"}
+        path: Path = kept["path"]
+        tracks = await self.set_track(app_id, str(path), path.name)
+        if kept["youtube_id"]:
+            self._tracks[str(app_id)]["youtube_id"] = kept["youtube_id"]
+            self._save_tracks()
+        self._log_info(f"reattached kept track app={app_id} file={path} source={kept['source']}")
+        return {"path": str(path), "source": kept["source"], "tracks": tracks}
+
+    async def get_auto_download_excluded(self) -> list[int]:
+        return sorted(self._read_auto_download_excluded())
+
+    async def set_auto_download_excluded(self, app_id: int, excluded: bool) -> list[int]:
+        """Exclude a game from automatic downloads (manual bulk download still works)."""
+        ids = self._read_auto_download_excluded()
+        if excluded:
+            ids.add(int(app_id))
+        else:
+            ids.discard(int(app_id))
+        path = self._settings_dir / "auto-download-excluded.json"
+        path.write_text(json.dumps(sorted(ids)), encoding="utf-8")
+        return sorted(ids)
+
+    def _read_auto_download_excluded(self) -> set[int]:
+        path = self._settings_dir / "auto-download-excluded.json"
+        try:
+            return {int(value) for value in json.loads(path.read_text(encoding="utf-8"))}
+        except FileNotFoundError:
+            return set()
+        except Exception as error:
+            self._log_warning(f"failed reading {path}: {error}")
+            return set()
+
+    async def get_theme_search_name(self, app_id: int, game_name: str) -> dict[str, Any]:
+        """Name to pre-fill the manual YouTube search with."""
+        steam_name = strip_trademark_symbols(game_name)
+        canonical_name = await self._lookup_canonical_name(app_id, steam_name)
+        return {
+            "name": canonical_name or steam_name,
+            "source": "wikidata" if canonical_name else "steam",
+        }
+
+    async def search_youtube_ranked(
+        self, query: str, limit: int, app_id: int, game_name: str
+    ) -> dict[str, Any]:
+        """search_youtube, with results sorted so the likeliest theme comes first."""
+        response = await self.search_youtube(query, limit)
+        results = response.get("results", [])
+        steam_name = strip_trademark_symbols(game_name)
+        names = [steam_name] if steam_name else []
+        canonical_name = await self._lookup_canonical_name(app_id, steam_name)
+        if canonical_name:
+            names.insert(0, canonical_name)
+        if not names:
+            return {"results": results}
+        return {"results": sort_theme_results(results, names)}
+
+    async def _lookup_canonical_name(self, app_id: int, steam_name: str) -> str | None:
+        if not steam_name or not 0 < int(app_id) < 0x80000000:  # skip non-Steam shortcuts
+            return None
+        try:
+            canonical = await asyncio.to_thread(
+                self._resolve_canonical_names, {int(app_id): steam_name}
+            )
+        except Exception as error:
+            self._log_warning(f"canonical name lookup failed app={app_id}: {error}")
+            return None
+        return canonical.get(int(app_id))
+
+    async def find_theme_candidates(self, app_id: int, game_name: str) -> dict[str, Any]:
+        """Smart theme search for one game.
+
+        Returns ranked candidates, or an empty list when nothing scored well enough,
+        in which case the caller falls back to its original search.
+        """
+        steam_name = strip_trademark_symbols(game_name)
+        canonical_name = await self._lookup_canonical_name(app_id, steam_name)
+        query_name = canonical_name or steam_name
+        if not query_name:
+            return {"query_name": "", "source": "none", "candidates": []}
+        names = [name for name in dict.fromkeys([query_name, steam_name]) if name]
+
+        candidates: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for query in build_theme_queries(query_name):
+            try:
+                response = await self.search_youtube(query, THEME_SEARCH_RESULTS_PER_QUERY)
+            except Exception as error:
+                self._log_warning(f"theme search query failed query={query!r}: {error}")
+                continue
+            fresh = [
+                result
+                for result in response.get("results", [])
+                if result.get("id") and result["id"] not in seen_ids
+            ]
+            seen_ids.update(result["id"] for result in fresh)
+            candidates = rank_theme_results(
+                [*candidates, *fresh], names
+            )
+            if candidates and candidates[0]["score"] >= THEME_CONFIDENT_SCORE:
+                break
+
+        candidates = candidates[:THEME_MAX_CANDIDATES]
+        self._log_info(
+            f"theme search app={app_id} steam_name={steam_name!r} query_name={query_name!r} "
+            f"source={'wikidata' if canonical_name else 'steam'} candidates="
+            + ", ".join(
+                f"{c['score']}:{self._trim_message(c['title'], 60)!r}"
+                f"({c.get('duration')}s,{c.get('view_count')}v,{self._trim_message(c.get('uploader') or '', 30)})"
+                for c in candidates
+            )
+        )
+        return {
+            "query_name": query_name,
+            "source": "wikidata" if canonical_name else "steam",
+            "candidates": candidates,
+        }
 
     async def get_youtube_preview_stream(self, video_url: str) -> dict[str, Any]:
         yt_dlp = self._require_yt_dlp_invocation()
@@ -757,10 +1657,18 @@ class Plugin:
         return payload
 
     async def download_youtube_audio(
-        self, app_id: int, video_url: str
+        self, app_id: int, video_url: str, source: str = "manual"
     ) -> dict[str, Any]:
+        """Download a YouTube video's audio and assign it to a game.
+
+        source: "manual" (picked on the game's music page) or "auto" (bulk or
+        automatic download); recorded in the downloads index.
+        """
         if app_id <= 0:
             raise ValueError("Invalid app id")
+        if source == "auto" and str(app_id) in self._tracks:
+            # Picked by hand (or reattached) while this automatic download was queued.
+            return {"skipped": "has_track", "tracks": self._tracks}
 
         yt_dlp = self._require_yt_dlp_invocation()
         normalized_url = self._normalize_youtube_url(video_url)
@@ -792,10 +1700,12 @@ class Plugin:
             "after_move:filepath",
             normalized_url,
         ]
-        result = await self._run_command(command, timeout=900, env=yt_dlp["env"])
+        result = await self._run_with_retries(
+            command, timeout=900, env=yt_dlp["env"], label=f"download app={app_id}"
+        )
         if result.returncode != 0:
             raise RuntimeError(
-                self._command_error(result, "YouTube download failed")
+                describe_youtube_error(self._command_error(result, "YouTube download failed"))
             )
 
         output_lines = [
@@ -807,10 +1717,26 @@ class Plugin:
         if not downloaded_path:
             raise RuntimeError("Download completed but no audio file was found")
 
+        if source == "auto" and str(app_id) in self._tracks:
+            # Music was assigned while downloading: keep it, just record the file.
+            self._record_download(
+                downloaded_path, app_id=app_id, youtube_id=video_id, source="auto"
+            )
+            self._log_info(f"youtube download kept existing track app={app_id}")
+            return {"skipped": "has_track", "tracks": self._tracks}
+
         tracks = await self.set_track(app_id, str(downloaded_path), downloaded_path.name)
         self._tracks[str(app_id)]["youtube_id"] = video_id
         self._save_tracks()
-        self._log_info(f"youtube download assigned app={app_id} file={downloaded_path}")
+        self._record_download(
+            downloaded_path,
+            app_id=app_id,
+            youtube_id=video_id,
+            source="auto" if source == "auto" else "manual",
+        )
+        self._log_info(
+            f"youtube download assigned app={app_id} file={downloaded_path} source={source}"
+        )
         return {
             "tracks": tracks,
             "path": str(downloaded_path),
@@ -1016,6 +1942,42 @@ class Plugin:
         )
         return games, installed_app_ids
 
+    def _read_non_steam_shortcuts(self) -> list[dict[str, Any]]:
+        by_id: dict[int, dict[str, Any]] = {}
+        for steam_root in self._get_steam_roots():
+            userdata = steam_root / "userdata"
+            if not userdata.exists():
+                continue
+            try:
+                shortcut_files = list(userdata.glob("*/config/shortcuts.vdf"))
+            except Exception as error:
+                decky.logger.error(f"Failed listing shortcuts.vdf under {userdata}: {error}")
+                continue
+            for shortcut_file in shortcut_files:
+                try:
+                    entries = extract_non_steam_shortcuts(shortcut_file.read_bytes())
+                except Exception as error:
+                    decky.logger.error(f"Failed reading non-Steam shortcuts {shortcut_file}: {error}")
+                    continue
+                for entry in entries:
+                    app_id = int(entry["appid"])
+                    if app_id <= 0 or app_id in by_id:
+                        continue
+                    name = self._trim_message(entry["name"], 180)
+                    by_id[app_id] = {
+                        "appid": app_id,
+                        "name": name,
+                        "search_name": clean_game_search_name(name),
+                        "launcher": is_launcher_shortcut_name(name),
+                    }
+
+        shortcuts = sorted(by_id.values(), key=lambda item: str(item["name"]).lower())
+        self._log_info(
+            "Non-Steam shortcut scan found "
+            f"shortcuts={len(shortcuts)} launchers={sum(1 for item in shortcuts if item['launcher'])}"
+        )
+        return shortcuts
+
     def _get_steam_roots(self) -> list[Path]:
         candidates = [
             Path.home() / ".local" / "share" / "Steam",
@@ -1130,6 +2092,110 @@ class Plugin:
                         app_ids.add(app_id)
 
         return app_ids
+
+    def _resolve_canonical_names(self, steam_names: dict[int, str]) -> dict[int, str]:
+        """Map Steam app IDs to Wikidata game names, using a persistent cache."""
+        cache_file = self._settings_dir / "wikidata-names.json"
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8"))
+            if not isinstance(cache, dict):
+                cache = {}
+        except Exception:
+            cache = {}
+
+        now = time.time()
+        resolved: dict[int, str] = {}
+        pending: list[int] = []
+        for app_id in steam_names:
+            entry = cache.get(str(app_id))
+            if isinstance(entry, dict) and entry.get("name"):
+                resolved[app_id] = str(entry["name"])
+            elif isinstance(entry, dict) and now - float(entry.get("checked", 0)) < WIKIDATA_MISS_TTL_SECONDS:
+                continue
+            else:
+                pending.append(app_id)
+
+        if pending:
+            for start in range(0, len(pending), WIKIDATA_BATCH_SIZE):
+                batch = pending[start : start + WIKIDATA_BATCH_SIZE]
+                labels_by_id = self._fetch_wikidata_labels(batch)
+                for app_id in batch:
+                    name = pick_wikidata_label(steam_names[app_id], labels_by_id.get(app_id, []))
+                    cache[str(app_id)] = {"name": name, "checked": now}
+                    if name:
+                        resolved[app_id] = name
+            try:
+                cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+            except Exception as error:
+                self._log_warning(f"failed writing {cache_file}: {error}")
+        return resolved
+
+    def _urlopen_with_tls_fallback(self, request: urllib.request.Request, timeout: int) -> bytes:
+        """Fetch a URL, coping with Decky's bundled Python having no CA bundle.
+
+        Tries the default certificates, then the system CA bundle, and only then an
+        unverified connection (as the rest of this plugin does). Only used for public,
+        read-only data such as game names.
+        """
+        contexts: list[tuple[str, ssl.SSLContext | None]] = [("default", None)]
+        for cafile in SYSTEM_CA_BUNDLES:
+            if os.path.isfile(cafile):
+                try:
+                    contexts.append((cafile, ssl.create_default_context(cafile=cafile)))
+                except Exception:
+                    pass
+                break
+        contexts.append(("unverified", ssl._create_unverified_context()))
+
+        last_error: Exception | None = None
+        for label, context in contexts:
+            try:
+                with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+                    return response.read()
+            except (ssl.SSLError, urllib.error.URLError) as error:
+                reason = getattr(error, "reason", error)
+                if not isinstance(reason, ssl.SSLError) and not isinstance(error, ssl.SSLError):
+                    raise
+                last_error = error
+                if label != "unverified":
+                    self._log_info(f"TLS verification with {label} certificates failed: {reason}")
+        assert last_error is not None
+        raise last_error
+
+    def _fetch_wikidata_labels(self, app_ids: list[int]) -> dict[int, list[str]]:
+        values = " ".join(f'"{app_id}"' for app_id in app_ids)
+        # "mul" holds the language-independent name many game items use instead of "en".
+        query = (
+            "SELECT ?appid ?label WHERE { "
+            f"VALUES ?appid {{ {values} }} "
+            "?item wdt:P1733 ?appid. "
+            "OPTIONAL { ?item rdfs:label ?en. FILTER(LANG(?en) = \"en\") } "
+            "OPTIONAL { ?item rdfs:label ?mul. FILTER(LANG(?mul) = \"mul\") } "
+            "BIND(COALESCE(?en, ?mul) AS ?label) "
+            "}"
+        )
+        url = f"{WIKIDATA_SPARQL_URL}?{urllib.parse.urlencode({'query': query, 'format': 'json'})}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": WIKIDATA_USER_AGENT,
+                "Accept": "application/sparql-results+json",
+            },
+        )
+        # Network errors propagate so a failed lookup isn't cached as a miss.
+        raw = self._urlopen_with_tls_fallback(request, timeout=15)
+        payload = json.loads(raw.decode("utf-8", errors="ignore"))
+
+        labels: dict[int, list[str]] = {}
+        for binding in payload.get("results", {}).get("bindings", []):
+            try:
+                app_id = int(binding["appid"]["value"])
+            except (KeyError, ValueError):
+                continue
+            label = binding.get("label", {}).get("value")
+            if label:
+                labels.setdefault(app_id, []).append(label)
+        return labels
 
     def _resolve_store_app_names_chunk(self, app_ids: list[int]) -> dict[str, str]:
         if not app_ids:
@@ -1318,6 +2384,22 @@ class Plugin:
             self._log_info(f"Command completed rc=0: {command_text}")
         return result
 
+    async def _run_with_retries(
+        self, command: list[str], *, timeout: int, env: dict[str, str], label: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a yt-dlp command, retrying errors YouTube usually recovers from."""
+        result = await self._run_command(command, timeout=timeout, env=env)
+        for delay in YOUTUBE_RETRY_DELAYS_SECONDS:
+            if result.returncode == 0:
+                break
+            message = self._command_error(result, "")
+            if not is_retryable_youtube_error(message):
+                break
+            self._log_warning(f"{label} failed ({message}); retrying in {delay}s")
+            await asyncio.sleep(delay)
+            result = await self._run_command(command, timeout=timeout, env=env)
+        return result
+
     def _command_error(
         self, result: subprocess.CompletedProcess[str], fallback: str
     ) -> str:
@@ -1442,6 +2524,12 @@ class Plugin:
             else:
                 webpage_url = f"https://www.youtube.com/watch?v={video_id}"
 
+            view_count: int | None = None
+            try:
+                view_count = int(item["view_count"]) if item.get("view_count") is not None else None
+            except (TypeError, ValueError):
+                view_count = None
+
             seen_ids.add(video_id)
             results.append(
                 {
@@ -1449,6 +2537,7 @@ class Plugin:
                     "title": title,
                     "uploader": uploader,
                     "duration": duration,
+                    "view_count": view_count,
                     "webpage_url": webpage_url,
                 }
             )
