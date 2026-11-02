@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.1.7 - 2026-11-02
+- Adds a disabled-by-default, opt-in background-app music setting below the launch stop timing controls (issue #8).
+- Allows game/global/store music in the full Steam menu while apps run; stops when gameplay regains focus.
+- Preserves default suppression, launch timing, sleep, and Desktop Mode behavior.
+
 ## 3.1.6 - 2026-11-02
 - Integrates DrRedBird's YouTube support work from PR #28 for issues #25 and #27.
 - Installs yt-dlp with recommended dependencies and a checksum-verified managed Deno runtime when needed.

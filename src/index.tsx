@@ -421,6 +421,8 @@ const AMBIENT_INTERRUPTION_MODE_EVENT =
   "themedeck:ambient-interruption-mode-changed";
 const LAUNCH_STOP_MODE_STORAGE_KEY = "themedeck:launchStopMode";
 const LAUNCH_STOP_MODE_EVENT = "themedeck:launch-stop-mode-changed";
+const BACKGROUND_MUSIC_STORAGE_KEY = "themedeck:allowBackgroundMusic";
+const BACKGROUND_MUSIC_EVENT = "themedeck:background-music-changed";
 const NOW_PLAYING_CARD_ENABLED_STORAGE_KEY = "themedeck:nowPlayingCardEnabled";
 const NOW_PLAYING_CARD_ENABLED_EVENT = "themedeck:now-playing-card-enabled-changed";
 const NOW_PLAYING_CARD_ANCHOR_STORAGE_KEY = "themedeck:nowPlayingCardAnchor";
@@ -523,6 +525,11 @@ let runningAppRefreshInFlight = false;
 const runningAppSubscriptions: Array<() => void> = [];
 const launchingAppFirstSeenAtMs = new Map<number, number>();
 let launchStopModeRuntime: LaunchStopMode = "launch_start";
+let backgroundLaunchHold: {appId: number; path: string} | null = null;
+let runningStateInitialized = false;
+let menuContextPoll: number | null = null;
+const menuContextSubscriptions: Array<() => void> = [];
+let lastMenuContextSignature = "";
 let globalAmbientResumeSnapshot: {
   path: string;
   seconds: number;
@@ -571,6 +578,40 @@ const persistPreference = (key: string, event: string, value: boolean) => {
   }
   window.dispatchEvent(new CustomEvent<boolean>(event, { detail: value }));
 };
+
+const readBackgroundMusicSetting = (): boolean =>
+  readPreference(BACKGROUND_MUSIC_STORAGE_KEY, false);
+const persistBackgroundMusicSetting = (value: boolean) =>
+  persistPreference(BACKGROUND_MUSIC_STORAGE_KEY, BACKGROUND_MUSIC_EVENT, value);
+
+// A mounted library route can remain behind a game. Require Steam's full main
+// window AND its foreground app ID; the quick-access/Steam overlay is not enough.
+const readMainMenuContext = () => {
+  try {
+    const steamUI = (window as any).SteamUIStore;
+    const main = steamUI?.GetWindowForRunningAppNavigation?.();
+    const path = main?.LocationPathName;
+    return {
+      visible: steamUI?.MainWindowVisible?.Value === true &&
+        main?.IsMainGamepadUIWindow?.() === true &&
+        typeof path === "string" && !path.startsWith("/apprunning") &&
+        main?.MenuStore?.IsAnySideMenuVisible?.() === false,
+      focusedAppId: Number((window as any).FocusedAppWindowStore?.GetFocusedAppID?.()),
+      path: typeof path === "string" ? path : "",
+    };
+  } catch {
+    return {visible: false, focusedAppId: NaN, path: ""};
+  }
+};
+const isBackgroundMenuPlaybackAllowed = (): boolean => {
+  if (!readBackgroundMusicSetting()) return false;
+  const context = readMainMenuContext();
+  return runningGameAppId !== null &&
+    (launchActivityAppId === null || launchActivityAppId === runningGameAppId) &&
+    context.visible && context.focusedAppId === 769 && !backgroundLaunchHold;
+};
+const shouldBlockRunningPlayback = (): boolean =>
+  runningGameAppId !== null && !isBackgroundMenuPlaybackAllowed();
 
 const readAutoPlaySetting = (): boolean =>
   readPreference(AUTO_PLAY_STORAGE_KEY, true);
@@ -1333,7 +1374,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
   if (inDesktopMode || systemSuspending) {
     return;
   }
-  if (runningGameAppId !== null) {
+  if (shouldBlockRunningPlayback()) {
     return;
   }
 
@@ -1384,7 +1425,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     if (invocationId !== playInvocationCounter) {
       return;
     }
-    if (runningGameAppId !== null) {
+    if (shouldBlockRunningPlayback()) {
       return;
     }
     const sameTrack =
@@ -1437,7 +1478,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
         // no-op
       }
     }
-    if (runningGameAppId !== null) {
+    if (shouldBlockRunningPlayback()) {
       return;
     }
     logClient("info", "play_attempt", {
@@ -1768,6 +1809,9 @@ const wrapUnsubscribe = (token: any): (() => void) | null => {
   if (!token) return null;
   if (typeof token === "function") {
     return token;
+  }
+  if (typeof token.Unsubscribe === "function") {
+    return () => token.Unsubscribe();
   }
   if (typeof token.dispose === "function") {
     return () => token.dispose();
@@ -2212,6 +2256,8 @@ const readRunningGameAppId = async (): Promise<number | null> => {
     (Router as any)?.WindowStore?.m_mapRunningApps,
     (Router as any)?.WindowStore?.m_runningApps,
     (Router as any)?.WindowStore?.runningApps,
+    (window as any).SteamUIStore?.RunningApps,
+    (window as any).SteamUIStore?.MainRunningApp,
     (Router as any)?.MainRunningApp,
     (Router as any)?.RunningApp,
   ].forEach((value) => collectRunningAppStates(value, snapshot, true));
@@ -2293,10 +2339,18 @@ const readRunningGameAppId = async (): Promise<number | null> => {
 const setRunningGameAppId = (next: number | null) => {
   const normalized = next && isEligibleRunningAppId(next) ? next : null;
   if (runningGameAppId === normalized) {
+    runningStateInitialized = true;
     return;
   }
+  if (normalized !== null && runningStateInitialized) {
+    backgroundLaunchHold = {appId: normalized, path: readMainMenuContext().path};
+  } else if (normalized === null) {
+    backgroundLaunchHold = null;
+  }
+  runningStateInitialized = true;
   runningGameAppId = normalized;
-  if (runningGameAppId !== null && playbackState.status === "playing") {
+  refreshMainMenuContext();
+  if (shouldBlockRunningPlayback() && playbackState.status === "playing") {
     if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
       captureGlobalAmbientResumeSnapshot();
     }
@@ -2396,6 +2450,8 @@ const stopRunningGameWatcher = () => {
   }
   runningAppRefreshInFlight = false;
   runningGameAppId = null;
+  runningStateInitialized = false;
+  backgroundLaunchHold = null;
   launchActivityAppId = null;
   launchingAppFirstSeenAtMs.clear();
 };
@@ -3726,7 +3782,7 @@ const refreshStoreContext = async () => {
 };
 
 const resolveAutoTrackFromContext = (): GameTrack | null => {
-  if (runningGameAppId !== null) {
+  if (shouldBlockRunningPlayback()) {
     return null;
   }
 
@@ -3744,7 +3800,7 @@ const resolveAutoTrackFromContext = (): GameTrack | null => {
   }
 
   // Never promote global/store ambient while an app launch/run is in progress.
-  if (launchActivityAppId !== null) {
+  if (launchActivityAppId !== null && !isBackgroundMenuPlaybackAllowed()) {
     return null;
   }
 
@@ -3848,7 +3904,7 @@ const applyAutoPlaybackFromContext = () => {
     return;
   }
 
-  if (runningGameAppId !== null) {
+  if (shouldBlockRunningPlayback()) {
     if (playbackState.status === "playing") {
       if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) {
         captureGlobalAmbientResumeSnapshot();
@@ -3865,6 +3921,7 @@ const applyAutoPlaybackFromContext = () => {
 
   const launchSuppressionActive =
     launchActivityAppId !== null &&
+    !isBackgroundMenuPlaybackAllowed() &&
     (activeDetailRouteAppId === launchActivityAppId ||
       playbackState.appId === launchActivityAppId ||
       runningGameAppId === launchActivityAppId);
@@ -3910,6 +3967,7 @@ const applyAutoPlaybackFromContext = () => {
 
   if (
     launchActivityAppId !== null &&
+    !isBackgroundMenuPlaybackAllowed() &&
     playbackState.reason === "auto" &&
     playbackState.status === "playing" &&
     playbackState.appId === launchActivityAppId &&
@@ -4005,6 +4063,57 @@ const refreshAutoPlaybackTrackCache = async () => {
   } finally {
     autoPlaybackTrackRefreshInFlight = false;
   }
+};
+
+const refreshMainMenuContext = () => {
+  const context = readMainMenuContext();
+  const path = context.path;
+  if (backgroundLaunchHold && (!context.visible || context.focusedAppId !== 769 ||
+      (path && path !== backgroundLaunchHold.path))) {
+    backgroundLaunchHold = null;
+  }
+  const signature = `${context.visible}|${context.focusedAppId}|${!!backgroundLaunchHold}|${readBackgroundMusicSetting()}`;
+  if (signature === lastMenuContextSignature) return;
+  lastMenuContextSignature = signature;
+  logClient("info", "background_music_context", {...context, allowed: isBackgroundMenuPlaybackAllowed(), launchHold: !!backgroundLaunchHold});
+  if (shouldBlockRunningPlayback()) {
+    playInvocationCounter += 1;
+    playInFlightSignature = null;
+    if (playbackState.appId === GLOBAL_AMBIENT_APP_ID) captureGlobalAmbientResumeSnapshot();
+    stopPlayback(false, "background_music_foreground_change");
+  }
+  scheduleAutoPlaybackFromContext();
+};
+const handleBackgroundMusicChanged = () => {
+  // Explicitly enabling the setting is an intentional return to menu playback.
+  backgroundLaunchHold = null;
+  lastMenuContextSignature = "";
+  refreshMainMenuContext();
+};
+const startMainMenuWatcher = () => {
+  if (menuContextPoll !== null) return;
+  const ui = (window as any).SteamClient?.System?.UI;
+  const changed = () => queueMicrotask(refreshMainMenuContext);
+  const registrations = [
+    () => (window as any).SteamUIStore?.MainWindowVisible?.Subscribe?.(changed),
+    () => ui?.RegisterForFocusChangeEvents?.(changed),
+  ];
+  registrations.forEach(register => {
+    try {
+      const clean = wrapUnsubscribe(register());
+      if (clean) menuContextSubscriptions.push(clean);
+    } catch (error) {
+      logClient("warning", "background_music_watcher_failed", {error: toErrorMessage(error)});
+    }
+  });
+  menuContextPoll = window.setInterval(refreshMainMenuContext, 250);
+  refreshMainMenuContext();
+};
+const stopMainMenuWatcher = () => {
+  menuContextSubscriptions.splice(0).forEach(clean => {try {clean();} catch {}});
+  if (menuContextPoll !== null) window.clearInterval(menuContextPoll);
+  menuContextPoll = null;
+  lastMenuContextSignature = "";
 };
 
 const handleLaunchStopModeChanged = () => {
@@ -4156,6 +4265,7 @@ const startAutoPlaybackCoordinator = () => {
   startSystemLifecycleWatcher();
   startDesktopModeWatcher();
   startRunningGameWatcher();
+  startMainMenuWatcher();
   refreshAutoPlaybackTrackCache();
   stopAutoPlaybackSubscription = subscribePlayback(() => {
     scheduleAutoPlaybackFromContext();
@@ -4178,6 +4288,7 @@ const startAutoPlaybackCoordinator = () => {
     scheduleAutoPlaybackFromContext
   );
   window.addEventListener(LAUNCH_STOP_MODE_EVENT, handleLaunchStopModeChanged);
+  window.addEventListener(BACKGROUND_MUSIC_EVENT, handleBackgroundMusicChanged);
   window.addEventListener(MASTER_VOLUME_EVENT, handleMasterVolumeChanged);
   window.addEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
   refreshStoreContext();
@@ -4194,6 +4305,7 @@ const stopAutoPlaybackCoordinator = () => {
   autoPlaybackStarted = false;
   stopSystemLifecycleWatcher();
   stopRunningGameWatcher();
+  stopMainMenuWatcher();
   stopAutoPlaybackSubscription?.();
   stopAutoPlaybackSubscription = null;
   window.removeEventListener(AUTO_PLAY_EVENT, scheduleAutoPlaybackFromContext);
@@ -4217,6 +4329,7 @@ const stopAutoPlaybackCoordinator = () => {
     LAUNCH_STOP_MODE_EVENT,
     handleLaunchStopModeChanged
   );
+  window.removeEventListener(BACKGROUND_MUSIC_EVENT, handleBackgroundMusicChanged);
   window.removeEventListener(MASTER_VOLUME_EVENT, handleMasterVolumeChanged);
   window.removeEventListener(TRACKS_UPDATED_EVENT, refreshAutoPlaybackTrackCache);
   stopDesktopModeWatcher();
@@ -4400,6 +4513,9 @@ const useBooleanPreference = (
 
   return [value, update];
 };
+
+const useBackgroundMusicSetting = (): [boolean, (value: boolean) => void] =>
+  useBooleanPreference(readBackgroundMusicSetting, persistBackgroundMusicSetting, BACKGROUND_MUSIC_EVENT);
 
 const useAutoPlaySetting = (): [boolean, (value: boolean) => void] =>
   useBooleanPreference(
@@ -4623,6 +4739,7 @@ const Content = () => {
   const [ambientInterruptionMode, setAmbientInterruptionMode] =
     useAmbientInterruptionModeSetting();
   const [launchStopMode, setLaunchStopMode] = useLaunchStopModeSetting();
+  const [backgroundMusic, setBackgroundMusic] = useBackgroundMusicSetting();
   const [nowPlayingCardSettings, updateNowPlayingCardSettings] =
     useNowPlayingCardSettings();
   const [ytDlpStatus, setYtDlpStatus] = useState<YtDlpStatus>({
@@ -5884,6 +6001,14 @@ const Content = () => {
                 ))}
               </div>
             </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              checked={backgroundMusic}
+              label="Allow music while games/apps run in the background"
+              description="Resume music when browsing Steam while a game or app is still running. Stops when you return to the game."
+              onChange={setBackgroundMusic}
+            />
           </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField

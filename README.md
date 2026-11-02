@@ -10,7 +10,7 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Install Package
 
-**Latest release: [ThemeDeck v3.1.6](https://github.com/BrenticusMaximus/ThemeDeck/releases/tag/v3.1.6)** — [Download ThemeDeck-v3.1.6.zip](https://github.com/BrenticusMaximus/ThemeDeck/releases/download/v3.1.6/ThemeDeck-v3.1.6.zip).
+**Latest release: [ThemeDeck v3.1.7](https://github.com/BrenticusMaximus/ThemeDeck/releases/tag/v3.1.7)** — [Download ThemeDeck-v3.1.7.zip](https://github.com/BrenticusMaximus/ThemeDeck/releases/download/v3.1.7/ThemeDeck-v3.1.7.zip).
 
 1. Go to https://github.com/BrenticusMaximus/ThemeDeck/releases/ and download the latest ZIP, not the source code.
 
@@ -56,6 +56,13 @@ Firefox cookies are optional and disabled by default. YouTube may block ThemeDec
 - Works with both installed and uninstalled games in your library.
 
 ## Release Updates
+
+## November 2, 2026 Update (v3.1.7)
+
+- Added **Allow music while games/apps run in the background**, directly below **Stop music after pressing Play**. It is **disabled by default** for new and existing installations; enable it only if you want this behavior.
+- When enabled, game themes, global/ambient music, and store music can play while browsing the full Steam menu with an app running in the background. Returning to gameplay stops ThemeDeck music; side overlays and the running-app screen do not restart it.
+- Saves your choice between restarts and preserves the selected launch-stop timing.
+- Tested game-theme and ambient playback, gameplay/menu transitions, quick access, toggle persistence, and launch-start timing directly on a Steam Deck. Existing music and assignments were preserved.
 
 ## November 2, 2026 Update (v3.1.6)
 
@@ -199,3 +206,8 @@ Open **Song storage → Manage downloaded songs and preview cache** in ThemeDeck
 **Unassign music** removes the assignment and keeps the file. For a ThemeDeck download, **Delete downloaded file from disk** also appears on the assignment screen. Confirming it deletes the file and clears all assignments using it. Music outside ThemeDeck's download/cache folders is never deleted by these controls. If files were deleted manually, **Clear missing-file assignments** removes their broken references. Failed automatic playback is not retried continuously; an assignment change or an explicit Play action allows another attempt.
 
 Deletion is paused while ThemeDeck is preparing a preview or downloading audio. Refresh the storage page once the transfer finishes. Preview files can be downloaded again after clearing the cache. This build manages existing storage; bulk song matching and its search duration filter are unchanged.
+
+
+## Background app music (v3.1.7)
+
+Below **Stop music after pressing Play**, enable **Allow music while games/apps run in the background** to hear game-page, global/ambient, or store music while browsing the full Steam menu with an app still running. The setting is off by default and is saved between restarts. Returning to gameplay stops ThemeDeck audio; the running-app screen and side overlays do not start it. Existing launch timing, sleep, and Desktop Mode restrictions still apply.
