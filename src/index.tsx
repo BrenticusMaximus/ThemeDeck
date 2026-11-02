@@ -168,6 +168,12 @@ type YtDlpStatus = {
   path?: string;
   source?: string;
   version?: string;
+  ready?: boolean;
+  deno_installed?: boolean;
+  deno_path?: string;
+  deno_version?: string;
+  cookies_browser?: string;
+  firefox_cookies_enabled?: boolean;
 };
 
 type BulkAssignStatus = {
@@ -380,6 +386,10 @@ const getYouTubePreviewStream = callable<
 >("get_youtube_preview_stream");
 const getYtDlpStatus = callable<[], YtDlpStatus>("get_yt_dlp_status");
 const updateYtDlp = callable<[], YtDlpStatus>("update_yt_dlp");
+const setYouTubeFirefoxCookies = callable<
+  [enabled: boolean],
+  YtDlpStatus
+>("set_youtube_firefox_cookies");
 const playTrackBackend = callable<
   [path: string, volume?: number, loop?: boolean, startOffset?: number],
   { ok: boolean; pid?: number; player?: string }
@@ -4619,6 +4629,7 @@ const Content = () => {
     installed: false,
   });
   const [ytDlpBusy, setYtDlpBusy] = useState(false);
+  const [firefoxCookiesBusy, setFirefoxCookiesBusy] = useState(false);
   const [bulkAssign, setBulkAssign] = useState<BulkAssignStatus>({
     running: false,
     stopRequested: false,
@@ -5075,6 +5086,39 @@ const Content = () => {
     refreshYtDlpStatus();
   }, [refreshYtDlpStatus]);
 
+  const handleFirefoxCookiesChange = async (enabled: boolean) => {
+    if (firefoxCookiesBusy) {
+      return;
+    }
+    const previous = Boolean(ytDlpStatus.firefox_cookies_enabled);
+    setFirefoxCookiesBusy(true);
+    setYtDlpStatus((current) => ({
+      ...current,
+      cookies_browser: enabled ? "firefox" : "",
+      firefox_cookies_enabled: enabled,
+    }));
+    try {
+      const status = await setYouTubeFirefoxCookies(enabled);
+      setYtDlpStatus(status);
+    } catch (error) {
+      console.error("[ThemeDeck] Firefox cookie setting failed", error);
+      setYtDlpStatus((current) => ({
+        ...current,
+        cookies_browser: previous ? "firefox" : "",
+        firefox_cookies_enabled: previous,
+      }));
+      toaster.toast({
+        title: "ThemeDeck",
+        body: `Failed to save Firefox cookie setting: ${getErrorMessage(
+          error,
+          "Unknown settings error"
+        )}`,
+      });
+    } finally {
+      setFirefoxCookiesBusy(false);
+    }
+  };
+
   const handleUpdateYtDlp = async () => {
     if (ytDlpBusy) {
       return;
@@ -5088,7 +5132,7 @@ const Content = () => {
     setYtDlpBusy(true);
     toaster.toast({
       title: "ThemeDeck",
-      body: "Updating yt-dlp. This can take a minute.",
+      body: "Updating YouTube support (yt-dlp and Deno). This can take a minute.",
     });
     try {
       const status = await updateYtDlp();
@@ -5097,10 +5141,14 @@ const Content = () => {
         version: status.version || "",
         source: status.source || "",
         path: status.path || "",
+        denoVersion: status.deno_version || "",
+        denoPath: status.deno_path || "",
       });
       toaster.toast({
         title: "ThemeDeck",
-        body: `yt-dlp ready (${formatYtDlpVersion(status.version) || "latest"})`,
+        body: `YouTube support ready (yt-dlp ${
+          formatYtDlpVersion(status.version) || "latest"
+        }, Deno ${status.deno_version || "ready"})`,
       });
     } catch (error) {
       console.error("[ThemeDeck] update yt-dlp failed", error);
@@ -5109,7 +5157,7 @@ const Content = () => {
       });
       toaster.toast({
         title: "ThemeDeck",
-        body: `Failed to update yt-dlp: ${getErrorMessage(
+        body: `Failed to update YouTube support: ${getErrorMessage(
           error,
           "Unknown update error"
         )}`,
@@ -5137,6 +5185,10 @@ const Content = () => {
       return;
     }
     setBulkAssignMode(mode);
+    if (!ytDlpStatus.ready) {
+      toaster.toast({title: "ThemeDeck", body: "YouTube support is not ready. Use Update YouTube support first."});
+      return;
+    }
     if (!libraryGames.length) {
       toaster.toast({
         title: "ThemeDeck",
@@ -5451,7 +5503,7 @@ const Content = () => {
     libraryGames,
     tracks,
     ytDlpBusy,
-    ytDlpStatus.installed,
+    ytDlpStatus.ready,
     setTracks,
   ]);
 
@@ -6071,6 +6123,14 @@ const Content = () => {
             </button>
           </PanelSectionRow>
           <PanelSectionRow>
+            <ToggleField
+              checked={Boolean(ytDlpStatus.firefox_cookies_enabled)}
+              label="Use Firefox cookies for YouTube"
+              description="Enable only when YouTube asks you to sign in or confirm you are not a bot. Firefox must be signed into YouTube."
+              onChange={handleFirefoxCookiesChange}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
             <div
               style={{
                 width: "100%",
@@ -6081,12 +6141,20 @@ const Content = () => {
               }}
             >
               <div style={{ color: "#ff6b6b", fontWeight: 700, fontSize: "0.86rem" }}>
-                Only update yt-dlp if YouTube search doesn't work.
+                Use this if YouTube search, previews, or downloads stop working.
               </div>
               <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
                 {ytDlpStatus.installed
                   ? `yt-dlp ${formatYtDlpVersion(ytDlpStatus.version) || ""}`.trim()
                   : "yt-dlp not installed"}
+              </div>
+              <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
+                {ytDlpStatus.deno_installed
+                  ? `Deno ${ytDlpStatus.deno_version || "ready"}`
+                  : "Deno not configured"}
+                {` • Firefox cookies ${
+                  ytDlpStatus.firefox_cookies_enabled ? "enabled" : "disabled"
+                }`}
               </div>
               <button
                 className="DialogButton themedeck-fit themedeck-wrap"
@@ -6101,7 +6169,7 @@ const Content = () => {
                   border: "1px solid rgba(255, 107, 107, 0.7)",
                 }}
               >
-                {ytDlpBusy ? "Updating..." : "Update yt-dlp"}
+                {ytDlpBusy ? "Updating..." : "Update YouTube support"}
               </button>
             </div>
           </PanelSectionRow>
@@ -6568,6 +6636,7 @@ const ChangeTheme = () => {
     installed: false,
   });
   const [ytDlpBusy, setYtDlpBusy] = useState(false);
+  const [firefoxCookiesBusy, setFirefoxCookiesBusy] = useState(false);
   const [youtubeQuery, setYoutubeQuery] = useState("");
   const [youtubeLoading, setYoutubeLoading] = useState(false);
   const [youtubeResults, setYoutubeResults] = useState<YouTubeSearchResult[]>([]);
@@ -6681,6 +6750,39 @@ const ChangeTheme = () => {
   useEffect(() => {
     refreshYtDlpStatus(true);
   }, [refreshYtDlpStatus]);
+
+  const handleFirefoxCookiesChange = async (enabled: boolean) => {
+    if (firefoxCookiesBusy) {
+      return;
+    }
+    const previous = Boolean(ytDlpStatus.firefox_cookies_enabled);
+    setFirefoxCookiesBusy(true);
+    setYtDlpStatus((current) => ({
+      ...current,
+      cookies_browser: enabled ? "firefox" : "",
+      firefox_cookies_enabled: enabled,
+    }));
+    try {
+      const status = await setYouTubeFirefoxCookies(enabled);
+      setYtDlpStatus(status);
+    } catch (error) {
+      console.error("[ThemeDeck] Firefox cookie setting failed", error);
+      setYtDlpStatus((current) => ({
+        ...current,
+        cookies_browser: previous ? "firefox" : "",
+        firefox_cookies_enabled: previous,
+      }));
+      toaster.toast({
+        title: "ThemeDeck",
+        body: `Failed to save Firefox cookie setting: ${getErrorMessage(
+          error,
+          "Unknown settings error"
+        )}`,
+      });
+    } finally {
+      setFirefoxCookiesBusy(false);
+    }
+  };
 
   const refreshDirectory = useCallback(
     async (nextDir?: string) => {
@@ -7250,11 +7352,19 @@ const ChangeTheme = () => {
                   {ytDlpStatus.path}
                 </div>
               ) : null}
+              <div style={{ fontSize: "0.82rem", opacity: 0.8 }}>
+                {ytDlpStatus.deno_installed
+                  ? `Deno ${ytDlpStatus.deno_version || "ready"}`
+                  : "Deno not configured"}
+                {` • Firefox cookies ${
+                  ytDlpStatus.firefox_cookies_enabled ? "enabled" : "disabled"
+                }`}
+              </div>
               <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
                 Search YouTube for game music, download audio locally, and assign it to
-                this game.
+                this game. Enable Firefox cookies below if YouTube asks you to sign in.
               </div>
-              {!ytDlpStatus.installed ? (
+              {!ytDlpStatus.ready ? (
 	                  <ControllerButton
 	                    onCancel={navigateBack}
 	                  onClick={async () => {
@@ -7271,7 +7381,7 @@ const ChangeTheme = () => {
 	                    setYtDlpBusy(true);
 	                    toaster.toast({
 	                      title: "ThemeDeck",
-	                      body: "Installing/updating yt-dlp. This can take a minute.",
+	                      body: "Installing/updating yt-dlp and Deno. This can take a minute.",
 	                    });
 	                    try {
 	                      const status = await updateYtDlp();
@@ -7281,10 +7391,14 @@ const ChangeTheme = () => {
 	                        version: status.version || "",
 	                        source: status.source || "",
 	                        path: status.path || "",
+	                        denoVersion: status.deno_version || "",
+	                        denoPath: status.deno_path || "",
 	                      });
 	                      toaster.toast({
 	                        title: "ThemeDeck",
-	                        body: `yt-dlp ready (${formatYtDlpVersion(status.version) || "latest"})`,
+	                        body: `YouTube support ready (yt-dlp ${
+	                          formatYtDlpVersion(status.version) || "latest"
+	                        }, Deno ${status.deno_version || "ready"})`,
 	                      });
 	                    } catch (error) {
 	                      logClient("error", "yt_dlp_install_failed", {
@@ -7293,7 +7407,7 @@ const ChangeTheme = () => {
 	                      });
 	                      toaster.toast({
 	                        title: "ThemeDeck",
-                        body: `Failed to install yt-dlp: ${getErrorMessage(
+                        body: `Failed to install YouTube support: ${getErrorMessage(
                           error,
                           "Unknown update error"
                         )}`,
@@ -7306,10 +7420,22 @@ const ChangeTheme = () => {
                   disabled={ytDlpBusy}
                   style={{ width: "fit-content" }}
                 >
-                  {ytDlpBusy ? "Installing..." : "Install yt-dlp"}
+                  {ytDlpBusy
+                    ? "Installing..."
+                    : ytDlpStatus.installed
+                      ? "Set up YouTube support"
+                      : "Install YouTube support"}
                 </ControllerButton>
               ) : null}
             </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              checked={Boolean(ytDlpStatus.firefox_cookies_enabled)}
+              label="Use Firefox cookies for YouTube"
+              description="Firefox must be installed and signed into YouTube. Leave this disabled unless YouTube requires authentication."
+              onChange={handleFirefoxCookiesChange}
+            />
           </PanelSectionRow>
           <PanelSectionRow>
             <div

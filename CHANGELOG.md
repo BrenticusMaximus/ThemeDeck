@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.1.6 - 2026-11-02
+- Integrates DrRedBird's YouTube support work from PR #28 for issues #25 and #27.
+- Installs yt-dlp with recommended dependencies and a checksum-verified managed Deno runtime when needed.
+- Adds optional Firefox cookies, disabled by default, with persistent settings and explicit downloader arguments.
+- Shows yt-dlp/Deno readiness and actionable sign-in/challenge/403 error guidance.
+- Preserves verified fallback selection, OS-update runtime repair, native M4A audio, and song storage management.
+
 ## 3.1.5 - 2026-11-02
 - Adds song storage management with usage totals, largest-file listing, download/preview/unused filters, and permanent deletion.
 - Adds explicit downloaded-file deletion beside game/global/store assignments; clarifies that Unassign music keeps the file.

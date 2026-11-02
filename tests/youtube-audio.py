@@ -21,6 +21,10 @@ async def check():
         plugin._debug_log_file = Path(directory) / 'debug.log'
         invocation = {'command': ['yt-dlp'], 'env': None, 'source': 'test', 'path': 'yt-dlp'}
         commands = []
+        plugin._deno_path.parent.mkdir(parents=True)
+        plugin._deno_path.write_text('#!/bin/sh\necho deno 2.9.8\n')
+        plugin._deno_path.chmod(0o755)
+        plugin._use_firefox_cookies = True
         async def run(command, **kwargs):
             commands.append(command)
             assert '--extract-audio' not in command
@@ -28,6 +32,8 @@ async def check():
             assert command[command.index('--format') + 1] == 'bestaudio[ext=m4a]'
             assert command[command.index('--fixup') + 1] == 'never'
             assert '--ignore-config' in command
+            assert command[command.index('--cookies-from-browser') + 1] == 'firefox'
+            assert command[command.index('--js-runtimes') + 1] == f'deno:{plugin._deno_path}'
             output = Path(command[command.index('--paths') + 1]) / 'audio.m4a'
             output.write_bytes(b'native audio payload')
             return subprocess.CompletedProcess(command, 0, str(output) + '\n', '')

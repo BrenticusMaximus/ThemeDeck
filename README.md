@@ -10,7 +10,7 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Install Package
 
-**Latest release: [ThemeDeck v3.1.5](https://github.com/BrenticusMaximus/ThemeDeck/releases/tag/v3.1.5)** — [Download ThemeDeck-v3.1.5.zip](https://github.com/BrenticusMaximus/ThemeDeck/releases/download/v3.1.5/ThemeDeck-v3.1.5.zip).
+**Latest release: [ThemeDeck v3.1.6](https://github.com/BrenticusMaximus/ThemeDeck/releases/tag/v3.1.6)** — [Download ThemeDeck-v3.1.6.zip](https://github.com/BrenticusMaximus/ThemeDeck/releases/download/v3.1.6/ThemeDeck-v3.1.6.zip).
 
 1. Go to https://github.com/BrenticusMaximus/ThemeDeck/releases/ and download the latest ZIP, not the source code.
 
@@ -19,6 +19,12 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 3. On steam deck, go to decky settings, general, enable developer mode.
 
 4. On steam deck, go to decky settings, developer, 'install plugin from zip file', and find the zip from step 2. 
+
+## YouTube setup
+
+Use **Install YouTube support** (or **Update YouTube support**) inside ThemeDeck. ThemeDeck installs `yt-dlp` with its recommended dependencies and installs a private Deno runtime when a supported Deno executable is not already available.
+
+Firefox cookies are optional and disabled by default. YouTube may block ThemeDeck previews and downloads with sign-in or bot-verification checks. Firefox cookies can resolve this issue. Sign in to YouTube in Firefox on your Steam Deck, then enable **Use Firefox cookies for YouTube** in ThemeDeck. ThemeDeck passes this option directly to yt-dlp and does not modify your global yt-dlp configuration file.
 
 ![ThemeDeck June 29 2026 update thumbnail](https://images.steamusercontent.com/ugc/10246844756434218824/5BE3695A090A9AD263F22EE5F73C7CDA3B84CEB0/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
@@ -50,6 +56,14 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 - Works with both installed and uninstalled games in your library.
 
 ## Release Updates
+
+## November 2, 2026 Update (v3.1.6)
+
+- Integrated [DrRedBird's YouTube support fixes](https://github.com/BrenticusMaximus/ThemeDeck/pull/28) for sign-in and JavaScript challenge failures reported in issues #25 and #27.
+- **Update YouTube support** now installs the recommended downloader dependencies and sets up Deno when needed. Run this after upgrading to complete setup on an existing installation.
+- Added optional **Use Firefox cookies for YouTube**, disabled by default. Enable only if YouTube requests verification, after signing into YouTube in Firefox on the same device.
+- Added downloader/Deno readiness information and clearer guidance for 403, sign-in, and challenge errors. YouTube may still require verification or reject particular videos.
+- Keeps direct M4A downloads and all v3.1.5 song storage features.
 
 ## November 2, 2026 Update (v3.1.5)
 

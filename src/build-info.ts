@@ -1,2 +1,2 @@
-export const BUILD_LABEL = "ThemeDeck v3.1.5 — song storage (test build)";
-export const BUILD_ID = "3.1.5-song-storage-test";
+export const BUILD_LABEL = "ThemeDeck Build 2026-11-02 11:10:26 EST";
+export const BUILD_ID = "2026-11-02-111026-EST";
