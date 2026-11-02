@@ -1,0 +1,53 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createRequire } from 'node:module';
+const dir = mkdtempSync(join(tmpdir(), 'themedeck-shelves-'));
+try {
+  execFileSync(process.execPath, ['node_modules/typescript/bin/tsc', 'src/deck-shelves.ts', '--target', 'ES2020', '--module', 'commonjs', '--strict', '--outDir', dir]);
+  const { startDeckShelvesIntegration, updateShelfAssignments } = createRequire(import.meta.url)(join(dir, 'deck-shelves.js'));
+  globalThis.window = new EventTarget();
+  const sources = new Map(), filters = new Map(), sorts = new Map(), refreshed = [];
+  const registry = map => descriptor => { map.set(descriptor.id, descriptor); return () => map.delete(descriptor.id); };
+  const api = { version: 4, registerShelfSource: registry(sources), registerFilterType: registry(filters), registerSortOption: registry(sorts), getShelves: () => [{ id: 'regular' }], getSmartShelves: () => [{ id: 'smart' }], refreshShelf: id => refreshed.push(id) };
+  let tracks = { '10': { path: 'a', assigned_at: 100 }, '20': { path: 'b', assigned_at: 200 }, '30': { path: 'c' }, '__global__': { path: 'g' }, '__store__': { path: 's' } };
+  const host = { register(integration) { integration.onMount(api); return integration.onUnmount; } };
+  const fetchTracks = async () => tracks;
+  const fetchLibrary = async () => ({ games: [10,20,30,40,40].map(appid => ({ appid })) });
+  // ThemeDeck loads first, then DS appears.
+  const off = startDeckShelvesIntegration(fetchTracks, fetchLibrary);
+  assert.equal(sources.size, 0);
+  window.deckShelves = host;
+  window.appStore = { m_mapAppOverview: new Map([[50, { appid: 50, app_type: 1 }], [60, { appid: 60, app_type: 1073741824 }], [70, { appid: 70, app_type: 32 }]]) };
+  window.dispatchEvent(new Event('deck-shelves:ready'));
+  window.dispatchEvent(new Event('deck-shelves:ready'));
+  assert.equal(sources.size, 3);
+  assert.deepEqual(await sources.get('themedeck.with-music').resolve(10), [10,20,30]);
+  assert.deepEqual(await sources.get('themedeck.without-music').resolve(10), [40,50,60]);
+  assert.deepEqual(await sources.get('themedeck.recent-music').resolve(2), [20,10]);
+  assert.deepEqual(sorts.get('themedeck.recent-music').sort([40,30,10,20]), [20,10,30,40]);
+  assert.equal(filters.get('themedeck.has-music').evaluate({ appid: 10 }), true);
+  assert.equal(filters.get('themedeck.no-music').evaluate({ appid: 40 }), true);
+  await new Promise(r => setTimeout(r, 300));
+  refreshed.length = 0;
+  tracks = { '10': { path: 'a', assigned_at: 300 } };
+  updateShelfAssignments(tracks);
+  await new Promise(r => setTimeout(r, 300));
+  assert.deepEqual(refreshed, ['regular','smart']);
+  assert.equal(filters.get('themedeck.no-music').evaluate({ appid: 20 }), true);
+  window.dispatchEvent(new Event('deck-shelves:teardown'));
+  assert.equal(sources.size, 0);
+  window.dispatchEvent(new Event('deck-shelves:ready'));
+  assert.equal(sources.size, 3);
+  off();
+  assert.equal(sources.size + filters.size + sorts.size, 0);
+  // DS already loaded; unload also removes ready listeners.
+  const off2 = startDeckShelvesIntegration(fetchTracks, fetchLibrary);
+  assert.equal(sources.size, 3);
+  off2();
+  window.dispatchEvent(new Event('deck-shelves:ready'));
+  assert.equal(sources.size, 0);
+  console.log('Deck Shelves integration checks passed');
+} finally { rmSync(dir, { recursive: true, force: true }); }

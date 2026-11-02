@@ -1,2 +1,2 @@
-export const BUILD_LABEL = "ThemeDeck Build 2026-09-06 11:44:23 EDT";
-export const BUILD_ID = "2026-09-06-114423-EDT";
+export const BUILD_LABEL = "ThemeDeck v3.1.4";
+export const BUILD_ID = "3.1.4-native-m4a-audio";

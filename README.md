@@ -49,6 +49,14 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Release Updates
 
+## November 1, 2026 Update (v3.1.4)
+
+- Fixed YouTube previews and downloads failing with “ffprobe and ffmpeg not found.” New YouTube audio downloads use M4A directly, without converting to MP3 or requiring FFmpeg/FFprobe. Existing MP3 tracks continue to work.
+- Added downloader runtime checks, fallback selection, and automatic repair when no working downloader is available.
+- Preview and download errors remain visible on the page, and preview failures include full debug-log tracebacks.
+- Includes optional Deck Shelves integration for games with music, games without music, and recently assigned music, plus assignment-date recording and recovery. See the integration details below.
+
+
 ## September 6, 2026 Update (v3.0.2)
 
 - Improved sleep/wake behavior for global ambient music.
@@ -149,3 +157,13 @@ This update includes UI and playback behavior improvements:
 - Kept support for manually assigning local music tracks.
 
 <a href='https://ko-fi.com/U6U516PSAI' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
+## Deck Shelves integration (v3.1.0)
+
+With Deck Shelves installed, ThemeDeck automatically registers three external shelf sources: **ThemeDeck: Games with music**, **ThemeDeck: Games without music**, and **ThemeDeck: Recently assigned music**. Select one in the Deck Shelves shelf editor. Music means a per-game ThemeDeck assignment; global/store tracks do not count. The without-music source combines ThemeDeck’s Steam library discovery with Steam’s live game and non-Steam shortcut list.
+
+For combinations such as installed games with music, use the **Has music assigned** or **Has no music assigned** filters with the other Deck Shelves criteria. Choose **Most recently assigned music** to sort by assignment date. New and replaced assignments record their date; older YouTube assignments use estimated file-creation dates when available, and undated assignments appear after dated ones, and games without music appear last. Shelves refresh when assignments change. ThemeDeck also works without Deck Shelves.
+
+### Assignment date recovery (v3.1.1)
+
+ThemeDeck keeps recorded assignment dates first. On startup, older YouTube assignments without a date can recover an estimated date from the assigned audio file’s creation time (including Linux filesystems exposing birth time through GNU stat). Recovered dates are saved with `assigned_at_estimated: true` and `assigned_at_source: "file_creation"`. Missing files, filesystems without creation times, and ordinary local-file assignments remain undated. Modified times and inode change times are never used. Copying or restoring a download may change its creation date, so these dates are estimates. Replacing the track records a fresh, exact assignment date.

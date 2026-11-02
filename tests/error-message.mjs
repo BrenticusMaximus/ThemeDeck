@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import ts from 'typescript';
+const source = fs.readFileSync(new URL('../src/error-message.ts', import.meta.url), 'utf8');
+const compiled = ts.transpileModule(source, {compilerOptions: {module: ts.ModuleKind.ESNext}}).outputText;
+const {getErrorMessage} = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+assert.equal(getErrorMessage({name: 'Python Exception', python_message: 'ffmpeg not found'}, 'unknown'), 'ffmpeg not found');
+assert.equal(getErrorMessage(new Error('disk full'), 'unknown'), 'disk full');
+assert.equal(getErrorMessage(new Error(JSON.stringify({name: 'Python Exception', python_message: 'HTTP Error 403'})), 'unknown'), 'HTTP Error 403');
+assert.equal(getErrorMessage({error: {python_message: 'permission denied'}}, 'unknown'), 'permission denied');
+assert.equal(getErrorMessage({python_traceback: 'Traceback:\n  line\nRuntimeError: failed\n'}, 'unknown'), 'RuntimeError: failed');
+const circular = {}; circular.cause = circular;
+assert.equal(getErrorMessage(circular, 'unknown'), 'unknown');
+console.log('Python exception display checks passed');

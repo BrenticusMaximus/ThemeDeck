@@ -4,10 +4,12 @@ import asyncio
 import base64
 import html as html_lib
 import json
+import math
 import os
 import re
 import shutil
 import ssl
+import sys
 import subprocess
 import tempfile
 import threading
@@ -40,6 +42,7 @@ def clamp_seconds(value: float, minimum: float = 0.0, maximum: float = 30.0) -> 
 
 class Plugin:
     def __init__(self) -> None:
+        self._yt_dlp_repair_lock = asyncio.Lock()
         self._tracks: dict[str, dict[str, Any]] = {}
         self._global_track_key = "__global__"
         self._store_track_key = "__store__"
@@ -337,6 +340,7 @@ class Plugin:
                 raise PermissionError(f"Permission denied: {resolved}") from error
             self._tracks[key] = {
                 "app_id": app_id,
+                "assigned_at": time.time(),
                 "path": str(resolved),
                 "filename": filename,
                 "volume": self._tracks.get(key, {}).get("volume", 1.0),
@@ -561,7 +565,7 @@ class Plugin:
         }
 
     async def get_yt_dlp_status(self) -> dict[str, Any]:
-        invocation = self._resolve_yt_dlp_invocation()
+        invocation = await self._working_yt_dlp_invocation()
         installed = bool(invocation)
         status: dict[str, Any] = {
             "installed": installed,
@@ -654,7 +658,7 @@ class Plugin:
             if not cleaned_query:
                 raise ValueError("Search query is required")
 
-            yt_dlp = self._require_yt_dlp_invocation()
+            yt_dlp = await self._require_yt_dlp_invocation()
             safe_limit = max(1, min(int(limit), 25))
 
             search_queries = self._youtube_search_candidates(cleaned_query)
@@ -703,7 +707,14 @@ class Plugin:
             raise
 
     async def get_youtube_preview_stream(self, video_url: str) -> dict[str, Any]:
-        yt_dlp = self._require_yt_dlp_invocation()
+        try:
+            return await self._prepare_youtube_preview(video_url)
+        except Exception:
+            self._log_error(f"YouTube preview failed:\n{traceback.format_exc()}")
+            raise
+
+    async def _prepare_youtube_preview(self, video_url: str) -> dict[str, Any]:
+        yt_dlp = await self._require_yt_dlp_invocation()
         normalized_url = self._normalize_youtube_url(video_url)
         video_id = self._extract_youtube_video_id(normalized_url)
         preview_key = re.sub(r"[^A-Za-z0-9_-]+", "_", video_id or "preview")[:80]
@@ -723,11 +734,13 @@ class Plugin:
             "--no-warnings",
             "--no-check-certificate",
             "--no-playlist",
-            "--extract-audio",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "5",
+            # YouTube supplies browser-playable AAC/M4A directly. Avoid the
+            # MP3 postprocessor, which needs system ffmpeg/ffprobe after OS updates.
+            "--ignore-config",
+            "--format",
+            "bestaudio[ext=m4a]",
+            "--fixup",
+            "never",
             "--restrict-filenames",
             "--force-overwrites",
             "--paths",
@@ -762,7 +775,7 @@ class Plugin:
         if app_id <= 0:
             raise ValueError("Invalid app id")
 
-        yt_dlp = self._require_yt_dlp_invocation()
+        yt_dlp = await self._require_yt_dlp_invocation()
         normalized_url = self._normalize_youtube_url(video_url)
         video_id = self._extract_youtube_video_id(normalized_url)
         app_download_dir = self._downloads_dir / str(app_id)
@@ -777,11 +790,13 @@ class Plugin:
             "--no-warnings",
             "--no-check-certificate",
             "--no-playlist",
-            "--extract-audio",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "0",
+            # YouTube supplies browser-playable AAC/M4A directly. Avoid the
+            # MP3 postprocessor, which needs system ffmpeg/ffprobe after OS updates.
+            "--ignore-config",
+            "--format",
+            "bestaudio[ext=m4a]",
+            "--fixup",
+            "never",
             "--restrict-filenames",
             "--force-overwrites",
             "--paths",
@@ -817,6 +832,53 @@ class Plugin:
             "filename": downloaded_path.name,
         }
 
+    @staticmethod
+    def _file_creation_timestamp(path: Path) -> float | None:
+        """Read birth time; never substitute modified/change times for creation."""
+        try:
+            info = path.stat()
+            if not path.is_file():
+                return None
+            created = getattr(info, "st_birthtime", None)
+            if created is None and sys.platform.startswith("linux"):
+                # Python's Linux stat omits birth time; GNU stat reads it via statx.
+                result = subprocess.run(
+                    ["stat", "--format=%W", "--", str(path)],
+                    capture_output=True, text=True, timeout=2, check=False,
+                )
+                if result.returncode == 0:
+                    created = float(result.stdout.strip())
+            if isinstance(created, (int, float)) and math.isfinite(created) and created > 0:
+                return float(created)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        return None
+
+    def _recover_assignment_date(self, key: str, track: dict[str, Any]) -> bool:
+        saved = track.get("assigned_at")
+        if isinstance(saved, (int, float)) and math.isfinite(saved) and saved > 0:
+            return False
+        if not key.isdigit() or int(key) <= 0 or not track.get("path"):
+            return False
+        path = Path(track["path"]).expanduser()
+        try:
+            # Older downloads may lack youtube_id, but their per-game download
+            # directory still identifies them as ThemeDeck downloads.
+            downloaded = path.resolve().is_relative_to(
+                (self._downloads_dir / key).resolve()
+            )
+        except (OSError, ValueError):
+            downloaded = False
+        if not track.get("youtube_id") and not downloaded:
+            return False
+        created = self._file_creation_timestamp(path)
+        if created is None:
+            return False
+        track["assigned_at"] = created
+        track["assigned_at_estimated"] = True
+        track["assigned_at_source"] = "file_creation"
+        return True
+
     def _load_tracks(self) -> None:
         if not self._tracks_file.exists():
             self._tracks = {}
@@ -829,6 +891,8 @@ class Plugin:
             for key, track in list(self._tracks.items()):
                 if not isinstance(track, dict):
                     continue
+                if self._recover_assignment_date(key, track):
+                    changed = True
                 if "loop" not in track:
                     track["loop"] = True
                     changed = True
@@ -1232,8 +1296,11 @@ class Plugin:
             return None
         return cleaned
 
-    def _resolve_yt_dlp_invocation(self) -> dict[str, Any] | None:
-        if self._yt_venv_yt_dlp.exists() and os.access(self._yt_venv_yt_dlp, os.X_OK):
+    def _resolve_yt_dlp_invocation(
+        self, excluded: set[str] | None = None
+    ) -> dict[str, Any] | None:
+        excluded = excluded or set()
+        if str(self._yt_venv_yt_dlp) not in excluded and self._yt_venv_yt_dlp.exists() and os.access(self._yt_venv_yt_dlp, os.X_OK):
             return {
                 "command": [str(self._yt_venv_yt_dlp)],
                 "env": None,
@@ -1242,7 +1309,7 @@ class Plugin:
             }
 
         system_yt_dlp = shutil.which("yt-dlp")
-        if system_yt_dlp:
+        if system_yt_dlp and system_yt_dlp not in excluded:
             return {
                 "command": [system_yt_dlp],
                 "env": None,
@@ -1251,7 +1318,7 @@ class Plugin:
             }
 
         user_yt_dlp = Path.home() / ".local" / "bin" / "yt-dlp"
-        if user_yt_dlp.exists() and os.access(user_yt_dlp, os.X_OK):
+        if str(user_yt_dlp) not in excluded and user_yt_dlp.exists() and os.access(user_yt_dlp, os.X_OK):
             return {
                 "command": [str(user_yt_dlp)],
                 "env": None,
@@ -1259,7 +1326,7 @@ class Plugin:
                 "path": str(user_yt_dlp),
             }
 
-        if self._yt_dlp_path.exists() and os.access(self._yt_dlp_path, os.X_OK):
+        if str(self._yt_dlp_path) not in excluded and self._yt_dlp_path.exists() and os.access(self._yt_dlp_path, os.X_OK):
             return {
                 "command": [str(self._yt_dlp_path)],
                 "env": None,
@@ -1269,17 +1336,41 @@ class Plugin:
 
         return None
 
-    def _require_yt_dlp_invocation(self) -> dict[str, Any]:
-        invocation = self._resolve_yt_dlp_invocation()
+    async def _working_yt_dlp_invocation(self) -> dict[str, Any] | None:
+        # Executable permission does not prove that a script's Python still works.
+        excluded: set[str] = set()
+        while invocation := self._resolve_yt_dlp_invocation(excluded):
+            if await self._get_yt_dlp_version(invocation):
+                return invocation
+            excluded.add(invocation["path"])
+            self._log_warning(f"Skipping broken yt-dlp: {invocation['path']}")
+        return None
+
+    async def _require_yt_dlp_invocation(self) -> dict[str, Any]:
+        invocation = await self._working_yt_dlp_invocation()
+        if invocation:
+            return invocation
+        # Concurrent previews/downloads share one repair attempt.
+        async with self._yt_dlp_repair_lock:
+            invocation = await self._working_yt_dlp_invocation()
+            if not invocation:
+                self._log_warning("Repairing unavailable yt-dlp runtime")
+                await self.update_yt_dlp()
+                invocation = await self._working_yt_dlp_invocation()
         if not invocation:
             raise RuntimeError(
-                "yt-dlp is not available. Use the ThemeDeck install/update button."
+                "ThemeDeck could not repair its YouTube downloader. "
+                "Use Update yt-dlp and check themedeck-debug.log for details."
             )
         return invocation
 
     async def _get_yt_dlp_version(self, invocation: dict[str, Any]) -> str | None:
         command = [*invocation["command"], "--version"]
-        result = await self._run_command(command, timeout=20, env=invocation["env"])
+        try:
+            result = await self._run_command(command, timeout=20, env=invocation["env"])
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self._log_warning(f"yt-dlp runtime check failed: {error}")
+            return None
         if result.returncode != 0:
             return None
         version = (result.stdout or "").strip()
@@ -1643,8 +1734,17 @@ class Plugin:
             return "python3 not found"
 
         self._yt_venv_dir.parent.mkdir(parents=True, exist_ok=True)
+        create_command = [python3, "-m", "venv"]
+        if self._yt_venv_dir.exists():
+            healthy = await self._get_yt_dlp_version({
+                "command": [str(self._yt_venv_yt_dlp)], "env": None,
+            })
+            if not healthy:
+                # A Python minor-version upgrade leaves old site-packages behind.
+                # Only recreate the dedicated runtime; music/settings live elsewhere.
+                create_command.append("--clear")
         create_venv_result = await self._run_command(
-            [python3, "-m", "venv", str(self._yt_venv_dir)],
+            [*create_command, str(self._yt_venv_dir)],
             timeout=180,
         )
         if create_venv_result.returncode != 0:

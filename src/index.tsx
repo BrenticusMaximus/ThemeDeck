@@ -51,9 +51,12 @@ import {
   FaPlay,
   FaTrash,
 } from "react-icons/fa";
+import { startDeckShelvesIntegration, updateShelfAssignments } from "./deck-shelves";
 import { BUILD_ID, BUILD_LABEL } from "./build-info";
+import { getErrorMessage } from "./error-message";
 
 type BackendTrack = {
+  assigned_at?: number;
   app_id?: number;
   path: string;
   filename?: string;
@@ -3241,30 +3244,6 @@ const MarqueeText = ({ text }: { text: string }) => {
 const clamp = (value: number, min = 0, max = 1) =>
   Math.min(max, Math.max(min, value));
 
-const getErrorMessage = (error: unknown, fallback: string) => {
-  if (error instanceof Error && error.message) return error.message;
-  if (typeof error === "string" && error.trim()) return error;
-  if (error && typeof error === "object") {
-    const candidate = error as Record<string, unknown>;
-    const nested =
-      candidate.message ??
-      candidate.error ??
-      (candidate.cause as Record<string, unknown> | undefined)?.message ??
-      (candidate.details as Record<string, unknown> | undefined)?.message;
-    if (typeof nested === "string" && nested.trim()) {
-      return nested;
-    }
-    try {
-      const serialized = JSON.stringify(error);
-      if (serialized && serialized !== "{}") {
-        return serialized;
-      }
-    } catch (_ignored) {
-      // no-op
-    }
-  }
-  return fallback;
-};
 
 const formatDuration = (seconds?: number | null) => {
   if (!seconds || seconds <= 0) {
@@ -3405,6 +3384,7 @@ const normalizeGlobalTrack = (
 
 const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
   const normalized: TrackMap = {};
+  if (raw) updateShelfAssignments(raw);
   if (!raw) {
     return normalized;
   }
@@ -5149,13 +5129,6 @@ const Content = () => {
       return;
     }
     setBulkAssignMode(mode);
-    if (!ytDlpStatus.installed) {
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "yt-dlp is not installed yet.",
-      });
-      return;
-    }
     if (!libraryGames.length) {
       toaster.toast({
         title: "ThemeDeck",
@@ -6770,13 +6743,6 @@ const ChangeTheme = () => {
   };
 
   const handleYouTubeSearch = async (overrideQuery?: string) => {
-    if (!ytDlpStatus.installed) {
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "yt-dlp is not installed yet. Press Install yt-dlp first.",
-      });
-      return;
-    }
     const query = (overrideQuery ?? youtubeQuery).trim();
     if (!query) {
       toaster.toast({
@@ -6827,6 +6793,7 @@ const ChangeTheme = () => {
       return;
     }
     setPreviewLoadingVideoId(result.id);
+    setYoutubeError("");
     try {
       const response = await getYouTubePreviewStream(result.webpage_url);
       let previewUrl = (response?.stream_url || "").trim();
@@ -6864,6 +6831,8 @@ const ChangeTheme = () => {
       setPreviewingVideoId(result.id);
     } catch (error) {
       const message = getErrorMessage(error, "Preview failed");
+      setYoutubeError(`Preview failed: ${message}`);
+      console.error("[ThemeDeck] youtube preview failed", error);
       toaster.toast({
         title: "ThemeDeck",
         body: `Preview failed: ${message}`,
@@ -6878,6 +6847,7 @@ const ChangeTheme = () => {
   const handleYouTubeDownload = async (result: YouTubeSearchResult) => {
     if (!appId) return;
     setDownloadingVideoId(result.id);
+    setYoutubeError("");
     try {
       const response = await downloadYouTubeAudio(appId, result.webpage_url);
       const normalized = normalizeTracks(response?.tracks);
@@ -6890,6 +6860,7 @@ const ChangeTheme = () => {
     } catch (error) {
       console.error("[ThemeDeck] youtube download failed", error);
       const message = getErrorMessage(error, "Unknown download error");
+      setYoutubeError(`Download failed: ${message}`);
       toaster.toast({
         title: "ThemeDeck",
         body: `YouTube download failed: ${message}`,
@@ -8282,6 +8253,7 @@ const ChangeStoreTheme = () => {
 };
 
 export default definePlugin(() => {
+  const stopDeckShelves = startDeckShelvesIntegration(fetchTracks, getSteamLibraryGames);
   startLocationWatcher();
   startSteamAppWatchers();
   startAutoPlaybackCoordinator();
@@ -8319,6 +8291,7 @@ export default definePlugin(() => {
     icon: <FaMusic />,
     content: <Content />,
     onDismount() {
+      stopDeckShelves();
       stopLocationWatcher();
       stopSteamAppWatchers();
       stopAutoPlaybackCoordinator();

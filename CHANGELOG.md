@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.1.4 - 2026-11-01
+- Fixes YouTube previews and downloads when FFmpeg or FFprobe is missing by downloading M4A audio directly instead of converting to MP3.
+- Preserves existing MP3 tracks and music assignments.
+- Verifies downloader runtimes, skips broken installations, and attempts repair when no working runtime is available.
+- Displays preview and download errors on the page and records full preview tracebacks in the debug log.
+- Includes the Deck Shelves integration and assignment-date improvements described below.
+
+## 3.1.1 - 2026-10-08
+- Recovers estimated assignment dates for older YouTube downloads from audio-file creation times when available.
+- Preserves recorded assignment dates and marks recovered dates as estimated.
+- Leaves local files and downloads without a readable creation date undated; never uses modified/change times.
+
+## 3.1.0 - 2026-10-08
+- Adds optional Deck Shelves sources for games with music, without music, and recently assigned music.
+- Adds music assignment filters and a most-recently-assigned sort.
+- Refreshes shelves after assignments change and supports either plugin load order.
+- Records assignment dates for new/replaced tracks; older assignments retain unknown dates.
+
 ## 3.0.2 - 2026-09-06
 - Stops and releases browser audio and visualizer resources before system sleep.
 - Rebuilds playback state after wake and resumes eligible global ambient music.
