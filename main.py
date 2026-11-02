@@ -42,6 +42,7 @@ def clamp_seconds(value: float, minimum: float = 0.0, maximum: float = 30.0) -> 
 
 class Plugin:
     def __init__(self) -> None:
+        self._storage_lock = asyncio.Lock()
         self._yt_dlp_repair_lock = asyncio.Lock()
         self._tracks: dict[str, dict[str, Any]] = {}
         self._global_track_key = "__global__"
@@ -417,6 +418,144 @@ class Plugin:
         self._save_tracks()
         return self._tracks
 
+    def _storage_path(self, file_id: str) -> Path:
+        """Accept only relative IDs under our own non-symlink storage trees."""
+        relative = Path(file_id)
+        if relative.is_absolute() or ".." in relative.parts or len(relative.parts) < 2:
+            raise ValueError("Invalid storage file")
+        root = {"downloads": self._downloads_dir, "previews": self._preview_dir}.get(relative.parts[0])
+        if root is None or root.is_symlink():
+            raise ValueError("Only ThemeDeck downloads and previews can be deleted")
+        candidate = root
+        for part in relative.parts[1:]:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise ValueError("Symbolic links cannot be managed")
+        if not candidate.resolve().is_relative_to(root.resolve()):
+            raise ValueError("File is outside ThemeDeck storage")
+        return candidate
+
+    def _storage_references(self, path: Path) -> list[str]:
+        resolved = path.resolve()
+        return [key for key, track in self._tracks.items()
+                if track.get("path") and Path(track["path"]).expanduser().resolve() == resolved]
+
+    async def get_song_storage(self) -> dict[str, Any]:
+        files: list[dict[str, Any]] = []
+        references: dict[Path, list[str]] = {}
+        missing: list[str] = []
+        for key, track in self._tracks.items():
+            if track.get("path"):
+                path = Path(track["path"]).expanduser().resolve()
+                references.setdefault(path, []).append(key)
+                if not path.is_file():
+                    missing.append(key)
+        for category, root in (("downloads", self._downloads_dir), ("previews", self._preview_dir)):
+            if not root.exists() or root.is_symlink():
+                continue
+            for directory, dirs, names in os.walk(root, followlinks=False):
+                dirs[:] = [name for name in dirs if not (Path(directory) / name).is_symlink()]
+                for name in names:
+                    path = Path(directory) / name
+                    file_id = str(Path(category) / path.relative_to(root))
+                    try:
+                        self._storage_path(file_id)
+                        if not path.is_file():
+                            continue
+                        size = path.stat().st_size
+                        refs = references.get(path.resolve(), [])
+                    except (OSError, ValueError):
+                        continue
+                    files.append({"id": file_id, "name": name, "path": str(path),
+                                  "category": category, "bytes": size, "assignments": refs})
+        files.sort(key=lambda item: (-item["bytes"], item["id"]))
+        return {"files": files, "total_bytes": sum(item["bytes"] for item in files),
+                "download_bytes": sum(item["bytes"] for item in files if item["category"] == "downloads"),
+                "preview_bytes": sum(item["bytes"] for item in files if item["category"] == "previews"),
+                "unused_bytes": sum(item["bytes"] for item in files if not item["assignments"]),
+                "missing_assignments": missing, "busy": self._storage_lock.locked()}
+
+    def _delete_storage_file(
+        self, file_id: str, remove_assignments: bool, known_refs: list[str] | None = None
+    ) -> int:
+        path = self._storage_path(file_id)
+        refs = self._storage_references(path) if known_refs is None else known_refs
+        if refs and not remove_assignments:
+            raise ValueError("This file is assigned. Confirm removal of its assignments first.")
+        if path.exists() and not path.is_file():
+            raise ValueError("Select a file, not a folder")
+        size = path.stat().st_size if path.exists() else 0
+        previous = self._tracks.copy()
+        for key in refs:
+            self._tracks.pop(key)
+        # Save before deleting; restore assignments if saving/deleting fails.
+        try:
+            if refs:
+                self._save_tracks()
+            path.unlink(missing_ok=True)
+        except Exception:
+            self._tracks = previous
+            if refs:
+                self._save_tracks()
+            raise
+        parent = path.parent
+        root = self._downloads_dir if file_id.startswith("downloads/") else self._preview_dir
+        while parent != root and parent.is_relative_to(root):
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+        return size
+
+    async def delete_song_storage(
+        self, file_id: str, remove_assignments: bool = False,
+        expected_assignments: list[str] | None = None,
+    ) -> dict[str, Any]:
+        if self._storage_lock.locked():
+            raise RuntimeError("A preview or download is in progress. Wait for it to finish before deleting files.")
+        async with self._storage_lock:
+            if expected_assignments is not None:
+                actual = self._storage_references(self._storage_path(file_id))
+                if set(actual) != set(expected_assignments):
+                    raise ValueError("This file's assignments changed. Refresh storage and review them before deleting.")
+            freed = self._delete_storage_file(file_id, remove_assignments)
+        return {"freed_bytes": freed, "storage": await self.get_song_storage()}
+
+    async def clean_song_storage(self, category: str) -> dict[str, Any]:
+        if category not in {"previews", "unused"}:
+            raise ValueError("Invalid cleanup category")
+        if self._storage_lock.locked():
+            raise RuntimeError("A preview or download is in progress. Wait for it to finish before cleaning storage.")
+        freed = 0
+        deleted = 0
+        errors: list[str] = []
+        async with self._storage_lock:
+            storage = await self.get_song_storage()
+            for item in storage["files"]:
+                if item["assignments"] or (category == "previews" and item["category"] != "previews"):
+                    continue
+                try:
+                    freed += self._delete_storage_file(item["id"], False, [])
+                    deleted += 1
+                except (OSError, ValueError) as error:
+                    errors.append(f"{item['name']}: {error}")
+        return {"freed_bytes": freed, "deleted": deleted, "errors": errors,
+                "storage": await self.get_song_storage()}
+
+    async def clear_missing_song_assignments(self) -> dict[str, Any]:
+        # Clears broken references only; never deletes files, including local music.
+        missing = (await self.get_song_storage())["missing_assignments"]
+        previous = self._tracks.copy()
+        for key in missing:
+            self._tracks.pop(key, None)
+        try:
+            self._save_tracks()
+        except Exception:
+            self._tracks = previous
+            raise
+        return await self.get_song_storage()
+
     async def get_track(self, app_id: int) -> dict[str, Any] | None:
         return self._tracks.get(str(app_id))
 
@@ -708,7 +847,8 @@ class Plugin:
 
     async def get_youtube_preview_stream(self, video_url: str) -> dict[str, Any]:
         try:
-            return await self._prepare_youtube_preview(video_url)
+            async with self._storage_lock:
+                return await self._prepare_youtube_preview(video_url)
         except Exception:
             self._log_error(f"YouTube preview failed:\n{traceback.format_exc()}")
             raise
@@ -770,6 +910,12 @@ class Plugin:
         return payload
 
     async def download_youtube_audio(
+        self, app_id: int, video_url: str
+    ) -> dict[str, Any]:
+        async with self._storage_lock:
+            return await self._download_youtube_audio(app_id, video_url)
+
+    async def _download_youtube_audio(
         self, app_id: int, video_url: str
     ) -> dict[str, Any]:
         if app_id <= 0:
@@ -986,11 +1132,20 @@ class Plugin:
                 self._playback_player = None
 
     def _save_tracks(self) -> None:
+        # Storage deletion must not proceed after a silent/partial settings write.
+        descriptor, temp_name = tempfile.mkstemp(prefix="tracks-", suffix=".tmp", dir=self._tracks_file.parent)
         try:
-            with self._tracks_file.open("w", encoding="utf-8") as handle:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(self._tracks, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self._tracks_file)
         except Exception as error:
             decky.logger.error(f"Failed to save tracks.json: {error}")
+            raise
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
 
     def _write_debug_log(self, level: str, message: str) -> None:
         try:

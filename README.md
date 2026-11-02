@@ -10,6 +10,8 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Install Package
 
+**Latest release: [ThemeDeck v3.1.5](https://github.com/BrenticusMaximus/ThemeDeck/releases/tag/v3.1.5)** — [Download ThemeDeck-v3.1.5.zip](https://github.com/BrenticusMaximus/ThemeDeck/releases/download/v3.1.5/ThemeDeck-v3.1.5.zip).
+
 1. Go to https://github.com/BrenticusMaximus/ThemeDeck/releases/ and download the latest ZIP, not the source code.
 
 2. Put it anywhere on your steam deck where you'll be able to find it later.
@@ -48,6 +50,14 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 - Works with both installed and uninstalled games in your library.
 
 ## Release Updates
+
+## November 2, 2026 Update (v3.1.5)
+
+- Added **Song storage** to manage downloaded songs and cached previews, see space usage, and find the largest files.
+- Added **Delete from disk** with confirmation, plus cleanup of unused files and cached previews. Deleting an assigned file also clears its affected music assignments.
+- Renamed the old removal action to **Unassign music** to make clear that it keeps the audio file. Permanent deletion is now a separate action on game, global, and store music pages.
+- Added cleanup of missing-file assignments and stopped repeated automatic playback errors for inaccessible files.
+- Tested installation and storage deletion on a Steam Deck; existing music and assignments were preserved.
 
 ## November 1, 2026 Update (v3.1.4)
 
@@ -167,3 +177,11 @@ For combinations such as installed games with music, use the **Has music assigne
 ### Assignment date recovery (v3.1.1)
 
 ThemeDeck keeps recorded assignment dates first. On startup, older YouTube assignments without a date can recover an estimated date from the assigned audio file’s creation time (including Linux filesystems exposing birth time through GNU stat). Recovered dates are saved with `assigned_at_estimated: true` and `assigned_at_source: "file_creation"`. Missing files, filesystems without creation times, and ordinary local-file assignments remain undated. Modified times and inode change times are never used. Copying or restoring a download may change its creation date, so these dates are estimates. Replacing the track records a fresh, exact assignment date.
+
+## Song storage management (v3.1.5)
+
+Open **Song storage → Manage downloaded songs and preview cache** in ThemeDeck. The page shows total download/cache usage and files sorted largest first. Filter by downloads, previews, or unused files. Use **Delete from disk** for an individual file, **Clear cached previews**, or **Delete all unused files**. Permanent deletion requires confirmation; assigned files show every affected game/global/store assignment. Cleanup keeps files that are still assigned.
+
+**Unassign music** removes the assignment and keeps the file. For a ThemeDeck download, **Delete downloaded file from disk** also appears on the assignment screen. Confirming it deletes the file and clears all assignments using it. Music outside ThemeDeck's download/cache folders is never deleted by these controls. If files were deleted manually, **Clear missing-file assignments** removes their broken references. Failed automatic playback is not retried continuously; an assignment change or an explicit Play action allows another attempt.
+
+Deletion is paused while ThemeDeck is preparing a preview or downloading audio. Refresh the storage page once the transfer finishes. Preview files can be downloaded again after clearing the cache. This build manages existing storage; bulk song matching and its search duration filter are unchanged.

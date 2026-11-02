@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.1.5 - 2026-11-02
+- Adds song storage management with usage totals, largest-file listing, download/preview/unused filters, and permanent deletion.
+- Adds explicit downloaded-file deletion beside game/global/store assignments; clarifies that Unassign music keeps the file.
+- Adds cleanup of unused files, cached previews, and missing-file assignments.
+- Protects shared assignments, local music outside managed folders, active downloads, and symlink paths during deletion.
+- Prevents repeated automatic playback errors for inaccessible files until assignments change or the user retries manually.
+- Saves assignments atomically and propagates save failures before deleting files.
+
 ## 3.1.4 - 2026-11-01
 - Fixes YouTube previews and downloads when FFmpeg or FFprobe is missing by downloading M4A audio directly instead of converting to MP3.
 - Preserves existing MP3 tracks and music assignments.

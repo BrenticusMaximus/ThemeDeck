@@ -54,6 +54,7 @@ import {
 import { startDeckShelvesIntegration, updateShelfAssignments } from "./deck-shelves";
 import { BUILD_ID, BUILD_LABEL } from "./build-info";
 import { getErrorMessage } from "./error-message";
+import { SongStorage, DeleteAssignedSong } from "./song-storage";
 
 type BackendTrack = {
   assigned_at?: number;
@@ -1304,7 +1305,12 @@ const isIgnorablePlaybackError = (error: unknown): boolean => {
   );
 };
 
+// Do not repeatedly retry an inaccessible file on every autoplay poll.
+// Assignment changes or an explicit Play action allow another attempt.
+const failedAutoPlaybackPaths = new Set<string>();
 const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
+  if (reason === "auto" && failedAutoPlaybackPaths.has(track.path)) return;
+  if (reason === "manual") failedAutoPlaybackPaths.delete(track.path);
   if (systemSuspending) {
     return;
   }
@@ -1519,6 +1525,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       title: "ThemeDeck",
       body: `Can't play ${track.filename}: ${message}`,
     });
+    failedAutoPlaybackPaths.add(track.path);
     stopPlayback(false, "play_failed_exception");
   } finally {
     if (
@@ -3961,6 +3968,7 @@ const scheduleAutoPlaybackFromContext = () => {
 };
 
 const refreshAutoPlaybackTrackCache = async () => {
+  failedAutoPlaybackPaths.clear();
   if (autoPlaybackTrackRefreshInFlight) {
     return;
   }
@@ -6099,6 +6107,11 @@ const Content = () => {
           </PanelSectionRow>
         </PanelSection>
       </div>
+      <PanelSection title="Song storage">
+        <PanelSectionRow><ControllerButton onClick={() => Navigation.Navigate("/themedeck/storage")}>
+          Manage downloaded songs and preview cache
+        </ControllerButton></PanelSectionRow>
+      </PanelSection>
       <PanelSection title="Auto-assign missing game tracks (yt-dlp)">
         <PanelSectionRow>
           <div style={{ width: "100%" }}>
@@ -6892,11 +6905,16 @@ const ChangeTheme = () => {
     if (!appId) return;
     try {
       await deleteTrack(appId);
+      delete latestTracksForAutoPlay[appId];
+      if (playbackState.appId === appId) {
+        ++playInvocationCounter;
+        stopPlayback(false, "unassign_game_track");
+      }
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
       setTrack(null);
       toaster.toast({
         title: "ThemeDeck",
-        body: `Cleared music for ${getDisplayName(appId)}`,
+        body: `Unassigned music for ${getDisplayName(appId)}. File kept; use Manage storage to delete downloads.`,
       });
     } catch (error) {
       console.error("[ThemeDeck] route remove failed", error);
@@ -7157,9 +7175,12 @@ const ChangeTheme = () => {
                     onClick={handleRemove}
                     style={{ minWidth: "9rem", whiteSpace: "nowrap" }}
                   >
-                    Remove music
+                    Unassign music
                   </ControllerButton>
                 ) : null}
+                <ControllerButton onCancel={navigateBack} onClick={() => Navigation.Navigate("/themedeck/storage")}>
+                  Delete downloads / manage storage…
+                </ControllerButton>
                 <ControllerButton
                   onCancel={navigateBack}
                   onClick={navigateBack}
@@ -7170,6 +7191,7 @@ const ChangeTheme = () => {
               </div>
             </div>
           </PanelSectionRow>
+          {track && <PanelSectionRow><DeleteAssignedSong assignment={String(appId)} path={track.path} Button={ControllerButton} onDeleted={() => { setTrack(null); handleSongStorageChanged(); }} /></PanelSectionRow>}
           {track ? (
             <PanelSectionRow>
               <Focusable style={{ width: "100%" }}>
@@ -7871,7 +7893,7 @@ const ChangeGlobalTheme = () => {
                   onClick={handleRemove}
                   style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
                 >
-                  Remove music
+                  Unassign music
                 </button>
               ) : null}
               <button
@@ -7885,6 +7907,12 @@ const ChangeGlobalTheme = () => {
           </PanelSectionRow>
         </PanelSection>
 
+        {track && <PanelSection title="Delete downloaded song"><PanelSectionRow><DeleteAssignedSong assignment="__global__" path={track.path} Button={ControllerButton} onDeleted={() => { setTrack(null); handleSongStorageChanged(); }} /></PanelSectionRow></PanelSection>}
+        <PanelSection title="Song storage">
+          <PanelSectionRow><ControllerButton onCancel={() => Navigation.NavigateBack()} onClick={() => Navigation.Navigate("/themedeck/storage")}>
+            Delete downloads / manage storage…
+          </ControllerButton></PanelSectionRow>
+        </PanelSection>
         <PanelSection title="Browse local files to assign from system storage">
           <PanelSectionRow>
             <div
@@ -8142,7 +8170,7 @@ const ChangeStoreTheme = () => {
                   onClick={handleRemove}
                   style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
                 >
-                  Remove music
+                  Unassign music
                 </button>
               ) : null}
               <button
@@ -8156,6 +8184,12 @@ const ChangeStoreTheme = () => {
           </PanelSectionRow>
         </PanelSection>
 
+        {track && <PanelSection title="Delete downloaded song"><PanelSectionRow><DeleteAssignedSong assignment="__store__" path={track.path} Button={ControllerButton} onDeleted={() => { setTrack(null); handleSongStorageChanged(); }} /></PanelSectionRow></PanelSection>}
+        <PanelSection title="Song storage">
+          <PanelSectionRow><ControllerButton onCancel={() => Navigation.NavigateBack()} onClick={() => Navigation.Navigate("/themedeck/storage")}>
+            Delete downloads / manage storage…
+          </ControllerButton></PanelSectionRow>
+        </PanelSection>
         <PanelSection title="Browse local files to assign from system storage">
           <PanelSectionRow>
             <div
@@ -8252,6 +8286,17 @@ const ChangeStoreTheme = () => {
   );
 };
 
+const handleSongStorageChanged = () => {
+  // Drop stale references before stopPlayback schedules another autoplay pass.
+  latestTracksForAutoPlay = {};
+  latestGlobalTrackForAutoPlay = null;
+  latestStoreTrackForAutoPlay = null;
+  ++playInvocationCounter;
+  stopPlayback(false, "storage_changed");
+  clearAudioCache();
+  window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+};
+
 export default definePlugin(() => {
   const stopDeckShelves = startDeckShelvesIntegration(fetchTracks, getSteamLibraryGames);
   startLocationWatcher();
@@ -8262,6 +8307,11 @@ export default definePlugin(() => {
   );
   const contextMenuUnpatch = patchContextMenuFocus();
   const showContextMenuUnpatch = patchShowContextMenu();
+  routerHook.addRoute(
+    "/themedeck/storage",
+    () => <SongStorage Button={ControllerButton} onChanged={handleSongStorageChanged} />,
+    { exact: true }
+  );
   routerHook.addRoute(
     "/themedeck/global",
     () => <ChangeGlobalTheme />,
@@ -8318,6 +8368,7 @@ export default definePlugin(() => {
       }
       try {
         routerHook.removeRoute("/themedeck/store");
+        routerHook.removeRoute("/themedeck/storage");
       } catch (error) {
         console.error("[ThemeDeck] remove store route failed", error);
       }
