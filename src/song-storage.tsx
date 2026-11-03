@@ -1,4 +1,4 @@
-import { ComponentType, useEffect, useRef, useState } from "react";
+import { ComponentType, Fragment, useEffect, useRef, useState } from "react";
 import { Navigation, PanelSection, PanelSectionRow, ScrollPanel, Spinner } from "@decky/ui";
 import { callable } from "@decky/api";
 import { getErrorMessage } from "./error-message";
@@ -19,7 +19,10 @@ export const storageSize = (bytes: number): string => {
 const assignmentLabel = (key: string) => key === "__global__" ? "Global ambient" : key === "__store__" ? "Store" : `Game ${key}`;
 type Action = { file?: FileEntry; category?: string; missing?: boolean; description: string };
 
-export const SongStorage = ({ Button, onChanged }: { Button: ComponentType<any>; onChanged: () => void }) => {
+const CompactStorageSection = ({title, children}: any) => <div style={{marginBottom: 10}}><div style={{fontSize: 14, fontWeight: 700, marginBottom: 6}}>{title}</div>{children}</div>;
+const CompactStorageRow = ({children}: any) => <div style={{marginBottom: 6}}>{children}</div>;
+
+export const SongStorage = ({ Button, onChanged, embedded = false, onClose }: { Button: ComponentType<any>; onChanged: () => void; embedded?: boolean; onClose?: () => void }) => {
   const [storage, setStorage] = useState<Storage | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -30,7 +33,7 @@ export const SongStorage = ({ Button, onChanged }: { Button: ComponentType<any>;
   const actionInFlight = useRef(false);
   const confirmationRef = useRef<HTMLDivElement>(null);
   const refreshRef = useRef<HTMLDivElement>(null);
-  const back = () => Navigation.NavigateBack();
+  const back = () => embedded ? onClose?.() : Navigation.NavigateBack();
   const focusButton = (element: HTMLDivElement | null) => {
     const button = element?.querySelector<HTMLElement>("button, [role='button']");
     button?.focus();
@@ -66,44 +69,48 @@ export const SongStorage = ({ Button, onChanged }: { Button: ComponentType<any>;
   };
   const locked = busy || storage?.busy || !!pending;
   const entries = storage?.files.filter((file) => filter === "all" || (filter === "unused" ? !file.assignments.length : file.category === filter)) || [];
-  return <ScrollPanel><div style={{ padding: "48px 24px 140px", overflowWrap: "anywhere" }}>
-    <PanelSection title="Song storage">
-      <PanelSectionRow><div>
-        <p>Manage songs downloaded by ThemeDeck and cached YouTube previews. Your own music outside these folders is not listed or deleted.</p>
-        <p><strong>Unassign music</strong> keeps the file. <strong>Delete from disk</strong> permanently deletes it and clears every assignment that uses it.</p>
+  const Container = embedded ? Fragment : ScrollPanel;
+  const Section = embedded ? CompactStorageSection : PanelSection;
+  const Row = embedded ? CompactStorageRow : PanelSectionRow;
+  return <Container><div data-themedeck-storage={embedded ? "inline" : "page"} style={{ padding: embedded ? 12 : "48px 24px 140px", marginTop: embedded ? 8 : 0, borderRadius: 6, background: embedded ? "rgba(255,255,255,.04)" : undefined, fontSize: embedded ? 12 : undefined, overflowWrap: "anywhere" }}>
+    <Section title="Song storage">
+      <Row><div>
+        {!embedded && <p>Manage songs downloaded by ThemeDeck and cached YouTube previews. Your own music outside these folders is not listed or deleted.</p>}
+        <p style={{margin: "4px 0"}}>Deleting a file permanently removes it and clears all its assignments. Your own music outside ThemeDeck folders is excluded.</p>
         {storage && <p>Total: <strong>{storageSize(storage.total_bytes)}</strong> · Downloads: {storageSize(storage.download_bytes)} · Previews: {storageSize(storage.preview_bytes)} · Unused: {storageSize(storage.unused_bytes)}</p>}
         {storage?.busy && <p>A preview or download is in progress. Deletion is paused; refresh after it finishes.</p>}
         {error && <p role="alert" style={{ color: "#ffb4b4", whiteSpace: "pre-wrap" }}>{error}</p>}
         {notice && <p role="status">{notice}</p>}
-      </div></PanelSectionRow>
-      <PanelSectionRow><div ref={refreshRef} style={{ display: "flex", flexDirection: "column", gap: 8, width: "100%" }}>
+      </div></Row>
+      <Row><div ref={refreshRef} style={{ display: "flex", flexDirection: embedded ? "row" : "column", flexWrap: "wrap", gap: 6, width: "100%" }}>
         <Button disabled={busy || !!pending} onClick={refresh} onCancel={back}>Refresh storage</Button>
         <Button disabled={!!locked || !storage?.files.some((file) => file.category === "previews" && !file.assignments.length)} onClick={() => setPending({ category: "previews", description: "Delete all unused cached previews? Assigned files will be kept. You can download previews again." })} onCancel={back}>Clear cached previews</Button>
         <Button disabled={!!locked || !storage?.files.some((file) => !file.assignments.length)} onClick={() => setPending({ category: "unused", description: "Permanently delete all unassigned ThemeDeck downloads and previews? Assigned songs and your own local music will be kept." })} onCancel={back}>Delete all unused files</Button>
         {!!storage?.missing_assignments.length && <Button disabled={!!locked} onClick={() => setPending({ missing: true, description: `Clear ${storage.missing_assignments.length} assignments whose files are missing? This removes broken references without deleting any files.` })} onCancel={back}>Clear missing-file assignments ({storage.missing_assignments.length})</Button>}
-        <Button disabled={busy} onClick={back} onCancel={back}>Back</Button>
-      </div></PanelSectionRow>
-      {pending && <PanelSectionRow><div ref={confirmationRef} style={{ width: "100%" }}>
+        {!embedded && <Button disabled={busy} onClick={back} onCancel={back}>Back</Button>}
+      </div></Row>
+      {pending && <Row><div ref={confirmationRef} style={{ width: "100%" }}>
         <p role="alert">{pending.description}</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", flexDirection: embedded ? "row" : "column", flexWrap: "wrap", gap: 6 }}>
           <Button disabled={busy} onClick={() => { setPending(null); window.setTimeout(() => focusButton(refreshRef.current), 0); }} onCancel={() => setPending(null)}>Cancel</Button>
           <Button disabled={busy} onClick={confirm} onCancel={() => setPending(null)}>{busy ? "Working…" : pending.missing ? "Confirm clear assignments" : "Confirm permanent deletion"}</Button>
         </div>
-      </div></PanelSectionRow>}
-    </PanelSection>
-    <PanelSection title="Files — largest first">
-      <PanelSectionRow><div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+      </div></Row>}
+    </Section>
+    <Section title="Files — largest first">
+      <Row><div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
         {[["all", "All"], ["downloads", "Downloads"], ["previews", "Previews"], ["unused", "Unused"]].map(([value, label]) => <Button key={value} disabled={busy || !!pending} onClick={() => { setFilter(value); setVisibleCount(30); }} onCancel={back}>{filter === value ? "✓ " : ""}{label}</Button>)}
-      </div></PanelSectionRow>
-      {busy && !storage ? <Spinner /> : entries.length === 0 ? <PanelSectionRow>No files in this category.</PanelSectionRow> : entries.slice(0, visibleCount).map((file) => <PanelSectionRow key={file.id}><div style={{ width: "100%", borderBottom: "1px solid #ffffff22", paddingBottom: 12 }}>
+      </div></Row>
+      <div style={embedded ? {maxHeight: 240, overflowY: "auto"} : undefined}>{busy && !storage ? <Spinner /> : entries.length === 0 ? <Row>No files in this category.</Row> : entries.slice(0, visibleCount).map((file) => <Row key={file.id}><div style={{ width: "100%", borderBottom: "1px solid #ffffff22", paddingBottom: embedded ? 6 : 12 }}>
         <div style={{ fontWeight: 600 }}>{file.name}</div>
         <div>{storageSize(file.bytes)} · {file.category === "previews" ? "Preview cache" : "Download"}</div>
         <div>{file.assignments.length ? `Assigned to: ${file.assignments.map(assignmentLabel).join(", ")}` : "Unused — no assignments"}</div>
-        <Button style={{ marginTop: 8, width: "100%" }} disabled={!!locked} onClick={() => setPending({ file, description: `Permanently delete “${file.name}” (${storageSize(file.bytes)})? ${file.assignments.length ? `This will also clear: ${file.assignments.map(assignmentLabel).join(", ")}.` : "This file has no assignments."}` })} onCancel={back}>Delete from disk…</Button>
-      </div></PanelSectionRow>)}
-      {entries.length > visibleCount && <PanelSectionRow><Button disabled={!!locked} onClick={() => setVisibleCount((count) => count + 30)} onCancel={back}>Show more files ({entries.length - visibleCount} remaining)</Button></PanelSectionRow>}
-    </PanelSection>
-  </div></ScrollPanel>;
+        <Button style={{ marginTop: embedded ? 4 : 8, width: embedded ? "auto" : "100%" }} disabled={!!locked} onClick={() => setPending({ file, description: `Permanently delete “${file.name}” (${storageSize(file.bytes)})? ${file.assignments.length ? `This will also clear: ${file.assignments.map(assignmentLabel).join(", ")}.` : "This file has no assignments."}` })} onCancel={back}>Delete from disk…</Button>
+      </div></Row>)}
+      {entries.length > visibleCount && <Row><Button disabled={!!locked} onClick={() => setVisibleCount((count) => count + 30)} onCancel={back}>Show more files ({entries.length - visibleCount} remaining)</Button></Row>}
+      </div>
+    </Section>
+  </div></Container>;
 };
 
 // Keep ordinary unassign non-destructive, but offer real deletion beside it

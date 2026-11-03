@@ -345,6 +345,64 @@ class Plugin:
                     resolved[str(app_id)] = name
         return resolved
 
+    @staticmethod
+    def _playlist_entries(track: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{k: v for k, v in track.items() if k != "additional_tracks"},
+                *track.get("additional_tracks", [])] if track.get("path") else []
+
+    def _append_track(self, key: str, track: dict[str, Any]) -> None:
+        previous = self._tracks.get(key)
+        if not previous:
+            self._tracks[key] = track
+            return
+        entries = self._playlist_entries(previous)
+        # Adding the same file again is harmless and does not duplicate it.
+        if any(item["path"] == track["path"] for item in entries):
+            return
+        self._tracks[key] = {**previous, "additional_tracks": [*entries[1:], track]}
+
+    def _keep_playlist_entries(self, key: str, entries: list[dict[str, Any]]) -> None:
+        if not entries:
+            self._tracks.pop(key, None)
+            return
+        previous = self._tracks[key]
+        self._tracks[key] = {**entries[0],
+                             **{name: previous[name] for name in ("volume", "start_offset", "loop") if name in previous},
+                             "additional_tracks": entries[1:]}
+
+    async def move_playlist_track(self, key: str, path: str, direction: int) -> dict[str, dict[str, Any]]:
+        if direction not in (-1, 1):
+            raise ValueError("Invalid playlist direction")
+        if key not in self._tracks:
+            raise ValueError("Playlist no longer exists")
+        entries = self._playlist_entries(self._tracks[key])
+        index = next((i for i, item in enumerate(entries) if item["path"] == path), None)
+        if index is None:
+            raise ValueError("Song no longer exists in this playlist")
+        destination = index + direction
+        if not 0 <= destination < len(entries):
+            return self._tracks
+        entries[index], entries[destination] = entries[destination], entries[index]
+        previous = self._tracks.copy()
+        self._keep_playlist_entries(key, entries)
+        try:
+            self._save_tracks()
+        except Exception:
+            self._tracks = previous
+            raise
+        return self._tracks
+
+    async def remove_playlist_track(self, key: str, path: str) -> dict[str, dict[str, Any]]:
+        previous = self._tracks.copy()
+        if key in self._tracks:
+            self._keep_playlist_entries(key, [item for item in self._playlist_entries(self._tracks[key]) if item["path"] != path])
+        try:
+            self._save_tracks()
+        except Exception:
+            self._tracks = previous
+            raise
+        return self._tracks
+
     async def set_track(
         self, app_id: int, path: str, filename: str
     ) -> dict[str, dict[str, Any]]:
@@ -358,7 +416,7 @@ class Plugin:
                 resolved.open("rb").close()
             except PermissionError as error:
                 raise PermissionError(f"Permission denied: {resolved}") from error
-            self._tracks[key] = {
+            self._append_track(key, {
                 "app_id": app_id,
                 "assigned_at": time.time(),
                 "path": str(resolved),
@@ -366,7 +424,7 @@ class Plugin:
                 "volume": self._tracks.get(key, {}).get("volume", 1.0),
                 "start_offset": self._tracks.get(key, {}).get("start_offset", 0.0),
                 "loop": bool(self._tracks.get(key, {}).get("loop", True)),
-            }
+            })
             self._save_tracks()
             decky.logger.info(f"set_track stored app={app_id} path={resolved}")
             return self._tracks
@@ -457,17 +515,17 @@ class Plugin:
     def _storage_references(self, path: Path) -> list[str]:
         resolved = path.resolve()
         return [key for key, track in self._tracks.items()
-                if track.get("path") and Path(track["path"]).expanduser().resolve() == resolved]
+                if any(Path(item["path"]).expanduser().resolve() == resolved for item in self._playlist_entries(track))]
 
     async def get_song_storage(self) -> dict[str, Any]:
         files: list[dict[str, Any]] = []
         references: dict[Path, list[str]] = {}
         missing: list[str] = []
         for key, track in self._tracks.items():
-            if track.get("path"):
-                path = Path(track["path"]).expanduser().resolve()
+            for item in self._playlist_entries(track):
+                path = Path(item["path"]).expanduser().resolve()
                 references.setdefault(path, []).append(key)
-                if not path.is_file():
+                if not path.is_file() and key not in missing:
                     missing.append(key)
         for category, root in (("downloads", self._downloads_dir), ("previews", self._preview_dir)):
             if not root.exists() or root.is_symlink():
@@ -506,7 +564,8 @@ class Plugin:
         size = path.stat().st_size if path.exists() else 0
         previous = self._tracks.copy()
         for key in refs:
-            self._tracks.pop(key)
+            self._keep_playlist_entries(key, [item for item in self._playlist_entries(self._tracks[key])
+                                              if Path(item["path"]).expanduser().resolve() != path.resolve()])
         # Save before deleting; restore assignments if saving/deleting fails.
         try:
             if refs:
@@ -567,7 +626,8 @@ class Plugin:
         missing = (await self.get_song_storage())["missing_assignments"]
         previous = self._tracks.copy()
         for key in missing:
-            self._tracks.pop(key, None)
+            self._keep_playlist_entries(key, [item for item in self._playlist_entries(self._tracks[key])
+                                              if Path(item["path"]).expanduser().is_file()])
         try:
             self._save_tracks()
         except Exception:
@@ -592,14 +652,15 @@ class Plugin:
             except PermissionError as error:
                 raise PermissionError(f"Permission denied: {resolved}") from error
             previous = self._tracks.get(self._global_track_key, {})
-            self._tracks[self._global_track_key] = {
+            self._append_track(self._global_track_key, {
                 "scope": "global",
+                "assigned_at": time.time(),
                 "path": str(resolved),
                 "filename": filename,
                 "volume": previous.get("volume", 1.0),
                 "start_offset": previous.get("start_offset", 0.0),
                 "loop": bool(previous.get("loop", True)),
-            }
+            })
             self._save_tracks()
             return self._tracks[self._global_track_key]
         except Exception as error:
@@ -648,14 +709,15 @@ class Plugin:
             except PermissionError as error:
                 raise PermissionError(f"Permission denied: {resolved}") from error
             previous = self._tracks.get(self._store_track_key, {})
-            self._tracks[self._store_track_key] = {
+            self._append_track(self._store_track_key, {
                 "scope": "store",
+                "assigned_at": time.time(),
                 "path": str(resolved),
                 "filename": filename,
                 "volume": previous.get("volume", 1.0),
                 "start_offset": previous.get("start_offset", 0.0),
                 "loop": bool(previous.get("loop", True)),
-            }
+            })
             self._save_tracks()
             return self._tracks[self._store_track_key]
         except Exception as error:
@@ -984,13 +1046,14 @@ class Plugin:
     async def _download_youtube_audio(
         self, app_id: int, video_url: str
     ) -> dict[str, Any]:
-        if app_id <= 0:
+        if app_id <= 0 and app_id not in (-1, -2):
             raise ValueError("Invalid app id")
 
         yt_dlp = await self._require_yt_dlp_invocation()
         normalized_url = self._normalize_youtube_url(video_url)
         video_id = self._extract_youtube_video_id(normalized_url)
-        app_download_dir = self._downloads_dir / str(app_id)
+        key = self._global_track_key if app_id == -1 else self._store_track_key if app_id == -2 else str(app_id)
+        app_download_dir = self._downloads_dir / ("global" if app_id == -1 else "store" if app_id == -2 else str(app_id))
         app_download_dir.mkdir(parents=True, exist_ok=True)
         self._log_info(
             f"youtube download requested app={app_id} url={normalized_url} "
@@ -1035,8 +1098,16 @@ class Plugin:
         if not downloaded_path:
             raise RuntimeError("Download completed but no audio file was found")
 
-        tracks = await self.set_track(app_id, str(downloaded_path), downloaded_path.name)
-        self._tracks[str(app_id)]["youtube_id"] = video_id
+        if app_id == -1:
+            await self.set_global_track(str(downloaded_path), downloaded_path.name)
+        elif app_id == -2:
+            await self.set_store_track(str(downloaded_path), downloaded_path.name)
+        else:
+            await self.set_track(app_id, str(downloaded_path), downloaded_path.name)
+        tracks = self._tracks
+        root = self._tracks[key]
+        target = root if root["path"] == str(downloaded_path) else next(item for item in root.get("additional_tracks", []) if item["path"] == str(downloaded_path))
+        target["youtube_id"] = video_id
         self._save_tracks()
         self._log_info(f"youtube download assigned app={app_id} file={downloaded_path}")
         return {

@@ -10,7 +10,7 @@ ThemeDeck lets you add and manage custom music across your Steam library and key
 
 ## Install Package
 
-**Latest release: [ThemeDeck v3.1.7](https://github.com/BrenticusMaximus/ThemeDeck/releases/tag/v3.1.7)** — [Download ThemeDeck-v3.1.7.zip](https://github.com/BrenticusMaximus/ThemeDeck/releases/download/v3.1.7/ThemeDeck-v3.1.7.zip).
+**Latest release: [ThemeDeck v4.0.0](https://github.com/BrenticusMaximus/ThemeDeck/releases/tag/v4.0.0)** — [Download ThemeDeck-v4.0.0.zip](https://github.com/BrenticusMaximus/ThemeDeck/releases/download/v4.0.0/ThemeDeck-v4.0.0.zip).
 
 1. Go to https://github.com/BrenticusMaximus/ThemeDeck/releases/ and download the latest ZIP, not the source code.
 
@@ -28,12 +28,24 @@ Firefox cookies are optional and disabled by default. YouTube may block ThemeDec
 
 ![ThemeDeck June 29 2026 update thumbnail](https://images.steamusercontent.com/ugc/10246844756434218824/5BE3695A090A9AD263F22EE5F73C7CDA3B84CEB0/?imw=5000&imh=5000&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false)
 
+## ThemeDeck 4.0 — playlists and a compact music chooser
+
+- Add unlimited songs to each game, global ambient music, and store music. Adding a song keeps your existing assignments. Reorder songs with the arrows or remove individual assignments without deleting their files.
+- Use the same YouTube search, preview, download, and local-file options for games, ambient music, and store music. **Download** adds the first song; **Download & Add** appends another.
+- Songs play in playlist order. **Loop playlist** repeats the sequence; disabling it stops after the last song. Volume and start skip apply across each playlist.
+- The compact Now Playing card includes previous/play-pause/next controls, playlist position, and a countdown. Its music-settings icon opens the matching music chooser. All card buttons support controller navigation; pausing keeps the card size stable.
+- YouTube search comes first in the redesigned chooser. Playlist settings, local files, and song storage open below their buttons, one section at a time. Volume and start-skip sliders use compact controls.
+- Improved frequency grouping and smoothing in the audio visualizer, with recovery after loops/seeks and separate handling for silence and capture failures.
+- Storage management recognizes all playlist members when listing files or deleting downloads.
+
+Existing single-song assignments and settings are preserved when upgrading. Install the release ZIP through Decky's developer settings as usual.
+
 ## Main Features
 
 - Add custom music to any game page in your library.
 - Use either local music files or YouTube search to find tracks.
 - Preview tracks before assigning them.
-- One-tap "Download & Assign" from YouTube results.
+- One-tap **Download** or **Download & Add** from YouTube results.
 - Auto-fill search terms based on the game you selected.
 - Highlight which YouTube result is already assigned.
 - Set per-game volume.
@@ -42,9 +54,9 @@ Firefox cookies are optional and disabled by default. YouTube may block ThemeDec
 - Remove or change a game's assigned track at any time.
 - Auto-play music when opening game pages.
 - Displays a live "Now Playing" card overlay on game pages.
-- Includes a real, beat-reactive audio visualizer in the "Now Playing" card.
-- Assign a global/ambient track for non-game areas.
-- Assign a separate store-only track for Steam Store pages.
+- Includes a real, audio-reactive visualizer in the "Now Playing" card.
+- Assign a global/ambient playlist for non-game areas.
+- Assign a separate store playlist for Steam Store pages.
 - Choose how ambient music behaves when interrupted (stop, pause, or mute until return).
 - Optionally disable ambient music while in the Steam Store.
 - Prevent all plugin music from playing in Desktop Mode.
@@ -56,6 +68,14 @@ Firefox cookies are optional and disabled by default. YouTube may block ThemeDec
 - Works with both installed and uninstalled games in your library.
 
 ## Release Updates
+
+## November 3, 2026 Update (v4.0.0)
+
+- Major playlist release: unlimited tracks for games, ambient music, and store music, with reordering and automatic advancement.
+- Unified YouTube/local music chooser with compact settings and inline storage management.
+- Added controller-accessible playback controls, remaining time, and a direct music-settings shortcut on the Now Playing card.
+- Improved visualizer response and recovery, and kept the card size stable when paused.
+- Tested playlist additions, YouTube preview/download, settings persistence, and card navigation directly on a Steam Deck. Temporary test songs and settings were removed afterward.
 
 ## November 2, 2026 Update (v3.1.7)
 

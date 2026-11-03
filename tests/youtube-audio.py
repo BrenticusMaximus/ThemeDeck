@@ -50,6 +50,35 @@ async def check():
             assert plugin._tracks['123']['path'] == download['path']
             assert plugin._tracks_file.exists()
             assert len(commands) == 2
+            for scope, key, folder in [(-1, '__global__', 'global'), (-2, '__store__', 'store')]:
+                first = await plugin.download_youtube_audio(scope, 'https://www.youtube.com/watch?v=z2xxQXcmOeE')
+                assert Path(first['path']).parent.name == folder
+                assert plugin._tracks[key]['youtube_id'] == 'z2xxQXcmOeE'
+                extra = Path(directory) / f'extra-{folder}.m4a'
+                extra.write_bytes(b'extra')
+                if scope == -1:
+                    await plugin.set_global_volume(.4)
+                    await plugin.set_global_start_offset(7)
+                    await plugin.set_global_loop(False)
+                    await plugin.set_global_track(str(extra), extra.name)
+                else:
+                    await plugin.set_store_volume(.4)
+                    await plugin.set_store_start_offset(7)
+                    await plugin.set_store_loop(False)
+                    await plugin.set_store_track(str(extra), extra.name)
+                await plugin.download_youtube_audio(scope, 'https://www.youtube.com/watch?v=z2xxQXcmOeE')
+                root = plugin._tracks[key]
+                assert len(root['additional_tracks']) == 1
+                assert root['volume'] == .4 and root['start_offset'] == 7 and root['loop'] is False
+                assert str(scope) not in plugin._tracks
+            for invalid in [0, -3]:
+                try:
+                    await plugin.download_youtube_audio(invalid, 'https://www.youtube.com/watch?v=z2xxQXcmOeE')
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError('Invalid target accepted')
+
         print('Preview, cached preview, and download assignment pass without ffmpeg/ffprobe')
 
 asyncio.run(check())

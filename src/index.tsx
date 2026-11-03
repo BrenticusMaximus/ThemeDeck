@@ -50,13 +50,17 @@ import {
   FaPause,
   FaPlay,
   FaTrash,
+  FaStepBackward,
+  FaStepForward,
 } from "react-icons/fa";
 import { startDeckShelvesIntegration, updateShelfAssignments } from "./deck-shelves";
+import { spectrumHeights, smoothHeights } from "./visualizer";
 import { BUILD_ID, BUILD_LABEL } from "./build-info";
 import { getErrorMessage } from "./error-message";
 import { SongStorage, DeleteAssignedSong } from "./song-storage";
 
 type BackendTrack = {
+  additional_tracks?: BackendTrack[];
   assigned_at?: number;
   app_id?: number;
   path: string;
@@ -70,6 +74,7 @@ type BackendTrack = {
 type RawTrackMap = Record<string, BackendTrack>;
 
 type GameTrack = {
+  additionalTracks?: GameTrack[];
   appId: number;
   path: string;
   filename: string;
@@ -90,6 +95,8 @@ type AudioPayload = {
 type PlaybackReason = "auto" | "manual";
 
 type PlaybackState = {
+  path?: string;
+  paused?: boolean;
   appId: number | null;
   reason: PlaybackReason;
   status: "playing" | "stopped";
@@ -141,6 +148,7 @@ type YouTubePreviewResponse = {
 };
 
 type GlobalTrack = {
+  additionalTracks?: GlobalTrack[];
   path: string;
   filename: string;
   volume: number;
@@ -322,6 +330,8 @@ const ControllerButton = ({
   </ControllerDialogButton>
 );
 
+const movePlaylistTrack = callable<[key: string, path: string, direction: number], RawTrackMap>("move_playlist_track");
+const removePlaylistTrack = callable<[key: string, path: string], RawTrackMap>("remove_playlist_track");
 const fetchTracks = callable<[], RawTrackMap>("get_tracks");
 const fetchGlobalTrack = callable<[], BackendTrack | null>("get_global_track");
 const fetchStoreTrack = callable<[], BackendTrack | null>("get_store_track");
@@ -488,7 +498,7 @@ let visualizerSourceAudio: HTMLAudioElement | null = null;
 let visualizerStreamSourceNode: MediaStreamAudioSourceNode | null = null;
 let visualizerOutputGain: GainNode | null = null;
 let visualizerDataArray: Uint8Array | null = null;
-let visualizerTimeDataArray: Uint8Array | null = null;
+let visualizerCapture: MediaStream | null = null;
 let visualizerRetryAfterMs = 0;
 let visualizerBoundSrc: string | null = null;
 const audioCache = new Map<string, AudioCacheEntry>();
@@ -887,6 +897,7 @@ const ensureAudio = () => {
     const eventNames: Array<keyof HTMLMediaElementEventMap> = [
       "play",
       "playing",
+      "seeked",
       "pause",
       "ended",
       "stalled",
@@ -898,6 +909,16 @@ const ensureAudio = () => {
       sharedAudio?.addEventListener(eventName, () => {
         const audio = sharedAudio;
         if (!audio) return;
+        if (eventName === "ended" && playbackState.status === "playing") {
+          void movePlaylist(1, true);
+        }
+        // Chromium can leave captureStream tracks live but silent after a loop,
+        // seek or resumed playback. Rebind on media lifecycle events, not silence.
+        if ((eventName === "playing" || eventName === "seeked") && visualizerCapture) {
+          resetVisualizerGraph(false);
+          visualizerRetryAfterMs = 0;
+          logClient("debug", "visualizer_playback_rebind", { event: eventName });
+        }
         logClient("info", "audio_event", {
           event: eventName,
           paused: audio.paused,
@@ -951,7 +972,8 @@ const resetVisualizerGraph = (closeContext = false) => {
   visualizerStreamSourceNode = null;
   visualizerOutputGain = null;
   visualizerDataArray = null;
-  visualizerTimeDataArray = null;
+  visualizerCapture?.getTracks().forEach((track) => track.stop());
+  visualizerCapture = null;
   visualizerBoundSrc = null;
 };
 
@@ -1000,15 +1022,22 @@ const ensureVisualizerAnalyser = (audio: HTMLAudioElement) => {
       visualizerAudioContext = null;
       return null;
     }
+    // Ended capture tracks indicate a broken tap; silence alone does not.
+    if (visualizerCapture && !visualizerCapture.getAudioTracks().some((track) => track.readyState === "live")) {
+      resetVisualizerGraph(false);
+    }
     if (!visualizerAnalyser) {
       visualizerAnalyser = context.createAnalyser();
-      visualizerAnalyser.fftSize = 128;
-      visualizerAnalyser.smoothingTimeConstant = 0.76;
+      visualizerAnalyser.fftSize = 2048;
+      visualizerAnalyser.smoothingTimeConstant = 0;
+      visualizerAnalyser.minDecibels = -80;
+      visualizerAnalyser.maxDecibels = -20;
     }
     if (!visualizerOutputGain) {
       visualizerOutputGain = context.createGain();
-      // Keep playback audible while visualizer taps the same source.
-      visualizerOutputGain.gain.value = 1;
+      // Process the capture silently; the original audio element supplies playback.
+      visualizerOutputGain.gain.value = 0;
+      visualizerAnalyser.connect(visualizerOutputGain);
       visualizerOutputGain.connect(context.destination);
     }
     if (visualizerSourceAudio && visualizerSourceAudio !== audio) {
@@ -1043,6 +1072,7 @@ const ensureVisualizerAnalyser = (audio: HTMLAudioElement) => {
         });
         return null;
       }
+      visualizerCapture = capture;
       visualizerStreamSourceNode = context.createMediaStreamSource(capture);
       visualizerStreamSourceNode.connect(visualizerAnalyser);
       visualizerSourceAudio = audio;
@@ -1056,14 +1086,10 @@ const ensureVisualizerAnalyser = (audio: HTMLAudioElement) => {
     if (!visualizerDataArray) {
       visualizerDataArray = new Uint8Array(visualizerAnalyser.frequencyBinCount);
     }
-    if (!visualizerTimeDataArray) {
-      visualizerTimeDataArray = new Uint8Array(visualizerAnalyser.fftSize);
-    }
     return {
       context,
       analyser: visualizerAnalyser,
       data: visualizerDataArray,
-      timeData: visualizerTimeDataArray,
     };
   } catch (error) {
     console.error("[ThemeDeck] visualizer init failed", error);
@@ -1132,6 +1158,10 @@ const resolveAudioUrl = async (track: GameTrack) => {
     objectUrl,
     mtime: payload.mtime ?? 0,
   });
+  for (const [path, entry] of audioCache) {
+    if (audioCache.size <= 4) break;
+    if (path !== track.path && entry.objectUrl !== sharedAudio?.currentSrc) revokeCacheEntry(path);
+  }
   return objectUrl;
 };
 
@@ -1169,7 +1199,7 @@ const captureGlobalAmbientResumeSnapshot = (
   const durationSeconds =
     Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : null;
   globalAmbientResumeSnapshot = {
-    path: globalTrack.path,
+    path: currentPlayingTrack?.path ?? globalTrack.path,
     seconds,
     capturedAtMs: Date.now(),
     durationSeconds,
@@ -1182,7 +1212,8 @@ const getGlobalAmbientResumeTime = (track: GlobalTrack): number | undefined => {
   if (!snapshot) {
     return undefined;
   }
-  if (snapshot.path !== track.path) {
+  const selectedPath = playlistSelections.get(GLOBAL_AMBIENT_APP_ID) ?? track.path;
+  if (snapshot.path !== selectedPath) {
     clearGlobalAmbientResumeSnapshot();
     return undefined;
   }
@@ -1359,7 +1390,61 @@ const isIgnorablePlaybackError = (error: unknown): boolean => {
 // Do not repeatedly retry an inaccessible file on every autoplay poll.
 // Assignment changes or an explicit Play action allow another attempt.
 const failedAutoPlaybackPaths = new Set<string>();
+const playlistSelections = new Map<number, string>();
+let currentPlayingTrack: GameTrack | null = null;
+let userPausedScope: number | null = null;
+let playlistTransition = false;
+const playlistForScope = (appId: number): GameTrack[] => {
+  const root = appId === GLOBAL_AMBIENT_APP_ID ? latestGlobalTrackForAutoPlay
+    : appId === STORE_TRACK_APP_ID ? latestStoreTrackForAutoPlay : latestTracksForAutoPlay[appId];
+  if (!root) return [];
+  return [root, ...(root.additionalTracks ?? [])].map(item => ({...item, appId,
+    volume: root.volume, startOffset: root.startOffset, loop: root.loop, additionalTracks: undefined}));
+};
+const selectedPlaylistTrack = (track: GameTrack): GameTrack => {
+  const list = playlistForScope(track.appId);
+  const selected = list.find(item => item.path === playlistSelections.get(track.appId));
+  return selected ? {...selected, resumeTime: track.resumeTime} : list[0] ? {...list[0], resumeTime: track.resumeTime} : track;
+};
+const movePlaylist = async (direction: number, automatic = false) => {
+  if (playlistTransition || playbackState.appId === null) return;
+  const appId = playbackState.appId;
+  const list = playlistForScope(appId);
+  if (!list.length) return;
+  const index = Math.max(0, list.findIndex(item => item.path === currentPlayingTrack?.path));
+  if (automatic && index === list.length - 1 && !list[0].loop) {
+    userPausedScope = appId;
+    notifyPlayback({...playbackState, paused: true});
+    return;
+  }
+  const next = list[(index + direction + list.length) % list.length];
+  playlistSelections.set(appId, next.path);
+  playlistTransition = true;
+  try { await playTrack(next, playbackState.reason); }
+  finally { playlistTransition = false; }
+};
+const toggleCardPlayback = async () => {
+  const audio = sharedAudio;
+  if (!audio || playbackState.appId === null) return;
+  if (!audio.paused) {
+    userPausedScope = playbackState.appId;
+    audio.pause();
+    notifyPlayback({...playbackState, paused: true});
+  } else {
+    try {
+      userPausedScope = null;
+      if (audio.ended) audio.currentTime = 0;
+      await audio.play();
+      notifyPlayback({...playbackState, paused: false});
+    } catch (error) {
+      userPausedScope = playbackState.appId;
+      toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, "Unable to resume music")});
+    }
+  }
+};
 const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
+  track = selectedPlaylistTrack(track);
+  userPausedScope = null;
   if (reason === "auto" && failedAutoPlaybackPaths.has(track.path)) return;
   if (reason === "manual") failedAutoPlaybackPaths.delete(track.path);
   if (systemSuspending) {
@@ -1417,7 +1502,9 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
         offset,
         result,
       });
-      notifyPlayback({ appId: track.appId, reason, status: "playing" });
+      currentPlayingTrack = track;
+    playlistSelections.set(track.appId, track.path);
+    notifyPlayback({ appId: track.appId, path: track.path, reason, status: "playing", paused: false });
       return;
     }
 
@@ -1460,7 +1547,7 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
       }
     }
 
-    audio.loop = track.loop !== false;
+    audio.loop = playlistForScope(track.appId).length <= 1 && track.loop !== false;
     audio.muted = false;
     audio.volume = getEffectiveTrackVolume(track.volume);
     const configuredOffset = clamp(track.startOffset ?? 0, 0, 30);
@@ -1548,7 +1635,9 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     window.setTimeout(() => emitProbe("play_probe_1200ms"), 1200);
     window.setTimeout(() => emitProbe("play_probe_8000ms"), 8000);
     window.setTimeout(() => emitProbe("play_probe_15000ms"), 15000);
-    notifyPlayback({ appId: track.appId, reason, status: "playing" });
+    currentPlayingTrack = track;
+    playlistSelections.set(track.appId, track.path);
+    notifyPlayback({ appId: track.appId, path: track.path, reason, status: "playing", paused: false });
   } catch (error) {
     if (invocationId !== playInvocationCounter) {
       return;
@@ -1622,7 +1711,7 @@ const applyLoopToActiveTrack = (appId: number, loop: boolean) => {
   if (playbackState.appId !== appId || playbackState.status !== "playing") {
     return;
   }
-  sharedAudio.loop = loop;
+  sharedAudio.loop = playlistForScope(appId).length <= 1 && loop;
 };
 
 const getTrackVolumeForPlaybackState = (state: PlaybackState): number | undefined => {
@@ -2995,7 +3084,12 @@ const GameFocusBridge = () => {
     };
   }, [appId]);
 
+  return <NowPlayingCard gamePage />;
+};
+
+const NowPlayingCard = ({gamePage = false}: {gamePage?: boolean}) => {
   const playback = usePlaybackStateValue();
+  const appId = playback.appId;
   const [cardSettings] = useNowPlayingCardSettings();
 
   const playingTrack = useMemo(() => {
@@ -3005,8 +3099,8 @@ const GameFocusBridge = () => {
     if (playback.status !== "playing" || playback.appId !== appId) {
       return null;
     }
-    return latestTracksForAutoPlay[appId] ?? null;
-  }, [appId, cardSettings.enabled, playback.appId, playback.status]);
+    return currentPlayingTrack ?? latestTracksForAutoPlay[appId] ?? null;
+  }, [appId, cardSettings.enabled, playback.appId, playback.status, playback.path]);
 
   const parsedNowPlaying = useMemo(() => {
     if (!playingTrack) {
@@ -3015,7 +3109,7 @@ const GameFocusBridge = () => {
     const sourceName =
       toHumanReadableTrackName(playingTrack.filename || "") ||
       toHumanReadableTrackName(playingTrack.path.split("/").pop() || "");
-    const gameName = appId ? getDisplayName(appId) : "Unknown game";
+    const gameName = appId === GLOBAL_AMBIENT_APP_ID ? "Global ambient music" : appId === STORE_TRACK_APP_ID ? "Store music" : appId ? getDisplayName(appId) : "Unknown game";
     const resolved = resolveNowPlayingText(sourceName, gameName);
     return {
       trackName: resolved.trackName,
@@ -3030,7 +3124,7 @@ const GameFocusBridge = () => {
       zIndex: 1001,
       width: "max-content",
       maxWidth: `${cardSettings.width}px`,
-      pointerEvents: "none",
+      pointerEvents: "auto",
     };
     if (cardSettings.anchor === "top_left") {
       style.top = `${baseMargin + cardSettings.offsetY}px`;
@@ -3055,12 +3149,12 @@ const GameFocusBridge = () => {
     textOverflow: "ellipsis",
   };
 
-  if (!parsedNowPlaying) {
+  if (!parsedNowPlaying || (gamePage ? playback.appId !== activeDetailRouteAppId : (playback.appId ?? 0) > 0)) {
     return null;
   }
 
   return (
-    <div style={anchorStyle}>
+    <Focusable flow-children="column" style={anchorStyle}>
       <style>{`
         @keyframes themedeck-nowplaying-marquee {
           0% { transform: translateX(0); }
@@ -3090,100 +3184,198 @@ const GameFocusBridge = () => {
             gap: "0.5rem",
           }}
         >
-          <span>NOW PLAYING</span>
+          <span style={{ display: "inline-grid", whiteSpace: "nowrap" }}>
+            <span aria-hidden="true" style={{ gridArea: "1 / 1", visibility: "hidden" }}>NOW PLAYING</span>
+            <span style={{ gridArea: "1 / 1" }}>{playback.paused ? "PAUSED" : "NOW PLAYING"}</span>
+          </span>
           <NowPlayingVisualizer />
         </div>
         <div style={{ ...marqueeBaseStyle, marginTop: "0.14rem", fontSize: "0.96rem", fontWeight: 700 }}>
           <MarqueeText text={parsedNowPlaying.trackName} />
         </div>
-        <div style={{ ...marqueeBaseStyle, marginTop: "0.1rem", fontSize: "0.77rem", opacity: 0.84 }}>
+        <div style={{ ...marqueeBaseStyle, paddingRight: 28, boxSizing: "border-box", marginTop: "0.1rem", fontSize: "0.77rem", opacity: 0.84 }}>
           <MarqueeText text={parsedNowPlaying.albumName} />
         </div>
+        <PlaylistPlaybackControls />
       </div>
-    </div>
+    </Focusable>
   );
+};
+
+const formatRemaining = (seconds: number) => {
+  if (!Number.isFinite(seconds)) return "—";
+  const remaining = Math.max(0, Math.ceil(seconds));
+  return `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
+};
+const PlaylistPlaybackControls = () => {
+  const playback = usePlaybackStateValue();
+  const [remaining, setRemaining] = useState("—");
+  useEffect(() => {
+    const tick = () => {
+      const audio = sharedAudio;
+      setRemaining(audio && Number.isFinite(audio.duration) ? formatRemaining(audio.duration - audio.currentTime) : "—");
+    };
+    tick(); const timer = window.setInterval(tick, 250);
+    return () => window.clearInterval(timer);
+  }, [playback.path]);
+  const footerRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const footer = footerRef.current;
+    const doc = footer?.ownerDocument;
+    if (!footer || !doc) return;
+    let returnTarget: HTMLElement | null = null;
+    let lastPlaybackButton: HTMLElement | null = null;
+    const navigate = (raw: Event) => {
+      const event = raw as CustomEvent<{button: number}>;
+      const target = event.target as HTMLElement;
+      if (!target || !doc.contains(target)) return;
+      const inside = footer.contains(target);
+      const focus = (element: HTMLElement | null | undefined) => {
+        if (!element) return;
+        event.preventDefault(); event.stopImmediatePropagation(); element.focus();
+      };
+      if (inside) {
+        const gear = footer.querySelector<HTMLElement>('[aria-label="Choose ThemeDeck music"]');
+        const pause = footer.querySelector<HTMLElement>('[aria-label="Pause music"], [aria-label="Play music"]');
+        const controls = Array.from(footer.querySelectorAll<HTMLButtonElement>('button')).filter(button => !button.disabled);
+        const current = target.closest<HTMLElement>('button');
+        const index = controls.indexOf(current as HTMLButtonElement);
+        if (event.detail.button === GamepadButton.DIR_LEFT || event.detail.button === GamepadButton.DIR_RIGHT) {
+          const direction = event.detail.button === GamepadButton.DIR_RIGHT ? 1 : -1;
+          focus(controls[Math.max(0, Math.min(controls.length - 1, index + direction))]);
+          return;
+        }
+        if (event.detail.button === GamepadButton.DIR_UP) {
+          if (current !== gear) lastPlaybackButton = current;
+          focus(gear);
+          return;
+        }
+        if (event.detail.button === GamepadButton.DIR_DOWN && current === gear) {
+          focus(lastPlaybackButton?.isConnected && !(lastPlaybackButton as HTMLButtonElement).disabled ? lastPlaybackButton : pause);
+          return;
+        }
+      }
+      if (inside && (event.detail.button === GamepadButton.CANCEL || event.detail.button === GamepadButton.DIR_DOWN)) {
+        const destination = returnTarget?.isConnected ? returnTarget : findPlay();
+        if (destination) { event.preventDefault(); event.stopImmediatePropagation(); destination.focus(); }
+        return;
+      }
+      if (inside || event.detail.button !== GamepadButton.DIR_UP) return;
+      const play = findPlay();
+      // Only bridge the game's main action row; leave menus and other page rows alone.
+      if (!play || Math.abs(target.getBoundingClientRect().top - play.getBoundingClientRect().top) > 55) return;
+      const pause = footer.querySelector<HTMLElement>('[aria-label="Pause music"], [aria-label="Play music"]');
+      if (pause) { returnTarget = target; event.preventDefault(); event.stopImmediatePropagation(); pause.focus(); }
+    };
+    const findPlay = () => Array.from(doc.querySelectorAll<HTMLElement>('button,[role="button"]')).find(element =>
+      /^(Play|Resume|Stream|Install)$/.test(element.textContent?.trim() ?? "") && !footer.contains(element)) ?? null;
+    const controller = (window as any).FocusNavController;
+    const registration = controller?.SetCatchAllGamepadInput?.((button: number, down: boolean) => {
+      if (!down || controller.GetActiveNavTree?.()?.id !== "GamepadUI_Full_Root") return false;
+      let handled = false;
+      navigate({ target: doc.activeElement, detail: {button}, preventDefault: () => { handled = true; }, stopImmediatePropagation: () => {} } as unknown as Event);
+      return handled;
+    });
+    return () => registration?.Unregister();
+  }, [playback.appId]);
+  const list = playback.appId !== null ? playlistForScope(playback.appId) : [];
+  const index = list.findIndex(item => item.path === playback.path);
+  const style: CSSProperties = { minWidth: 0, width: 24, padding: 0, height: 24, border: "none", borderRadius: "50%", background: "transparent", boxShadow: "none", color: "#e4edf7", fontSize: 11, display: "flex", justifyContent: "center", alignItems: "center", flexShrink: 0 };
+  return <div ref={footerRef} className="themedeck-player-footer" style={{display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 5}}>
+    <style>{`
+      .themedeck-player-footer button { transition: background 120ms, color 120ms; }
+      .themedeck-player-footer button:hover,
+      .themedeck-player-footer button:focus,
+      .themedeck-player-footer button.gpfocus { background: rgba(160,202,255,.18) !important; outline: 1px solid rgba(160,202,255,.65); outline-offset: 0; }
+      .themedeck-player-footer button.Disabled { opacity: .3; }
+    `}</style>
+    <Focusable flow-children="row" style={{display: "flex", alignItems: "center", gap: 2}}>
+      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label="Previous track" title="Previous track" style={style} disabled={list.length < 2} onClick={() => void movePlaylist(-1)}><FaStepBackward /></ControllerButton>
+      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label={playback.paused ? "Play music" : "Pause music"} title={playback.paused ? "Play" : "Pause"} style={{...style, background: "rgba(160,202,255,.09)"}} onClick={() => void toggleCardPlayback()}>{playback.paused ? <FaPlay /> : <FaPause />}</ControllerButton>
+      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label="Next track" title="Next track" style={style} disabled={list.length < 2} onClick={() => void movePlaylist(1)}><FaStepForward /></ControllerButton>
+    </Focusable>
+    <Focusable flow-children="column" style={{position: "relative", display: "flex", gap: 7, alignItems: "center", whiteSpace: "nowrap", fontSize: 10, color: "#b5c2d1", fontVariantNumeric: "tabular-nums"}}>
+      <ControllerButton aria-label="Choose ThemeDeck music" title="Choose ThemeDeck music" onCancel={() => Navigation.NavigateBack()} style={{...style, position: "absolute", right: 0, bottom: "calc(100% + 2px)", fontSize: 13}} onClick={() => Navigation.Navigate(playback.appId === GLOBAL_AMBIENT_APP_ID ? "/themedeck/global" : playback.appId === STORE_TRACK_APP_ID ? "/themedeck/store" : playback.appId && playback.appId > 0 ? `/themedeck/${playback.appId}` : "/themedeck")}><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 4.5 18 2v6.4l-2-.5V5.8L10 7.3V18c0 2.3-2.4 4-5 4-2.2 0-4-1.4-4-3.2s2-3.3 4.4-3.3c1 0 1.9.2 2.6.6Z" /><path fillRule="evenodd" d="M21.27 13.82 L23.14 14.48 L23.14 17.52 L21.27 18.18 L21.27 18.18 L22.12 19.98 L19.98 22.12 L18.18 21.27 L18.18 21.27 L17.52 23.14 L14.48 23.14 L13.82 21.27 L13.82 21.27 L12.02 22.12 L9.88 19.98 L10.73 18.18 L10.73 18.18 L8.86 17.52 L8.86 14.48 L10.73 13.82 L10.73 13.82 L9.88 12.02 L12.02 9.88 L13.82 10.73 L13.82 10.73 L14.48 8.86 L17.52 8.86 L18.18 10.73 L18.18 10.73 L19.98 9.88 L22.12 12.02 L21.27 13.82 Z M19 16 A3 3 0 1 0 13 16 A3 3 0 1 0 19 16 Z" /></svg></ControllerButton>
+      {list.length > 1 && <span style={{opacity: .65}}>{index + 1}/{list.length}</span>}
+      <span aria-label="Time remaining" title="Time remaining">−{remaining}</span>
+    </Focusable>
+  </div>;
+};
+
+const AssignedPlaylist = ({track, scope, refresh}: {track: GlobalTrack | null; scope: string; refresh: () => Promise<void>}) => {
+  const [busy, setBusy] = useState(false);
+  const list = track ? [track, ...(track.additionalTracks ?? [])] : [];
+  return <PanelSection title={`Assigned songs (${list.length})`}>
+    <PanelSectionRow><div>
+      <div style={{fontSize: 12, opacity: .7, marginBottom: 6}}>{list.length ? "New songs are added to this playlist. Use the arrows to change playback order." : "No songs yet. Search YouTube to add your first song."}</div>
+    </div></PanelSectionRow>
+    {list.map((item, i) => <PanelSectionRow key={item.path}><div style={{width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "4px 0"}}>
+      <div title={item.filename} style={{flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13}}>{i + 1}. {toHumanReadableTrackName(item.filename)}</div>
+      {list.length > 1 && <Focusable flow-children="row" style={{display: "flex", gap: 4}} >
+        {([-1, 1] as const).map(direction => <ControllerButton key={direction} style={{minWidth: 30, width: 30, height: 28, padding: 0, fontSize: 14}}
+          disabled={busy || (direction === -1 ? i === 0 : i === list.length - 1)}
+          aria-label={`${direction === -1 ? "Move up" : "Move down"}: ${item.filename}`}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await movePlaylistTrack(scope, item.path, direction);
+              window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
+              await refresh();
+            } catch (error) { toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, "Unable to reorder songs")}); }
+            finally { setBusy(false); }
+          }}>{direction === -1 ? "↑" : "↓"}</ControllerButton>)}
+      </Focusable>}
+      <ControllerButton style={{minWidth: 64, width: "auto", height: 28, padding: "2px 8px", fontSize: 12}} disabled={busy} onClick={async () => {
+        setBusy(true);
+        try { await removePlaylistTrack(scope, item.path); handleSongStorageChanged(); await refresh(); }
+        catch (error) { toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, "Unable to remove song")}); }
+        finally { setBusy(false); }
+      }}>Remove</ControllerButton>
+    </div></PanelSectionRow>)}
+  </PanelSection>;
 };
 
 const NowPlayingVisualizer = () => {
   const BAR_COUNT = 16;
   const playback = usePlaybackStateValue();
   const [barHeights, setBarHeights] = useState<number[]>(
-    () => new Array(BAR_COUNT).fill(0.25)
+    () => new Array(BAR_COUNT).fill(0.08)
   );
-  const silentTickCountRef = useRef(0);
-
   useEffect(() => {
-    const tick = () => {
+    let frame = 0;
+    let lastSample = 0;
+    let failures = 0;
+    let heights = new Array(BAR_COUNT).fill(0.08);
+    const tick = (now: number) => {
+      frame = window.requestAnimationFrame(tick);
+      if (now - lastSample < 1000 / 30) return;
+      const elapsed = lastSample ? Math.min(250, now - lastSample) : 1000 / 30;
+      lastSample = now;
+      let target = new Array(BAR_COUNT).fill(0.08);
       const audio = sharedAudio;
-      const shouldAnimate =
-        playback.status === "playing" && !!audio && !audio.paused;
-      if (!shouldAnimate) {
-        setBarHeights(
-          Array.from({ length: BAR_COUNT }, (_, i) => 0.2 + ((i % 3) * 0.08))
-        );
-        return;
-      }
-      try {
-        const analyserBundle = ensureVisualizerAnalyser(audio);
-        if (!analyserBundle) {
-          setBarHeights(
-            Array.from({ length: BAR_COUNT }, (_, i) => 0.2 + ((i % 3) * 0.08))
-          );
-          return;
-        }
-        if (analyserBundle.context.state === "suspended") {
-          void analyserBundle.context.resume().catch(() => {});
-        }
-        analyserBundle.analyser.getByteFrequencyData(analyserBundle.data);
-        analyserBundle.analyser.getByteTimeDomainData(analyserBundle.timeData);
-        const step = Math.max(1, Math.floor(analyserBundle.data.length / BAR_COUNT));
-        let waveformEnergy = 0;
-        for (let i = 0; i < analyserBundle.timeData.length; i += 1) {
-          waveformEnergy += Math.abs(analyserBundle.timeData[i] - 128);
-        }
-        const normalizedWaveform =
-          analyserBundle.timeData.length > 0
-            ? waveformEnergy / analyserBundle.timeData.length / 128
-            : 0;
-        let peakSample = 0;
-        setBarHeights(
-          Array.from({ length: BAR_COUNT }, (_, i) => {
-            const sample = analyserBundle.data[i * step] ?? 0;
-            if (sample > peakSample) peakSample = sample;
-            const normalizedSample = sample / 255;
-            const blended = normalizedSample * 0.82 + normalizedWaveform * 0.5;
-            return 0.18 + Math.min(1, blended) * 0.82;
-          })
-        );
-        if (peakSample <= 2 && normalizedWaveform < 0.01) {
-          silentTickCountRef.current += 1;
-          if (silentTickCountRef.current >= 20) {
-            resetVisualizerGraph(true);
-            visualizerRetryAfterMs = 0;
-            silentTickCountRef.current = 0;
+      if (playback.status === "playing" && audio && !audio.paused) {
+        try {
+          const bundle = ensureVisualizerAnalyser(audio);
+          if (bundle?.context.state === "running") {
+            bundle.analyser.getByteFrequencyData(bundle.data);
+            target = spectrumHeights(bundle.data, bundle.context.sampleRate, bundle.analyser.fftSize, BAR_COUNT);
+            failures = 0;
           }
-        } else {
-          silentTickCountRef.current = 0;
+        } catch (error) {
+          failures += 1;
+          if (failures >= 6) {
+            logClient("warning", "visualizer_sampling_recovery", { error: toErrorMessage(error) });
+            resetVisualizerGraph(true);
+            visualizerRetryAfterMs = Date.now() + 600;
+            failures = 0;
+          }
         }
-      } catch (error) {
-        console.error("[ThemeDeck] visualizer sampling failed", error);
-        silentTickCountRef.current += 1;
-        if (silentTickCountRef.current >= 6) {
-          resetVisualizerGraph(true);
-          visualizerRetryAfterMs = Date.now() + 600;
-          silentTickCountRef.current = 0;
-        }
-        setBarHeights(
-          Array.from({ length: BAR_COUNT }, (_, i) => 0.2 + ((i % 3) * 0.08))
-        );
       }
+      heights = smoothHeights(heights, target, elapsed);
+      setBarHeights(heights);
     };
-
-    tick();
-    const intervalId = window.setInterval(tick, 90);
-    return () => {
-      window.clearInterval(intervalId);
-    };
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
   }, [playback.status]);
 
   return (
@@ -3204,9 +3396,9 @@ const NowPlayingVisualizer = () => {
             height: "12px",
             background: `hsla(${Math.round((i / Math.max(1, BAR_COUNT - 1)) * 300)}, 84%, 60%, 0.95)`,
             borderRadius: "1px",
-            transform: `scaleY(${Math.max(0.18, Math.min(1, heightRatio))})`,
+            transform: `scaleY(${Math.max(0.08, Math.min(1, heightRatio))})`,
             transformOrigin: "bottom center",
-            transition: "transform 80ms linear",
+
           }}
         />
       ))}
@@ -3444,6 +3636,7 @@ const normalizeGlobalTrack = (
     return null;
   }
   return {
+    additionalTracks: (raw.additional_tracks ?? []).map(item => normalizeGlobalTrack(item)).filter((item): item is GlobalTrack => !!item),
     path: raw.path,
     filename: raw.filename || raw.path.split("/").pop() || "Global track",
     volume: typeof raw.volume === "number" ? clamp(raw.volume) : 1,
@@ -3455,9 +3648,9 @@ const normalizeGlobalTrack = (
   };
 };
 
-const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
+const normalizeTracks = (raw: RawTrackMap | null | undefined, updateShelves = true): TrackMap => {
   const normalized: TrackMap = {};
-  if (raw) updateShelfAssignments(raw);
+  if (raw && updateShelves) updateShelfAssignments(raw);
   if (!raw) {
     return normalized;
   }
@@ -3470,6 +3663,7 @@ const normalizeTracks = (raw: RawTrackMap | null | undefined): TrackMap => {
 
     normalized[appId] = {
       appId,
+      additionalTracks: (track.additional_tracks ?? []).map(item => ({...normalizeGlobalTrack(item)!, additionalTracks: undefined, appId, youtubeId: item.youtube_id})),
       path: track.path,
       filename:
         track.filename ||
@@ -4010,10 +4204,12 @@ const applyAutoPlaybackFromContext = () => {
     captureGlobalAmbientResumeSnapshot();
   }
 
+  if (playlistTransition || (userPausedScope === nextTrack.appId && playbackState.appId === nextTrack.appId)) return;
   if (
     playbackState.reason === "auto" &&
     playbackState.status === "playing" &&
     playbackState.appId === nextTrack.appId &&
+    playlistForScope(nextTrack.appId).some(item => item.path === currentPlayingTrack?.path) &&
     (USE_BACKEND_PLAYBACK ||
       (!!sharedAudio &&
         !sharedAudio.paused &&
@@ -4050,10 +4246,14 @@ const refreshAutoPlaybackTrackCache = async () => {
     latestTracksForAutoPlay = normalizeTracks(trackData);
     latestGlobalTrackForAutoPlay = normalizeGlobalTrack(globalData);
     latestStoreTrackForAutoPlay = normalizeGlobalTrack(storeData);
+    if (sharedAudio && currentPlayingTrack) {
+      const list = playlistForScope(currentPlayingTrack.appId);
+      sharedAudio.loop = list.length === 1 && list[0].loop;
+    }
     if (
       !latestGlobalTrackForAutoPlay ||
       (globalAmbientResumeSnapshot &&
-        globalAmbientResumeSnapshot.path !== latestGlobalTrackForAutoPlay.path)
+        !playlistForScope(GLOBAL_AMBIENT_APP_ID).some(item => item.path === globalAmbientResumeSnapshot?.path))
     ) {
       clearGlobalAmbientResumeSnapshot();
     }
@@ -6745,9 +6945,14 @@ const Content = () => {
   );
 };
 
-const ChangeTheme = () => {
+const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
   const params = useParams<{ appid?: string }>();
-  const appId = Number(params?.appid);
+  const appId = scope === "global" ? GLOBAL_AMBIENT_APP_ID : scope === "store" ? STORE_TRACK_APP_ID : Number(params?.appid);
+  const assignmentKey = scope === "global" ? "__global__" : scope === "store" ? "__store__" : String(appId);
+  const selectionName = scope === "global" ? "Ambient music" : scope === "store" ? "Store music" : getDisplayName(appId);
+  const normalizeSelection = useCallback((data: RawTrackMap | null | undefined) => normalizeTracks(scope ? (data?.[assignmentKey] ? {[appId]: data[assignmentKey]} : {}) : data, !scope)[appId] ?? null, [appId, assignmentKey, scope]);
+  const [musicPanel, setMusicPanel] = useState<"settings" | "files" | "storage" | null>(null);
+  const [showYouTubeSetup, setShowYouTubeSetup] = useState(false);
   const [track, setTrack] = useState<GameTrack | null>(null);
   const [loading, setLoading] = useState(true);
   const [currentDir, setCurrentDir] = useState("/home/deck");
@@ -6777,16 +6982,14 @@ const ChangeTheme = () => {
   const localBrowseButtonRef = useRef<HTMLElement | null>(null);
   const assignedVideoIds = useMemo(() => {
     const ids = new Set<string>();
-    if (track?.youtubeId) {
-      ids.add(track.youtubeId);
-    }
-    for (const source of [track?.filename, track?.path]) {
-      for (const id of extractYouTubeIdsFromText(source)) {
-        ids.add(id);
+    for (const item of [track, ...(track?.additionalTracks ?? [])]) {
+      if (item?.youtubeId) ids.add(item.youtubeId);
+      for (const source of [item?.filename, item?.path]) {
+        for (const id of extractYouTubeIdsFromText(source)) ids.add(id);
       }
     }
     return ids;
-  }, [track?.filename, track?.path, track?.youtubeId]);
+  }, [track]);
   const [previewLoadingVideoId, setPreviewLoadingVideoId] = useState<string | null>(
     null
   );
@@ -6801,14 +7004,13 @@ const ChangeTheme = () => {
     setLoading(true);
     try {
       const data = await fetchTracks();
-      const normalized = normalizeTracks(data);
-      setTrack(normalized[appId] ?? null);
+      setTrack(normalizeSelection(data));
     } catch (error) {
       console.error("[ThemeDeck] failed to load track", error);
     } finally {
       setLoading(false);
     }
-  }, [appId]);
+  }, [appId, normalizeSelection]);
 
   useEffect(() => {
     loadTrack();
@@ -6833,10 +7035,10 @@ const ChangeTheme = () => {
     setYoutubeError("");
     setYoutubeResults([]);
     setYoutubeQuery("");
-    const nextQuery = sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} theme music`);
+    const nextQuery = sanitizeYouTubeQuery(scope ? (scope === "global" ? "ambient game music" : "game store background music") : `${getDisplayName(targetAppId)} theme music`);
     setYoutubeQuery(nextQuery);
     const delayedRefresh = window.setTimeout(() => {
-      setYoutubeQuery(sanitizeYouTubeQuery(`${getDisplayName(targetAppId)} theme music`));
+      setYoutubeQuery(sanitizeYouTubeQuery(scope ? (scope === "global" ? "ambient game music" : "game store background music") : `${getDisplayName(targetAppId)} theme music`));
     }, 250);
     return () => {
       window.clearTimeout(delayedRefresh);
@@ -6956,12 +7158,14 @@ const ChangeTheme = () => {
     if (!appId) return;
     try {
       const filename = fullPath.split("/").pop() || "track";
-      await assignTrack(appId, fullPath, filename);
+      if (scope === "global") await assignGlobalTrack(fullPath, filename);
+      else if (scope === "store") await assignStoreTrack(fullPath, filename);
+      else await assignTrack(appId, fullPath, filename);
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
       await loadTrack();
       toaster.toast({
         title: "ThemeDeck",
-        body: `Saved music for ${getDisplayName(appId)}`,
+        body: `Added track for ${selectionName}. Existing songs kept.`,
       });
     } catch (error) {
       console.error("[ThemeDeck] save from path failed", error);
@@ -7090,12 +7294,11 @@ const ChangeTheme = () => {
     setYoutubeError("");
     try {
       const response = await downloadYouTubeAudio(appId, result.webpage_url);
-      const normalized = normalizeTracks(response?.tracks);
-      setTrack(normalized[appId] ?? null);
+      setTrack(normalizeSelection(response?.tracks));
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
       toaster.toast({
         title: "ThemeDeck",
-        body: `Saved "${response.filename}" for ${getDisplayName(appId)}`,
+        body: `Added "${response.filename}" for ${selectionName}. Existing songs kept.`,
       });
     } catch (error) {
       console.error("[ThemeDeck] youtube download failed", error);
@@ -7131,7 +7334,9 @@ const ChangeTheme = () => {
   const handleRemove = async () => {
     if (!appId) return;
     try {
-      await deleteTrack(appId);
+      if (scope === "global") { await deleteGlobalTrack(); latestGlobalTrackForAutoPlay = null; clearGlobalAmbientResumeSnapshot(); }
+      else if (scope === "store") { await deleteStoreTrack(); latestStoreTrackForAutoPlay = null; }
+      else await deleteTrack(appId);
       delete latestTracksForAutoPlay[appId];
       if (playbackState.appId === appId) {
         ++playInvocationCounter;
@@ -7141,7 +7346,7 @@ const ChangeTheme = () => {
       setTrack(null);
       toaster.toast({
         title: "ThemeDeck",
-        body: `Unassigned music for ${getDisplayName(appId)}. File kept; use Manage storage to delete downloads.`,
+        body: `Unassigned music for ${selectionName}. File kept; use Manage storage to delete downloads.`,
       });
     } catch (error) {
       console.error("[ThemeDeck] route remove failed", error);
@@ -7155,9 +7360,8 @@ const ChangeTheme = () => {
     setTrack(nextTrack);
     applyVolumeToActiveTrack(appId, normalizedVolume);
     try {
-      const updated = await updateTrackVolume(appId, normalizedVolume);
-      const normalizedTracks = normalizeTracks(updated);
-      setTrack(normalizedTracks[appId] ?? nextTrack);
+      const updated = scope === "global" ? {[assignmentKey]: await updateGlobalVolume(normalizedVolume)} : scope === "store" ? {[assignmentKey]: await updateStoreVolume(normalizedVolume)} : await updateTrackVolume(appId, normalizedVolume);
+      setTrack(normalizeSelection(updated) ?? nextTrack);
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
     } catch (error) {
       console.error("[ThemeDeck] route volume update failed", error);
@@ -7175,9 +7379,8 @@ const ChangeTheme = () => {
     setTrack(nextTrack);
     applyStartOffsetToActiveTrack(appId, normalizedOffset);
     try {
-      const updated = await updateTrackStartOffset(appId, normalizedOffset);
-      const normalizedTracks = normalizeTracks(updated);
-      setTrack(normalizedTracks[appId] ?? nextTrack);
+      const updated = scope === "global" ? {[assignmentKey]: await updateGlobalStartOffset(normalizedOffset)} : scope === "store" ? {[assignmentKey]: await updateStoreStartOffset(normalizedOffset)} : await updateTrackStartOffset(appId, normalizedOffset);
+      setTrack(normalizeSelection(updated) ?? nextTrack);
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
     } catch (error) {
       console.error("[ThemeDeck] route start offset update failed", error);
@@ -7194,9 +7397,8 @@ const ChangeTheme = () => {
     setTrack(nextTrack);
     applyLoopToActiveTrack(appId, value);
     try {
-      const updated = await updateTrackLoop(appId, value);
-      const normalizedTracks = normalizeTracks(updated);
-      setTrack(normalizedTracks[appId] ?? nextTrack);
+      const updated = scope === "global" ? {[assignmentKey]: await updateGlobalLoop(value)} : scope === "store" ? {[assignmentKey]: await updateStoreLoop(value)} : await updateTrackLoop(appId, value);
+      setTrack(normalizeSelection(updated) ?? nextTrack);
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
     } catch (error) {
       console.error("[ThemeDeck] route loop update failed", error);
@@ -7338,127 +7540,40 @@ const ChangeTheme = () => {
     <ScrollPanel>
       <div
         ref={pageRef}
+        className="themedeck-music-picker"
         style={{
           padding: 24,
-          paddingTop: 48,
-          paddingBottom: 140,
+          paddingTop: 64,
+          paddingBottom: 70,
           minHeight: "100vh",
           boxSizing: "border-box",
         }}
       >
-        <PanelSection title={`ThemeDeck for ${getDisplayName(appId)}`}>
-          <PanelSectionRow>
-            <div
-              style={{
-                width: "100%",
-                display: "flex",
-                flexDirection: "column",
-                gap: "0.5rem",
-              }}
-            >
-              {loading ? (
-                <Spinner />
-              ) : track ? (
-                <>
-                  <div style={{ fontWeight: 700 }}>{track.filename}</div>
-                  <div
-                    style={{
-                      opacity: 0.8,
-                      fontFamily: "monospace",
-                      fontSize: "0.78rem",
-                      lineHeight: 1.35,
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    {track.path}
-                  </div>
-                </>
-              ) : (
-                <div>No music selected yet.</div>
-              )}
-              <div
-                style={{
-                  width: "100%",
-                  display: "flex",
-                  gap: "0.5rem",
-                  flexWrap: "wrap",
-                  alignItems: "center",
-                }}
-              >
-                {track ? (
-                  <ControllerButton
-                    onCancel={navigateBack}
-                    onClick={handleTrackPreviewToggle}
-                    style={{ minWidth: "7rem", whiteSpace: "nowrap" }}
-                  >
-                    {playback.appId === appId && playback.status === "playing"
-                      ? "Pause"
-                      : "Play"}
-                  </ControllerButton>
-                ) : null}
-                {track ? (
-                  <ControllerButton
-                    onCancel={navigateBack}
-                    onClick={handleRemove}
-                    style={{ minWidth: "9rem", whiteSpace: "nowrap" }}
-                  >
-                    Unassign music
-                  </ControllerButton>
-                ) : null}
-                <ControllerButton onCancel={navigateBack} onClick={() => Navigation.Navigate("/themedeck/storage")}>
-                  Delete downloads / manage storage…
-                </ControllerButton>
-                <ControllerButton
-                  onCancel={navigateBack}
-                  onClick={navigateBack}
-                  style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
-                >
-                  Done
-                </ControllerButton>
-              </div>
-            </div>
-          </PanelSectionRow>
-          {track && <PanelSectionRow><DeleteAssignedSong assignment={String(appId)} path={track.path} Button={ControllerButton} onDeleted={() => { setTrack(null); handleSongStorageChanged(); }} /></PanelSectionRow>}
-          {track ? (
-            <PanelSectionRow>
-              <Focusable style={{ width: "100%" }}>
-                <SliderField
-                  value={Math.round(track.volume * 100)}
-                  label="Volume"
-                  min={0}
-                  max={100}
-                  step={5}
-                  valueSuffix="%"
-                  showValue
-                  onChange={handleTrackVolumeChange}
-                />
-                <div style={{ marginTop: "0.35rem" }}>
-                  <SliderField
-                    value={Math.round(track.startOffset)}
-                    label="Start skip"
-                    min={0}
-                    max={30}
-                    step={1}
-                    valueSuffix="s"
-                    showValue
-                    onChange={handleTrackStartOffsetChange}
-                  />
-                </div>
-                <div style={{ marginTop: "0.35rem" }}>
-                  <ToggleField
-                    checked={track.loop}
-                    label="Loop track"
-                    description="Play continuously when this track is active."
-                    onChange={handleTrackLoopChange}
-                  />
-                </div>
-              </Focusable>
-            </PanelSectionRow>
-          ) : null}
-        </PanelSection>
-
-        <PanelSection title="YouTube search (yt-dlp)">
-          <PanelSectionRow>
+        <style>{`
+          .themedeck-music-picker button.DialogButton { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; min-height: 28px !important; padding: 5px 10px !important; font-size: 12px !important; line-height: 1.2 !important; }
+          .themedeck-compact-slider { padding: 6px 10px !important; min-height: 0 !important; margin: 0 !important; }
+          .themedeck-compact-slider > div { display: flex !important; align-items: center !important; gap: 10px !important; padding: 0 !important; }
+          .themedeck-compact-slider > div > div { margin: 0 !important; padding: 0 !important; min-width: 0 !important; }
+          .themedeck-compact-slider > div > div:first-child { flex: 0 0 110px !important; }
+          .themedeck-compact-slider > div > div:last-child { flex: 1 1 auto !important; }
+          .themedeck-compact-slider [id$="_Label"] { display: flex !important; align-items: center !important; justify-content: space-between !important; gap: 8px !important; font-size: 12px !important; line-height: 18px !important; margin: 0 !important; }
+          .themedeck-compact-slider [id$="_Label"] * { font-size: 12px !important; line-height: 18px !important; }
+          .themedeck-compact-slider .SliderControlPanelGroup, .themedeck-compact-slider [role="slider"], .themedeck-compact-slider .SliderControl { min-height: 24px !important; height: 24px !important; padding-top: 0 !important; padding-bottom: 0 !important; }
+          .themedeck-compact-slider .SliderHandle { width: 8px !important; height: 16px !important; top: 4px !important; border-radius: 3px !important; transform: none !important; scale: 1 !important; box-shadow: none !important; }
+          .themedeck-compact-slider .SliderTrack { position: absolute !important; height: 4px !important; top: 10px !important; margin: 0 !important; }
+          .themedeck-compact-slider .SliderHandleContainer { height: 24px !important; top: 0 !important; margin: 0 !important; }
+          .themedeck-music-picker input { font-size: 14px !important; }
+        `}</style>
+        <div style={{display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12}}>
+          <div style={{fontSize: 19, fontWeight: 700}}>Music for {selectionName}</div>
+          <ControllerButton onClick={navigateBack} onCancel={navigateBack}>Done</ControllerButton>
+        </div>
+        <PanelSection title="Search YouTube • Add music">
+          <PanelSectionRow><div style={{display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: 12}}>
+            <span style={{fontSize: 12, opacity: .75}}>{track ? "Download & Add keeps your existing songs." : "Find a soundtrack, preview it, then download."}</span>
+            <ControllerButton onClick={() => setShowYouTubeSetup(!showYouTubeSetup)} onCancel={navigateBack}>{showYouTubeSetup ? "Hide setup" : "YouTube setup"}</ControllerButton>
+          </div></PanelSectionRow>
+          {showYouTubeSetup && <>          <PanelSectionRow>
             <div
               style={{
                 width: "100%",
@@ -7562,6 +7677,7 @@ const ChangeTheme = () => {
               onChange={handleFirefoxCookiesChange}
             />
           </PanelSectionRow>
+</>}
           <PanelSectionRow>
             <div
               style={{
@@ -7575,7 +7691,7 @@ const ChangeTheme = () => {
               <TextField
                 value={youtubeQuery}
                 onChange={(event) => setYoutubeQuery(event.target.value)}
-                style={{ width: "100%", minWidth: "22rem" }}
+                style={{ width: "100%", minWidth: 0 }}
               />
               <ControllerButton
                 buttonRef={(element) => {
@@ -7584,9 +7700,9 @@ const ChangeTheme = () => {
                 onCancel={navigateBack}
                 onClick={() => handleYouTubeSearch()}
                 disabled={youtubeLoading || ytDlpBusy}
-                style={{ minWidth: "12rem" }}
+                style={{ minWidth: 90 }}
               >
-                {youtubeLoading ? "Searching..." : "Search"}
+                {youtubeLoading ? "Searching..." : "Search YouTube"}
               </ControllerButton>
             </div>
           </PanelSectionRow>
@@ -7627,7 +7743,7 @@ const ChangeTheme = () => {
                     display: "grid",
                     gap: "0.5rem",
                     gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-                    gridAutoRows: youtubeResults.length ? "16.25rem" : "auto",
+                    gridAutoRows: youtubeResults.length ? "14.5rem" : "auto",
                   }}
                 >
                   {youtubeResults.map((result, resultIndex) => {
@@ -7655,8 +7771,8 @@ const ChangeTheme = () => {
                           display: "flex",
                           flexDirection: "column",
                           gap: "0.28rem",
-                          height: "calc(100% - 0.85rem)",
-                          marginTop: "0.85rem",
+                          height: "calc(100% - 0.25rem)",
+                          marginTop: "0.25rem",
                           minHeight: 0,
                           overflow: "hidden",
                           scrollMarginTop: "12rem",
@@ -7859,7 +7975,7 @@ const ChangeTheme = () => {
                           >
                             {downloadingVideoId === result.id
                               ? "Downloading..."
-                              : "Download & Assign"}
+                              : track ? "Download & Add" : "Download"}
                           </ControllerButton>
                         </div>
                       </div>
@@ -7876,8 +7992,30 @@ const ChangeTheme = () => {
           </PanelSectionRow>
         </PanelSection>
 
-        <PanelSection title="Or, browse local files">
-          <PanelSectionRow>
+        <AssignedPlaylist track={track} scope={assignmentKey} refresh={loadTrack} />
+        <Focusable flow-children="row" style={{display: "flex", gap: 8, margin: "10px 0"}}>
+          <ControllerButton onClick={() => setMusicPanel(musicPanel === "settings" ? null : "settings")} onCancel={navigateBack}>{musicPanel === "settings" ? "Hide playlist settings" : "Playlist settings"}</ControllerButton>
+          <ControllerButton onClick={() => setMusicPanel(musicPanel === "files" ? null : "files")} onCancel={navigateBack}>{musicPanel === "files" ? "Hide local files" : "Browse local files"}</ControllerButton>
+          <ControllerButton onClick={() => setMusicPanel(musicPanel === "storage" ? null : "storage")} onCancel={navigateBack}>{musicPanel === "storage" ? "Hide song storage" : "Song storage"}</ControllerButton>
+        </Focusable>
+        {musicPanel === "storage" && <SongStorage embedded Button={ControllerButton} onClose={() => setMusicPanel(null)} onChanged={() => { handleSongStorageChanged(); void loadTrack(); }} />}
+        {musicPanel === "settings" && <div className="themedeck-compact-settings" style={{padding: 12, marginTop: 8, borderRadius: 6, background: "rgba(255,255,255,.04)"}}>
+          <div style={{fontSize: 14, fontWeight: 700, marginBottom: 8}}>Playlist settings</div>
+          {loading ? <Spinner /> : track ? <>
+            <Focusable flow-children="row" style={{display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8}}>
+              <ControllerButton onCancel={navigateBack} onClick={handleTrackPreviewToggle}>{playback.appId === appId && playback.status === "playing" ? "Pause" : "Play"}</ControllerButton>
+              <ControllerButton onCancel={navigateBack} onClick={handleRemove}>Unassign all songs</ControllerButton>
+              <DeleteAssignedSong assignment={assignmentKey} path={track.path} Button={ControllerButton} onDeleted={() => { handleSongStorageChanged(); void loadTrack(); }} />
+            </Focusable>
+            <Focusable style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 24px"}}>
+              <SliderField className="themedeck-compact-slider" value={Math.round(track.volume * 100)} label="Volume" min={0} max={100} step={5} valueSuffix="%" showValue onChange={handleTrackVolumeChange} />
+              <SliderField className="themedeck-compact-slider" value={Math.round(track.startOffset)} label="Start skip" min={0} max={30} step={1} valueSuffix="s" showValue onChange={handleTrackStartOffsetChange} />
+              <div style={{gridColumn: "1 / -1"}}><ToggleField checked={track.loop} label="Loop playlist" onChange={handleTrackLoopChange} /></div>
+            </Focusable>
+          </> : <div style={{fontSize: 13}}>No music selected yet.</div>}
+        </div>}
+        {musicPanel === "files" && <div style={{padding: 12, marginTop: 8, borderRadius: 6, background: "rgba(255,255,255,.04)"}}>
+          <div style={{fontSize: 14, fontWeight: 700, marginBottom: 8}}>Local audio files</div>
             <div
               style={{
                 width: "100%",
@@ -7927,17 +8065,16 @@ const ChangeTheme = () => {
                 {currentDir}
               </div>
             </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
+          <div style={{marginTop: 8, maxHeight: 240, overflowY: "auto"}}>
             {browserLoading ? (
               <Spinner />
             ) : (
               <div
                 style={{
                   width: "100%",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.35rem",
+                  display: "grid",
+                  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                  gap: "4px",
                   paddingRight: "0.25rem",
                 }}
               >
@@ -7948,11 +8085,15 @@ const ChangeTheme = () => {
                     onClick={() => handleDirClick(dir)}
                     style={{
                       justifyContent: "flex-start",
-                      minHeight: "2.6rem",
-                      whiteSpace: "normal",
+                      minHeight: 28,
+                      width: "100%",
+                      textAlign: "left",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
                     }}
                   >
-                    Folder: {dir}
+                    📁 {dir}
                   </ControllerButton>
                 ))}
                 {audioFiles.map((file) => (
@@ -7962,11 +8103,15 @@ const ChangeTheme = () => {
                     onClick={() => handleFileClick(file)}
                     style={{
                       justifyContent: "flex-start",
-                      minHeight: "2.6rem",
-                      whiteSpace: "normal",
+                      minHeight: 28,
+                      width: "100%",
+                      textAlign: "left",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
                     }}
                   >
-                    Assign file: {file}
+                    {track ? "Add" : "Assign"}: {file}
                   </ControllerButton>
                 ))}
                 {!browser.dirs.length && !audioFiles.length ? (
@@ -7974,568 +8119,15 @@ const ChangeTheme = () => {
                 ) : null}
               </div>
             )}
-          </PanelSectionRow>
-        </PanelSection>
+          </div>
+        </div>}
       </div>
     </ScrollPanel>
   );
 };
 
-const ChangeGlobalTheme = () => {
-  const [track, setTrack] = useState<GlobalTrack | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [currentDir, setCurrentDir] = useState("/home/deck");
-  const [browser, setBrowser] = useState<DirectoryListing>({
-    path: "/home/deck",
-    dirs: [],
-    files: [],
-  });
-  const [browserLoading, setBrowserLoading] = useState(true);
-  const [manualPath, setManualPath] = useState("/home/deck");
-  const pageRef = useRef<HTMLDivElement | null>(null);
-
-  const loadTrack = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await fetchGlobalTrack();
-      setTrack(normalizeGlobalTrack(data));
-    } catch (error) {
-      console.error("[ThemeDeck] failed to load global track", error);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadTrack();
-  }, [loadTrack]);
-
-  const refreshDirectory = useCallback(
-    async (nextDir?: string) => {
-      setBrowserLoading(true);
-      try {
-        const listing = await listDirectory(nextDir || currentDir);
-        setBrowser(listing);
-        setCurrentDir(listing.path);
-        setManualPath(listing.path);
-      } catch (error) {
-        console.error("[ThemeDeck] list directory failed", error);
-      } finally {
-        setBrowserLoading(false);
-      }
-    },
-    [currentDir]
-  );
-
-  useEffect(() => {
-    refreshDirectory("/home/deck");
-  }, []);
-
-  useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      focusFirstInteractiveElement(
-        pageRef.current,
-        "button, [role='button'], [role='radio'], input, textarea, select, [tabindex]:not([tabindex='-1'])"
-      );
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
-  }, []);
-
-  const saveFromPath = async (fullPath: string) => {
-    try {
-      const filename = fullPath.split("/").pop() || "track";
-      const saved = await assignGlobalTrack(fullPath, filename);
-      const normalized = normalizeGlobalTrack(saved);
-      setTrack(normalized);
-      latestGlobalTrackForAutoPlay = normalized;
-      clearGlobalAmbientResumeSnapshot();
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-      scheduleAutoPlaybackFromContext();
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "Saved global ambient music",
-      });
-    } catch (error) {
-      console.error("[ThemeDeck] global save from path failed", error);
-      toaster.toast({
-        title: "ThemeDeck",
-        body: `Unable to add file: ${getErrorMessage(error, "Unknown error")}`,
-      });
-    }
-  };
-
-  const joinPath = (base: string, child: string) =>
-    base === "/" ? `/${child}` : `${base.replace(/\/$/, "")}/${child}`;
-
-  const goUp = () => {
-    if (currentDir === "/") return;
-    const parent = currentDir.replace(/\/[^/]+$/, "") || "/";
-    refreshDirectory(parent);
-  };
-
-  const handleDirClick = (dir: string) => {
-    refreshDirectory(joinPath(currentDir, dir));
-  };
-
-  const handleFileClick = (file: string) => {
-    saveFromPath(joinPath(currentDir, file));
-  };
-
-  const handleManualGo = () => {
-    if (!manualPath) return;
-    refreshDirectory(manualPath);
-  };
-
-  const handleRemove = async () => {
-    try {
-      await deleteGlobalTrack();
-      setTrack(null);
-      latestGlobalTrackForAutoPlay = null;
-      clearGlobalAmbientResumeSnapshot();
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-      scheduleAutoPlaybackFromContext();
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "Cleared global ambient music",
-      });
-    } catch (error) {
-      console.error("[ThemeDeck] global remove failed", error);
-    }
-  };
-
-  return (
-    <ScrollPanel>
-      <div
-        ref={pageRef}
-        style={{
-          padding: 24,
-          paddingTop: 48,
-          paddingBottom: 140,
-          minHeight: "100vh",
-          boxSizing: "border-box",
-        }}
-      >
-        <PanelSection title="ThemeDeck global / ambient track">
-          <PanelSectionRow>
-            {loading ? (
-              <Spinner />
-            ) : track ? (
-              <div>
-                <div style={{ fontWeight: 600 }}>{track.filename}</div>
-                <div style={{ opacity: 0.8 }}>{track.path}</div>
-              </div>
-            ) : (
-              <div>No global track selected yet.</div>
-            )}
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div
-              style={{
-                width: "100%",
-                display: "flex",
-                gap: "0.5rem",
-                flexWrap: "nowrap",
-                alignItems: "center",
-              }}
-            >
-              {track ? (
-                <button
-                  className="DialogButton"
-                  onClick={handleRemove}
-                  style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
-                >
-                  Unassign music
-                </button>
-              ) : null}
-              <button
-                className="DialogButton"
-                onClick={() => Navigation.NavigateBack()}
-                style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
-              >
-                Done
-              </button>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
-
-        {track && <PanelSection title="Delete downloaded song"><PanelSectionRow><DeleteAssignedSong assignment="__global__" path={track.path} Button={ControllerButton} onDeleted={() => { setTrack(null); handleSongStorageChanged(); }} /></PanelSectionRow></PanelSection>}
-        <PanelSection title="Song storage">
-          <PanelSectionRow><ControllerButton onCancel={() => Navigation.NavigateBack()} onClick={() => Navigation.Navigate("/themedeck/storage")}>
-            Delete downloads / manage storage…
-          </ControllerButton></PanelSectionRow>
-        </PanelSection>
-        <PanelSection title="Browse local files to assign from system storage">
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                width: "100%",
-                gap: "0.5rem",
-                alignItems: "center",
-              }}
-            >
-              <button className="DialogButton" onClick={goUp}>
-                Up
-              </button>
-              <div style={{ flexGrow: 1, fontFamily: "monospace" }}>
-                {currentDir}
-              </div>
-            </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "1fr auto",
-                width: "100%",
-                gap: "0.5rem",
-                alignItems: "center",
-              }}
-            >
-            <TextField
-              value={manualPath}
-              onChange={(e) => setManualPath(e.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  handleManualGo();
-                }
-              }}
-              style={{ width: "100%", minWidth: "20rem" }}
-            />
-              <button className="DialogButton" onClick={handleManualGo}>
-                Go
-              </button>
-            </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            {browserLoading ? (
-              <Spinner />
-            ) : (
-              <div
-                style={{
-                  width: "100%",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.35rem",
-                  paddingRight: "0.25rem",
-                }}
-              >
-                {browser.dirs.map((dir) => (
-                  <button
-                    key={`dir-${dir}`}
-                    className="DialogButton"
-                    onClick={() => handleDirClick(dir)}
-                    style={{ justifyContent: "flex-start" }}
-                  >
-                    📁 {dir}
-                  </button>
-                ))}
-                {browser.files
-                  .filter((file) =>
-                    AUDIO_EXTENSIONS.some((ext) =>
-                      file.toLowerCase().endsWith(`.${ext}`)
-                    )
-                  )
-                  .map((file) => (
-                    <button
-                      key={`file-${file}`}
-                      className="DialogButton"
-                      onClick={() => handleFileClick(file)}
-                      style={{ justifyContent: "flex-start" }}
-                    >
-                      🎵 {file}
-                    </button>
-                  ))}
-                {!browser.dirs.length && !browser.files.length && (
-                  <div style={{ opacity: 0.6 }}>Folder is empty.</div>
-                )}
-              </div>
-            )}
-          </PanelSectionRow>
-        </PanelSection>
-
-      </div>
-    </ScrollPanel>
-  );
-};
-
-const ChangeStoreTheme = () => {
-  const [track, setTrack] = useState<StoreTrack | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [currentDir, setCurrentDir] = useState("/home/deck");
-  const [browser, setBrowser] = useState<DirectoryListing>({
-    path: "/home/deck",
-    dirs: [],
-    files: [],
-  });
-  const [browserLoading, setBrowserLoading] = useState(true);
-  const [manualPath, setManualPath] = useState("/home/deck");
-  const pageRef = useRef<HTMLDivElement | null>(null);
-
-  const loadTrack = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await fetchStoreTrack();
-      setTrack(normalizeGlobalTrack(data));
-    } catch (error) {
-      console.error("[ThemeDeck] failed to load store track", error);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadTrack();
-  }, [loadTrack]);
-
-  const refreshDirectory = useCallback(
-    async (nextDir?: string) => {
-      setBrowserLoading(true);
-      try {
-        const listing = await listDirectory(nextDir || currentDir);
-        setBrowser(listing);
-        setCurrentDir(listing.path);
-        setManualPath(listing.path);
-      } catch (error) {
-        console.error("[ThemeDeck] list directory failed", error);
-      } finally {
-        setBrowserLoading(false);
-      }
-    },
-    [currentDir]
-  );
-
-  useEffect(() => {
-    refreshDirectory("/home/deck");
-  }, []);
-
-  useEffect(() => {
-    const timeoutId = window.setTimeout(() => {
-      focusFirstInteractiveElement(
-        pageRef.current,
-        "button, [role='button'], [role='radio'], input, textarea, select, [tabindex]:not([tabindex='-1'])"
-      );
-    }, 0);
-    return () => window.clearTimeout(timeoutId);
-  }, []);
-
-  const saveFromPath = async (fullPath: string) => {
-    try {
-      const filename = fullPath.split("/").pop() || "track";
-      const saved = await assignStoreTrack(fullPath, filename);
-      const normalized = normalizeGlobalTrack(saved);
-      setTrack(normalized);
-      latestStoreTrackForAutoPlay = normalized;
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-      scheduleAutoPlaybackFromContext();
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "Saved store-only music",
-      });
-    } catch (error) {
-      console.error("[ThemeDeck] store save from path failed", error);
-      toaster.toast({
-        title: "ThemeDeck",
-        body: `Unable to add file: ${getErrorMessage(error, "Unknown error")}`,
-      });
-    }
-  };
-
-  const joinPath = (base: string, child: string) =>
-    base === "/" ? `/${child}` : `${base.replace(/\/$/, "")}/${child}`;
-
-  const goUp = () => {
-    if (currentDir === "/") return;
-    const parent = currentDir.replace(/\/[^/]+$/, "") || "/";
-    refreshDirectory(parent);
-  };
-
-  const handleDirClick = (dir: string) => {
-    refreshDirectory(joinPath(currentDir, dir));
-  };
-
-  const handleFileClick = (file: string) => {
-    saveFromPath(joinPath(currentDir, file));
-  };
-
-  const handleManualGo = () => {
-    if (!manualPath) return;
-    refreshDirectory(manualPath);
-  };
-
-  const handleRemove = async () => {
-    try {
-      await deleteStoreTrack();
-      setTrack(null);
-      latestStoreTrackForAutoPlay = null;
-      window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
-      scheduleAutoPlaybackFromContext();
-      toaster.toast({
-        title: "ThemeDeck",
-        body: "Cleared store-only music",
-      });
-    } catch (error) {
-      console.error("[ThemeDeck] store remove failed", error);
-    }
-  };
-
-  return (
-    <ScrollPanel>
-      <div
-        ref={pageRef}
-        style={{
-          padding: 24,
-          paddingTop: 48,
-          paddingBottom: 140,
-          minHeight: "100vh",
-          boxSizing: "border-box",
-        }}
-      >
-        <PanelSection title="ThemeDeck store-only track">
-          <PanelSectionRow>
-            {loading ? (
-              <Spinner />
-            ) : track ? (
-              <div>
-                <div style={{ fontWeight: 600 }}>{track.filename}</div>
-                <div style={{ opacity: 0.8 }}>{track.path}</div>
-              </div>
-            ) : (
-              <div>No store-only track selected yet.</div>
-            )}
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div
-              style={{
-                width: "100%",
-                display: "flex",
-                gap: "0.5rem",
-                flexWrap: "nowrap",
-                alignItems: "center",
-              }}
-            >
-              {track ? (
-                <button
-                  className="DialogButton"
-                  onClick={handleRemove}
-                  style={{ minWidth: "8.5rem", whiteSpace: "nowrap" }}
-                >
-                  Unassign music
-                </button>
-              ) : null}
-              <button
-                className="DialogButton"
-                onClick={() => Navigation.NavigateBack()}
-                style={{ minWidth: "6rem", whiteSpace: "nowrap" }}
-              >
-                Done
-              </button>
-            </div>
-          </PanelSectionRow>
-        </PanelSection>
-
-        {track && <PanelSection title="Delete downloaded song"><PanelSectionRow><DeleteAssignedSong assignment="__store__" path={track.path} Button={ControllerButton} onDeleted={() => { setTrack(null); handleSongStorageChanged(); }} /></PanelSectionRow></PanelSection>}
-        <PanelSection title="Song storage">
-          <PanelSectionRow><ControllerButton onCancel={() => Navigation.NavigateBack()} onClick={() => Navigation.Navigate("/themedeck/storage")}>
-            Delete downloads / manage storage…
-          </ControllerButton></PanelSectionRow>
-        </PanelSection>
-        <PanelSection title="Browse local files to assign from system storage">
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "flex",
-                width: "100%",
-                gap: "0.5rem",
-                alignItems: "center",
-              }}
-            >
-              <button className="DialogButton" onClick={goUp}>
-                Up
-              </button>
-              <div style={{ flexGrow: 1, fontFamily: "monospace" }}>
-                {currentDir}
-              </div>
-            </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "1fr auto",
-                width: "100%",
-                gap: "0.5rem",
-                alignItems: "center",
-              }}
-            >
-            <TextField
-              value={manualPath}
-              onChange={(e) => setManualPath(e.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  handleManualGo();
-                }
-              }}
-              style={{ width: "100%", minWidth: "20rem" }}
-            />
-              <button className="DialogButton" onClick={handleManualGo}>
-                Go
-              </button>
-            </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            {browserLoading ? (
-              <Spinner />
-            ) : (
-              <div
-                style={{
-                  width: "100%",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.35rem",
-                  paddingRight: "0.25rem",
-                }}
-              >
-                {browser.dirs.map((dir) => (
-                  <button
-                    key={`dir-${dir}`}
-                    className="DialogButton"
-                    onClick={() => handleDirClick(dir)}
-                    style={{ justifyContent: "flex-start" }}
-                  >
-                    📁 {dir}
-                  </button>
-                ))}
-                {browser.files
-                  .filter((file) =>
-                    AUDIO_EXTENSIONS.some((ext) =>
-                      file.toLowerCase().endsWith(`.${ext}`)
-                    )
-                  )
-                  .map((file) => (
-                    <button
-                      key={`file-${file}`}
-                      className="DialogButton"
-                      onClick={() => handleFileClick(file)}
-                      style={{ justifyContent: "flex-start" }}
-                    >
-                      🎵 {file}
-                    </button>
-                  ))}
-                {!browser.dirs.length && !browser.files.length && (
-                  <div style={{ opacity: 0.6 }}>Folder is empty.</div>
-                )}
-              </div>
-            )}
-          </PanelSectionRow>
-        </PanelSection>
-
-      </div>
-    </ScrollPanel>
-  );
-};
+const ChangeGlobalTheme = () => <ChangeTheme scope="global" />;
+const ChangeStoreTheme = () => <ChangeTheme scope="store" />;
 
 const handleSongStorageChanged = () => {
   // Drop stale references before stopPlayback schedules another autoplay pass.
@@ -8549,6 +8141,7 @@ const handleSongStorageChanged = () => {
 };
 
 export default definePlugin(() => {
+  routerHook.addGlobalComponent("ThemeDeckNowPlaying", NowPlayingCard);
   const stopDeckShelves = startDeckShelvesIntegration(fetchTracks, getSteamLibraryGames);
   startLocationWatcher();
   startSteamAppWatchers();
@@ -8592,6 +8185,7 @@ export default definePlugin(() => {
     icon: <FaMusic />,
     content: <Content />,
     onDismount() {
+      routerHook.removeGlobalComponent("ThemeDeckNowPlaying");
       stopDeckShelves();
       stopLocationWatcher();
       stopSteamAppWatchers();
