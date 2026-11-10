@@ -26,7 +26,7 @@ function harness(componentName, overrides = {}) {
     ...overrides,
   };
   const output = {exports: {}};
-  const sandbox = {exports: output.exports, module: output, window: {SP_REACT: React, setTimeout: fn => fn()}, require: name => name === 'react' ? React : name === '@decky/api' ? {callable: name => apis[name]} : name === './error-message' ? errors.exports : {Navigation: {NavigateBack() {}}, PanelSection: 'section', PanelSectionRow: 'row', ScrollPanel: 'scroll', Spinner: 'spinner'}};
+  const sandbox = {exports: output.exports, module: output, window: {SP_REACT: React, setTimeout: fn => fn()}, require: name => name === 'react' ? React : name === '@decky/api' ? {callable: name => apis[name]} : name === './error-message' ? errors.exports : name === './i18n' ? {t: (value, vars) => vars ? value.replace(/\{(\w+)\}/g, (match, key) => key in vars ? String(vars[key]) : match) : value} : {Navigation: {NavigateBack() {}}, PanelSection: 'section', PanelSectionRow: 'row', ScrollPanel: 'scroll', Spinner: 'spinner'}};
   vm.runInNewContext(transpile('song-storage.tsx'), sandbox);
   const props = {Button: 'button', onChanged: () => calls.push(['changed']), assignment: '1', path: file.path, onDeleted: () => calls.push(['changed'])};
   const render = () => {cursor = 0; effects = []; changed = false; tree = output.exports[componentName](props); effects.forEach(fn => fn());};

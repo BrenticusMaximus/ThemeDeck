@@ -57,6 +57,7 @@ import { startDeckShelvesIntegration, updateShelfAssignments } from "./deck-shel
 import { spectrumHeights, smoothHeights } from "./visualizer";
 import { BUILD_ID, BUILD_LABEL } from "./build-info";
 import { getErrorMessage } from "./error-message";
+import { t } from "./i18n";
 import { SongStorage, DeleteAssignedSong } from "./song-storage";
 
 type BackendTrack = {
@@ -1151,7 +1152,7 @@ const resolveAudioUrl = async (track: GameTrack) => {
   }
   const payload = await loadTrackAudio(track.path);
   if (!payload?.data) {
-    throw new Error("No audio data returned");
+    throw new Error(t("No audio data returned"));
   }
   const objectUrl = decodePayloadToObjectUrl(payload);
   audioCache.set(track.path, {
@@ -1438,7 +1439,7 @@ const toggleCardPlayback = async () => {
       notifyPlayback({...playbackState, paused: false});
     } catch (error) {
       userPausedScope = playbackState.appId;
-      toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, "Unable to resume music")});
+      toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, t("Unable to resume music"))});
     }
   }
 };
@@ -1660,10 +1661,10 @@ const playTrack = async (track: GameTrack, reason: PlaybackReason) => {
     const message =
       error instanceof Error && error.message
         ? error.message
-        : "Unknown playback error";
+        : t("Unknown playback error");
     toaster.toast({
       title: "ThemeDeck",
-      body: `Can't play ${track.filename}: ${message}`,
+      body: t("Can't play {file}: {error}", {file: track.filename, error: message}),
     });
     failedAutoPlaybackPaths.add(track.path);
     stopPlayback(false, "play_failed_exception");
@@ -2682,7 +2683,7 @@ const insertThemeDeckMenu = (children: any, appId: number) => {
         if (!latestAppId) {
           toaster.toast({
             title: "ThemeDeck",
-            body: "Couldn't determine current game app id",
+            body: t("Couldn't determine current game app id"),
           });
           return;
         }
@@ -2690,7 +2691,7 @@ const insertThemeDeckMenu = (children: any, appId: number) => {
         Navigation.Navigate(`/themedeck/${latestAppId}`);
       }}
     >
-      Choose ThemeDeck music...
+      {t("Choose ThemeDeck music...")}
     </MenuItem>
   );
 
@@ -3109,7 +3110,7 @@ const NowPlayingCard = ({gamePage = false}: {gamePage?: boolean}) => {
     const sourceName =
       toHumanReadableTrackName(playingTrack.filename || "") ||
       toHumanReadableTrackName(playingTrack.path.split("/").pop() || "");
-    const gameName = appId === GLOBAL_AMBIENT_APP_ID ? "Global ambient music" : appId === STORE_TRACK_APP_ID ? "Store music" : appId ? getDisplayName(appId) : "Unknown game";
+    const gameName = appId === GLOBAL_AMBIENT_APP_ID ? t("Global ambient music") : appId === STORE_TRACK_APP_ID ? t("Store music") : appId ? getDisplayName(appId) : t("Unknown game");
     const resolved = resolveNowPlayingText(sourceName, gameName);
     return {
       trackName: resolved.trackName,
@@ -3185,8 +3186,8 @@ const NowPlayingCard = ({gamePage = false}: {gamePage?: boolean}) => {
           }}
         >
           <span style={{ display: "inline-grid", whiteSpace: "nowrap" }}>
-            <span aria-hidden="true" style={{ gridArea: "1 / 1", visibility: "hidden" }}>NOW PLAYING</span>
-            <span style={{ gridArea: "1 / 1" }}>{playback.paused ? "PAUSED" : "NOW PLAYING"}</span>
+            <span aria-hidden="true" style={{ gridArea: "1 / 1", visibility: "hidden" }}>{t("NOW PLAYING")}</span>
+            <span style={{ gridArea: "1 / 1" }}>{playback.paused ? t("PAUSED") : t("NOW PLAYING")}</span>
           </span>
           <NowPlayingVisualizer />
         </div>
@@ -3235,8 +3236,8 @@ const PlaylistPlaybackControls = () => {
         event.preventDefault(); event.stopImmediatePropagation(); element.focus();
       };
       if (inside) {
-        const gear = footer.querySelector<HTMLElement>('[aria-label="Choose ThemeDeck music"]');
-        const pause = footer.querySelector<HTMLElement>('[aria-label="Pause music"], [aria-label="Play music"]');
+        const gear = footer.querySelector<HTMLElement>(`[aria-label="${t("Choose ThemeDeck music")}"]`);
+        const pause = footer.querySelector<HTMLElement>(`[aria-label="${t("Pause music")}"], [aria-label="${t("Play music")}"]`);
         const controls = Array.from(footer.querySelectorAll<HTMLButtonElement>('button')).filter(button => !button.disabled);
         const current = target.closest<HTMLElement>('button');
         const index = controls.indexOf(current as HTMLButtonElement);
@@ -3264,7 +3265,7 @@ const PlaylistPlaybackControls = () => {
       const play = findPlay();
       // Only bridge the game's main action row; leave menus and other page rows alone.
       if (!play || Math.abs(target.getBoundingClientRect().top - play.getBoundingClientRect().top) > 55) return;
-      const pause = footer.querySelector<HTMLElement>('[aria-label="Pause music"], [aria-label="Play music"]');
+      const pause = footer.querySelector<HTMLElement>(`[aria-label="${t("Pause music")}"], [aria-label="${t("Play music")}"]`);
       if (pause) { returnTarget = target; event.preventDefault(); event.stopImmediatePropagation(); pause.focus(); }
     };
     const findPlay = () => Array.from(doc.querySelectorAll<HTMLElement>('button,[role="button"]')).find(element =>
@@ -3290,14 +3291,14 @@ const PlaylistPlaybackControls = () => {
       .themedeck-player-footer button.Disabled { opacity: .3; }
     `}</style>
     <Focusable flow-children="row" style={{display: "flex", alignItems: "center", gap: 2}}>
-      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label="Previous track" title="Previous track" style={style} disabled={list.length < 2} onClick={() => void movePlaylist(-1)}><FaStepBackward /></ControllerButton>
-      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label={playback.paused ? "Play music" : "Pause music"} title={playback.paused ? "Play" : "Pause"} style={{...style, background: "rgba(160,202,255,.09)"}} onClick={() => void toggleCardPlayback()}>{playback.paused ? <FaPlay /> : <FaPause />}</ControllerButton>
-      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label="Next track" title="Next track" style={style} disabled={list.length < 2} onClick={() => void movePlaylist(1)}><FaStepForward /></ControllerButton>
+      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label={t("Previous track")} title={t("Previous track")} style={style} disabled={list.length < 2} onClick={() => void movePlaylist(-1)}><FaStepBackward /></ControllerButton>
+      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label={playback.paused ? t("Play music") : t("Pause music")} title={playback.paused ? t("Play") : t("Pause")} style={{...style, background: "rgba(160,202,255,.09)"}} onClick={() => void toggleCardPlayback()}>{playback.paused ? <FaPlay /> : <FaPause />}</ControllerButton>
+      <ControllerButton onCancel={() => Navigation.NavigateBack()} aria-label={t("Next track")} title={t("Next track")} style={style} disabled={list.length < 2} onClick={() => void movePlaylist(1)}><FaStepForward /></ControllerButton>
     </Focusable>
     <Focusable flow-children="column" style={{position: "relative", display: "flex", gap: 7, alignItems: "center", whiteSpace: "nowrap", fontSize: 10, color: "#b5c2d1", fontVariantNumeric: "tabular-nums"}}>
-      <ControllerButton aria-label="Choose ThemeDeck music" title="Choose ThemeDeck music" onCancel={() => Navigation.NavigateBack()} style={{...style, position: "absolute", right: 0, bottom: "calc(100% + 2px)", fontSize: 13}} onClick={() => Navigation.Navigate(playback.appId === GLOBAL_AMBIENT_APP_ID ? "/themedeck/global" : playback.appId === STORE_TRACK_APP_ID ? "/themedeck/store" : playback.appId && playback.appId > 0 ? `/themedeck/${playback.appId}` : "/themedeck")}><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 4.5 18 2v6.4l-2-.5V5.8L10 7.3V18c0 2.3-2.4 4-5 4-2.2 0-4-1.4-4-3.2s2-3.3 4.4-3.3c1 0 1.9.2 2.6.6Z" /><path fillRule="evenodd" d="M21.27 13.82 L23.14 14.48 L23.14 17.52 L21.27 18.18 L21.27 18.18 L22.12 19.98 L19.98 22.12 L18.18 21.27 L18.18 21.27 L17.52 23.14 L14.48 23.14 L13.82 21.27 L13.82 21.27 L12.02 22.12 L9.88 19.98 L10.73 18.18 L10.73 18.18 L8.86 17.52 L8.86 14.48 L10.73 13.82 L10.73 13.82 L9.88 12.02 L12.02 9.88 L13.82 10.73 L13.82 10.73 L14.48 8.86 L17.52 8.86 L18.18 10.73 L18.18 10.73 L19.98 9.88 L22.12 12.02 L21.27 13.82 Z M19 16 A3 3 0 1 0 13 16 A3 3 0 1 0 19 16 Z" /></svg></ControllerButton>
+      <ControllerButton aria-label={t("Choose ThemeDeck music")} title={t("Choose ThemeDeck music")} onCancel={() => Navigation.NavigateBack()} style={{...style, position: "absolute", right: 0, bottom: "calc(100% + 2px)", fontSize: 13}} onClick={() => Navigation.Navigate(playback.appId === GLOBAL_AMBIENT_APP_ID ? "/themedeck/global" : playback.appId === STORE_TRACK_APP_ID ? "/themedeck/store" : playback.appId && playback.appId > 0 ? `/themedeck/${playback.appId}` : "/themedeck")}><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 4.5 18 2v6.4l-2-.5V5.8L10 7.3V18c0 2.3-2.4 4-5 4-2.2 0-4-1.4-4-3.2s2-3.3 4.4-3.3c1 0 1.9.2 2.6.6Z" /><path fillRule="evenodd" d="M21.27 13.82 L23.14 14.48 L23.14 17.52 L21.27 18.18 L21.27 18.18 L22.12 19.98 L19.98 22.12 L18.18 21.27 L18.18 21.27 L17.52 23.14 L14.48 23.14 L13.82 21.27 L13.82 21.27 L12.02 22.12 L9.88 19.98 L10.73 18.18 L10.73 18.18 L8.86 17.52 L8.86 14.48 L10.73 13.82 L10.73 13.82 L9.88 12.02 L12.02 9.88 L13.82 10.73 L13.82 10.73 L14.48 8.86 L17.52 8.86 L18.18 10.73 L18.18 10.73 L19.98 9.88 L22.12 12.02 L21.27 13.82 Z M19 16 A3 3 0 1 0 13 16 A3 3 0 1 0 19 16 Z" /></svg></ControllerButton>
       {list.length > 1 && <span style={{opacity: .65}}>{index + 1}/{list.length}</span>}
-      <span aria-label="Time remaining" title="Time remaining">−{remaining}</span>
+      <span aria-label={t("Time remaining")} title={t("Time remaining")}>−{remaining}</span>
     </Focusable>
   </div>;
 };
@@ -3305,32 +3306,32 @@ const PlaylistPlaybackControls = () => {
 const AssignedPlaylist = ({track, scope, refresh}: {track: GlobalTrack | null; scope: string; refresh: () => Promise<void>}) => {
   const [busy, setBusy] = useState(false);
   const list = track ? [track, ...(track.additionalTracks ?? [])] : [];
-  return <PanelSection title={`Assigned songs (${list.length})`}>
+  return <PanelSection title={t("Assigned songs ({count})", {count: list.length})}>
     <PanelSectionRow><div>
-      <div style={{fontSize: 12, opacity: .7, marginBottom: 6}}>{list.length ? "New songs are added to this playlist. Use the arrows to change playback order." : "No songs yet. Search YouTube to add your first song."}</div>
+      <div style={{fontSize: 12, opacity: .7, marginBottom: 6}}>{list.length ? t("New songs are added to this playlist. Use the arrows to change playback order.") : t("No songs yet. Search YouTube to add your first song.")}</div>
     </div></PanelSectionRow>
     {list.map((item, i) => <PanelSectionRow key={item.path}><div style={{width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "4px 0"}}>
       <div title={item.filename} style={{flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13}}>{i + 1}. {toHumanReadableTrackName(item.filename)}</div>
       {list.length > 1 && <Focusable flow-children="row" style={{display: "flex", gap: 4}} >
         {([-1, 1] as const).map(direction => <ControllerButton key={direction} style={{minWidth: 30, width: 30, height: 28, padding: 0, fontSize: 14}}
           disabled={busy || (direction === -1 ? i === 0 : i === list.length - 1)}
-          aria-label={`${direction === -1 ? "Move up" : "Move down"}: ${item.filename}`}
+          aria-label={`${direction === -1 ? t("Move up") : t("Move down")}: ${item.filename}`}
           onClick={async () => {
             setBusy(true);
             try {
               await movePlaylistTrack(scope, item.path, direction);
               window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
               await refresh();
-            } catch (error) { toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, "Unable to reorder songs")}); }
+            } catch (error) { toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, t("Unable to reorder songs"))}); }
             finally { setBusy(false); }
           }}>{direction === -1 ? "↑" : "↓"}</ControllerButton>)}
       </Focusable>}
       <ControllerButton style={{minWidth: 64, width: "auto", height: 28, padding: "2px 8px", fontSize: 12}} disabled={busy} onClick={async () => {
         setBusy(true);
         try { await removePlaylistTrack(scope, item.path); handleSongStorageChanged(); await refresh(); }
-        catch (error) { toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, "Unable to remove song")}); }
+        catch (error) { toaster.toast({title: "ThemeDeck", body: getErrorMessage(error, t("Unable to remove song"))}); }
         finally { setBusy(false); }
-      }}>Remove</ControllerButton>
+      }}>{t("Remove")}</ControllerButton>
     </div></PanelSectionRow>)}
   </PanelSection>;
 };
@@ -3596,9 +3597,9 @@ const resolveNowPlayingText = (
   gameName: string
 ): { trackName: string; albumName: string } => {
   const cleaned = toHumanReadableTrackName(sourceName);
-  const defaultAlbum = toHumanReadableTrackName(gameName) || "Unknown album";
+  const defaultAlbum = toHumanReadableTrackName(gameName) || t("Unknown album");
   if (!cleaned) {
-    return { trackName: "Unknown track", albumName: defaultAlbum };
+    return { trackName: t("Unknown track"), albumName: defaultAlbum };
   }
   const parts = cleaned
     .split(/\s+[-–—]\s+/)
@@ -3638,7 +3639,7 @@ const normalizeGlobalTrack = (
   return {
     additionalTracks: (raw.additional_tracks ?? []).map(item => normalizeGlobalTrack(item)).filter((item): item is GlobalTrack => !!item),
     path: raw.path,
-    filename: raw.filename || raw.path.split("/").pop() || "Global track",
+    filename: raw.filename || raw.path.split("/").pop() || t("Global track"),
     volume: typeof raw.volume === "number" ? clamp(raw.volume) : 1,
     startOffset:
       typeof raw.start_offset === "number"
@@ -4572,7 +4573,7 @@ const useTrackState = (options?: { silent?: boolean }) => {
       if (!silent) {
         toaster.toast({
           title: "ThemeDeck",
-          body: "Failed to load saved tracks",
+          body: t("Failed to load saved tracks"),
         });
       }
     } finally {
@@ -5031,7 +5032,7 @@ const Content = () => {
           : "resolved";
         const name =
           status === "failed"
-            ? "Name unavailable"
+            ? t("Name unavailable")
             : fallbackName;
         return {
           appid: game.appid,
@@ -5357,7 +5358,7 @@ const Content = () => {
       } catch (error) {
         console.error("[ThemeDeck] backend library scan failed", error);
         logClient("warning", "library_backend_scan_failed", {
-          error: getErrorMessage(error, "Unknown library scan error"),
+          error: getErrorMessage(error, t("Unknown library scan error")),
         });
       }
 
@@ -5426,10 +5427,7 @@ const Content = () => {
       }));
       toaster.toast({
         title: "ThemeDeck",
-        body: `Failed to save Firefox cookie setting: ${getErrorMessage(
-          error,
-          "Unknown settings error"
-        )}`,
+        body: t("Failed to save Firefox cookie setting: {error}", {error: getErrorMessage(error, t("Unknown settings error"))}),
       });
     } finally {
       setFirefoxCookiesBusy(false);
@@ -5449,7 +5447,7 @@ const Content = () => {
     setYtDlpBusy(true);
     toaster.toast({
       title: "ThemeDeck",
-      body: "Updating YouTube support (yt-dlp and Deno). This can take a minute.",
+      body: t("Updating YouTube support (yt-dlp and Deno). This can take a minute."),
     });
     try {
       const status = await updateYtDlp();
@@ -5463,21 +5461,19 @@ const Content = () => {
       });
       toaster.toast({
         title: "ThemeDeck",
-        body: `YouTube support ready (yt-dlp ${
-          formatYtDlpVersion(status.version) || "latest"
-        }, Deno ${status.deno_version || "ready"})`,
+        body: t("YouTube support ready (yt-dlp {version}, Deno {deno})", {
+          version: formatYtDlpVersion(status.version) || t("latest"),
+          deno: status.deno_version || t("ready"),
+        }),
       });
     } catch (error) {
       console.error("[ThemeDeck] update yt-dlp failed", error);
       logClient("error", "yt_dlp_update_failed", {
-        error: getErrorMessage(error, "Unknown update error"),
+        error: getErrorMessage(error, t("Unknown update error")),
       });
       toaster.toast({
         title: "ThemeDeck",
-        body: `Failed to update YouTube support: ${getErrorMessage(
-          error,
-          "Unknown update error"
-        )}`,
+        body: t("Failed to update YouTube support: {error}", {error: getErrorMessage(error, t("Unknown update error"))}),
       });
     } finally {
       setYtDlpBusy(false);
@@ -5493,7 +5489,7 @@ const Content = () => {
     setBulkAssign((prev) => ({
       ...prev,
       stopRequested: true,
-      message: "Stopping after current operation...",
+      message: t("Stopping after current operation..."),
     }));
   }, [bulkAssign.running]);
 
@@ -5503,13 +5499,13 @@ const Content = () => {
     }
     setBulkAssignMode(mode);
     if (!ytDlpStatus.ready) {
-      toaster.toast({title: "ThemeDeck", body: "YouTube support is not ready. Use Update YouTube support first."});
+      toaster.toast({title: "ThemeDeck", body: t("YouTube support is not ready. Use Update YouTube support first.")});
       return;
     }
     if (!libraryGames.length) {
       toaster.toast({
         title: "ThemeDeck",
-        body: "No games found in library.",
+        body: t("No games found in library."),
       });
       return;
     }
@@ -5532,15 +5528,14 @@ const Content = () => {
       (game) => !latestTracks[game.appid]
     );
     if (!allMissingGames.length) {
-      const modeLabel =
-        mode === "installed"
-          ? "installed games"
-          : mode === "uninstalled"
-            ? "uninstalled games"
-            : "library games";
       toaster.toast({
         title: "ThemeDeck",
-        body: `No ${modeLabel} are missing assigned music.`,
+        body:
+          mode === "installed"
+            ? t("No installed games are missing assigned music.")
+            : mode === "uninstalled"
+              ? t("No uninstalled games are missing assigned music.")
+              : t("No library games are missing assigned music."),
       });
       return;
     }
@@ -5605,8 +5600,8 @@ const Content = () => {
       currentGame: "",
       message:
         unknownNameCount > 0
-          ? `Preparing bulk assignment... (${unknownNameCount} unnamed games will still be attempted)`
-          : "Preparing bulk assignment...",
+          ? t("Preparing bulk assignment... ({count} unnamed games will still be attempted)", {count: unknownNameCount})
+          : t("Preparing bulk assignment..."),
     });
 
     for (const game of missingGames) {
@@ -5651,7 +5646,7 @@ const Content = () => {
           completed,
           skipped,
           currentGame: gameName,
-          message: `Skipped ${gameName} (already assigned).`,
+          message: t("Skipped {game} (already assigned).", {game: gameName}),
         }));
         continue;
       }
@@ -5670,7 +5665,7 @@ const Content = () => {
         setBulkAssign((prev) => ({
           ...prev,
           currentGame: gameName,
-          message: `Searching YouTube for ${gameName} (${query})...`,
+          message: t("Searching YouTube for {game} ({query})...", {game: gameName, query}),
         }));
         try {
           const response = await searchYouTube(query, 5);
@@ -5690,7 +5685,7 @@ const Content = () => {
           }
         } catch (error) {
           hadSearchError = true;
-          searchErrorSummary = getErrorMessage(error, "Unknown search error");
+          searchErrorSummary = getErrorMessage(error, t("Unknown search error"));
         }
       }
 
@@ -5715,8 +5710,8 @@ const Content = () => {
           failed,
           currentGame: gameName,
           message: hadSearchError
-            ? `Search failed for ${gameName}: ${searchErrorSummary}`
-            : `No eligible YouTube results for ${gameName}.`,
+            ? t("Search failed for {game}: {error}", {game: gameName, error: searchErrorSummary})
+            : t("No eligible YouTube results for {game}.", {game: gameName}),
         }));
         continue;
       }
@@ -5734,7 +5729,7 @@ const Content = () => {
           completed,
           skipped,
           currentGame: gameName,
-          message: `Skipped ${gameName} (already assigned).`,
+          message: t("Skipped {game} (already assigned).", {game: gameName}),
         }));
         continue;
       }
@@ -5752,7 +5747,7 @@ const Content = () => {
         setBulkAssign((prev) => ({
           ...prev,
           currentGame: gameName,
-          message: `Downloading match ${index + 1}/${candidateResults.length} for ${gameName}...`,
+          message: t("Downloading match {index}/{total} for {game}...", {index: index + 1, total: candidateResults.length, game: gameName}),
         }));
 
         try {
@@ -5770,11 +5765,11 @@ const Content = () => {
             completed,
             assigned,
             currentGame: gameName,
-            message: `Assigned ${gameName}.`,
+            message: t("Assigned {game}.", {game: gameName}),
           }));
           break;
         } catch (error) {
-          lastDownloadError = getErrorMessage(error, "Unknown download error");
+          lastDownloadError = getErrorMessage(error, t("Unknown download error"));
         }
       }
 
@@ -5786,7 +5781,7 @@ const Content = () => {
           completed,
           failed,
           currentGame: gameName,
-          message: `All download attempts failed for ${gameName}: ${lastDownloadError || "No usable results"}`,
+          message: t("All download attempts failed for {game}: {error}", {game: gameName, error: lastDownloadError || t("No usable results")}),
         }));
       }
     }
@@ -5803,15 +5798,15 @@ const Content = () => {
       stopRequested: false,
       currentGame: "",
       message: wasStopped
-        ? `Stopped. Assigned ${assigned}, skipped ${skipped}, failed ${failed}.`
-        : `Done. Assigned ${assigned}, skipped ${skipped}, failed ${failed}.`,
+        ? t("Stopped. Assigned {assigned}, skipped {skipped}, failed {failed}.", {assigned, skipped, failed})
+        : t("Done. Assigned {assigned}, skipped {skipped}, failed {failed}.", {assigned, skipped, failed}),
     }));
 
     toaster.toast({
       title: "ThemeDeck",
       body: wasStopped
-        ? `Bulk assign stopped. Assigned ${assigned}, skipped ${skipped}, failed ${failed}.`
-        : `Bulk assign complete. Assigned ${assigned}, skipped ${skipped}, failed ${failed}.`,
+        ? t("Bulk assign stopped. Assigned {assigned}, skipped {skipped}, failed {failed}.", {assigned, skipped, failed})
+        : t("Bulk assign complete. Assigned {assigned}, skipped {skipped}, failed {failed}.", {assigned, skipped, failed}),
     });
   }, [
     bulkAssign.running,
@@ -5864,7 +5859,7 @@ const Content = () => {
       console.error("[ThemeDeck] global volume update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save global track volume",
+        body: t("Couldn't save global track volume"),
       });
     }
   };
@@ -5887,7 +5882,7 @@ const Content = () => {
       console.error("[ThemeDeck] global start offset update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save global song start truncation",
+        body: t("Couldn't save global song start truncation"),
       });
     }
   };
@@ -5909,7 +5904,7 @@ const Content = () => {
       console.error("[ThemeDeck] global loop update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save global track loop setting",
+        body: t("Couldn't save global track loop setting"),
       });
     }
   };
@@ -5935,7 +5930,7 @@ const Content = () => {
       console.error("[ThemeDeck] remove global track failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Failed to remove global track",
+        body: t("Failed to remove global track"),
       });
     }
   };
@@ -5977,7 +5972,7 @@ const Content = () => {
       console.error("[ThemeDeck] store volume update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save store track volume",
+        body: t("Couldn't save store track volume"),
       });
     }
   };
@@ -6000,7 +5995,7 @@ const Content = () => {
       console.error("[ThemeDeck] store start offset update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save store song start truncation",
+        body: t("Couldn't save store song start truncation"),
       });
     }
   };
@@ -6022,7 +6017,7 @@ const Content = () => {
       console.error("[ThemeDeck] store loop update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save store track loop setting",
+        body: t("Couldn't save store track loop setting"),
       });
     }
   };
@@ -6047,7 +6042,7 @@ const Content = () => {
       console.error("[ThemeDeck] remove store track failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Failed to remove store track",
+        body: t("Failed to remove store track"),
       });
     }
   };
@@ -6117,13 +6112,13 @@ const Content = () => {
         <PanelSectionRow>
           <div style={{ width: "100%", paddingTop: "0.2rem" }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>
-              Latest change: {BUILD_LABEL.replace(/^ThemeDeck Build\s*/, "")}
+              {t("Latest change:")} {BUILD_LABEL.replace(/^ThemeDeck Build\s*/, "")}
             </div>
             <div style={{ fontSize: "0.8rem", opacity: 0.75, marginTop: "0.15rem" }}>
-              Build ID: {BUILD_ID}
+              {t("Build ID:")} {BUILD_ID}
             </div>
             <div style={{ fontSize: "0.86rem", opacity: 0.88, marginTop: "0.25rem" }}>
-              To assign music tracks, go to a game's page, select the "gear" icon, then "Choose ThemeDeck music..."
+              {t("To assign music tracks, go to a game's page, select the \"gear\" icon, then \"Choose ThemeDeck music...\"")}
             </div>
             <hr style={{ margin: "0.4rem 0" }} />
           </div>
@@ -6134,18 +6129,18 @@ const Content = () => {
           <PanelSectionRow>
             <ToggleField
               checked={autoPlay}
-              label="Auto play on game page"
-              description="Start music as soon as you open a game's details view."
+              label={t("Auto play on game page")}
+              description={t("Start music as soon as you open a game's details view.")}
               onChange={(value) => setAutoPlay(value)}
             />
           </PanelSectionRow>
           <PanelSectionRow>
             <div style={{ width: "100%" }}>
               <div style={{ fontWeight: 600 }}>
-                Stop music after pressing Play
+                {t("Stop music after pressing Play")}
               </div>
               <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                Choose when ThemeDeck music should stop during game launch:
+                {t("Choose when ThemeDeck music should stop during game launch:")}
               </div>
               <div
                 style={{
@@ -6155,17 +6150,17 @@ const Content = () => {
                   marginTop: "0.45rem",
                 }}
                 role="radiogroup"
-                aria-label="Stop music timing on launch"
+                aria-label={t("Stop music timing on launch")}
               >
                 {(
                   [
                     {
                       value: "launch_start",
-                      label: "At launch start",
+                      label: t("At launch start"),
                     },
                     {
                       value: "game_started",
-                      label: "At launch finish",
+                      label: t("At launch finish"),
                     },
                   ] as Array<{ value: LaunchStopMode; label: string }>
                 ).map((option) => (
@@ -6205,24 +6200,24 @@ const Content = () => {
           <PanelSectionRow>
             <ToggleField
               checked={backgroundMusic}
-              label="Allow music while games/apps run in the background"
-              description="Resume music when browsing Steam while a game or app is still running. Stops when you return to the game."
+              label={t("Allow music while games/apps run in the background")}
+              description={t("Resume music when browsing Steam while a game or app is still running. Stops when you return to the game.")}
               onChange={setBackgroundMusic}
             />
           </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField
               checked={nowPlayingCardSettings.enabled}
-              label="Show game-page now playing card"
-              description="Displays artist/track while game music is playing."
+              label={t("Show game-page now playing card")}
+              description={t("Displays artist/track while game music is playing.")}
               onChange={(value) => updateNowPlayingCardSettings({ enabled: value })}
             />
           </PanelSectionRow>
           <PanelSectionRow>
             <div style={{ width: "100%" }}>
-              <div style={{ fontWeight: 600 }}>Now playing card anchor</div>
+              <div style={{ fontWeight: 600 }}>{t("Now playing card anchor")}</div>
               <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                Choose where the card starts before fine-tuning offsets.
+                {t("Choose where the card starts before fine-tuning offsets.")}
               </div>
               <div
                 style={{
@@ -6232,14 +6227,14 @@ const Content = () => {
                   marginTop: "0.45rem",
                 }}
                 role="radiogroup"
-                aria-label="Now playing card anchor"
+                aria-label={t("Now playing card anchor")}
               >
                 {(
                   [
-                    { value: "top_left", label: "Top left" },
-                    { value: "top_right", label: "Top right" },
-                    { value: "bottom_left", label: "Bottom left" },
-                    { value: "bottom_right", label: "Bottom right" },
+                    { value: "top_left", label: t("Top left") },
+                    { value: "top_right", label: t("Top right") },
+                    { value: "bottom_left", label: t("Bottom left") },
+                    { value: "bottom_right", label: t("Bottom right") },
                   ] as Array<{ value: NowPlayingCardAnchor; label: string }>
                 ).map((option) => (
                   <button
@@ -6278,7 +6273,7 @@ const Content = () => {
               <div style={{ marginTop: "0.35rem" }}>
                 <SliderField
                   value={Math.round(nowPlayingCardSettings.offsetX)}
-                  label="Horizontal offset"
+                  label={t("Horizontal offset")}
                   min={-300}
                   max={300}
                   step={1}
@@ -6292,7 +6287,7 @@ const Content = () => {
               <div style={{ marginTop: "0.35rem" }}>
                 <SliderField
                   value={Math.round(nowPlayingCardSettings.offsetY)}
-                  label="Vertical offset"
+                  label={t("Vertical offset")}
                   min={-300}
                   max={300}
                   step={1}
@@ -6306,7 +6301,7 @@ const Content = () => {
               <div style={{ marginTop: "0.35rem" }}>
                 <SliderField
                   value={Math.round(nowPlayingCardSettings.width)}
-                  label="Card max width"
+                  label={t("Card max width")}
                   min={220}
                   max={620}
                   step={5}
@@ -6322,8 +6317,8 @@ const Content = () => {
           <PanelSectionRow>
             <ToggleField
               checked={globalAmbientEnabled}
-              label="Enable global/ambient track"
-              description="Keep global track assigned, but toggle its playback on non-game pages."
+              label={t("Enable global/ambient track")}
+              description={t("Keep global track assigned, but toggle its playback on non-game pages.")}
               onChange={(value) => {
                 setGlobalAmbientEnabled(value);
                 scheduleAutoPlaybackFromContext();
@@ -6333,8 +6328,8 @@ const Content = () => {
           <PanelSectionRow>
             <ToggleField
               checked={storeTrackEnabled}
-              label="Enable store track"
-              description="Keep store track assigned, but toggle its playback on store pages."
+              label={t("Enable store track")}
+              description={t("Keep store track assigned, but toggle its playback on store pages.")}
               onChange={(value) => {
                 setStoreTrackEnabled(value);
                 scheduleAutoPlaybackFromContext();
@@ -6344,8 +6339,8 @@ const Content = () => {
           <PanelSectionRow>
             <ToggleField
               checked={ambientDisableStore}
-              label="Disable global/ambient track while in game store"
-              description="When enabled, global ambient music is muted on store pages."
+              label={t("Disable global/ambient track while in game store")}
+              description={t("When enabled, global ambient music is muted on store pages.")}
               onChange={(value) => {
                 setAmbientDisableStore(value);
                 scheduleAutoPlaybackFromContext();
@@ -6355,10 +6350,10 @@ const Content = () => {
           <PanelSectionRow>
             <div style={{ width: "100%" }}>
               <div style={{ fontWeight: 600 }}>
-                Global/ambient interruption behavior
+                {t("Global/ambient interruption behavior")}
               </div>
               <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                When game/store music interrupts global ambient:
+                {t("When game/store music interrupts global ambient:")}
               </div>
               <div
                 style={{
@@ -6368,21 +6363,21 @@ const Content = () => {
                   marginTop: "0.45rem",
                 }}
                 role="radiogroup"
-                aria-label="Global ambient interruption behavior"
+                aria-label={t("Global ambient interruption behavior")}
               >
                 {(
                   [
                     {
                       value: "stop",
-                      label: "Stop (restart)",
+                      label: t("Stop (restart)"),
                     },
                     {
                       value: "pause",
-                      label: "Pause",
+                      label: t("Pause"),
                     },
                     {
                       value: "mute",
-                      label: "Mute",
+                      label: t("Mute"),
                     },
                   ] as Array<{ value: AmbientInterruptionMode; label: string }>
                 ).map((option) => (
@@ -6430,7 +6425,7 @@ const Content = () => {
                 paddingLeft: "0.65rem",
               }}
             >
-              Choose global/ambient track...
+              {t("Choose global/ambient track...")}
             </button>
           </PanelSectionRow>
           <PanelSectionRow>
@@ -6444,14 +6439,14 @@ const Content = () => {
                 paddingLeft: "0.65rem",
               }}
             >
-              Choose store-only track...
+              {t("Choose store-only track...")}
             </button>
           </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField
               checked={Boolean(ytDlpStatus.firefox_cookies_enabled)}
-              label="Use Firefox cookies for YouTube"
-              description="Enable only when YouTube asks you to sign in or confirm you are not a bot. Firefox must be signed into YouTube."
+              label={t("Use Firefox cookies for YouTube")}
+              description={t("Enable only when YouTube asks you to sign in or confirm you are not a bot. Firefox must be signed into YouTube.")}
               onChange={handleFirefoxCookiesChange}
             />
           </PanelSectionRow>
@@ -6466,17 +6461,17 @@ const Content = () => {
               }}
             >
               <div style={{ color: "#ff6b6b", fontWeight: 700, fontSize: "0.86rem" }}>
-                Use this if YouTube search, previews, or downloads stop working.
+                {t("Use this if YouTube search, previews, or downloads stop working.")}
               </div>
               <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
                 {ytDlpStatus.installed
                   ? `yt-dlp ${formatYtDlpVersion(ytDlpStatus.version) || ""}`.trim()
-                  : "yt-dlp not installed"}
+                  : t("yt-dlp not installed")}
               </div>
               <div style={{ color: "#ff8f8f", fontSize: "0.84rem" }}>
                 {ytDlpStatus.deno_installed
-                  ? `Deno ${ytDlpStatus.deno_version || "ready"}`
-                  : "Deno not configured"}
+                  ? `Deno ${ytDlpStatus.deno_version || t("ready")}`
+                  : t("Deno not configured")}
                 {` • Firefox cookies ${
                   ytDlpStatus.firefox_cookies_enabled ? "enabled" : "disabled"
                 }`}
@@ -6494,29 +6489,28 @@ const Content = () => {
                   border: "1px solid rgba(255, 107, 107, 0.7)",
                 }}
               >
-                {ytDlpBusy ? "Updating..." : "Update YouTube support"}
+                {ytDlpBusy ? t("Updating...") : t("Update YouTube support")}
               </button>
             </div>
           </PanelSectionRow>
         </PanelSection>
       </div>
-      <PanelSection title="Song storage">
+      <PanelSection title={t("Song storage")}>
         <PanelSectionRow><ControllerButton onClick={() => Navigation.Navigate("/themedeck/storage")}>
-          Manage downloaded songs and preview cache
-        </ControllerButton></PanelSectionRow>
+          {t("Manage downloaded songs and preview cache")}
+          </ControllerButton></PanelSectionRow>
       </PanelSection>
-      <PanelSection title="Auto-assign missing game tracks (yt-dlp)">
+      <PanelSection title={t("Auto-assign missing game tracks (yt-dlp)")}>
         <PanelSectionRow>
           <div style={{ width: "100%" }}>
             <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-              Uses first YouTube result per game and only targets games with no assigned track.
+              {t("Uses first YouTube result per game and only targets games with no assigned track.")}
             </div>
             <div style={{ opacity: 0.95, fontSize: "0.88rem", marginTop: "0.25rem", fontWeight: 600 }}>
-              Games currently without music assigned:{" "}
-              {filteredLibraryGames.filter((game) => !tracks[game.appid]).length}
+              {t("Games currently without music assigned: {count}", {count: filteredLibraryGames.filter((game) => !tracks[game.appid]).length})}
             </div>
             <div style={{ opacity: 0.75, fontSize: "0.8rem", marginTop: "0.15rem" }}>
-              Total library games detected: {libraryGames.length}
+              {t("Total library games detected: {count}", {count: libraryGames.length})}
             </div>
             <div
               style={{
@@ -6528,14 +6522,14 @@ const Content = () => {
             >
               {(
                 [
-                  { value: "all", label: "Download music for all games" },
+                  { value: "all", label: t("Download music for all games") },
                   {
                     value: "installed",
-                    label: "Download music only for installed games",
+                    label: t("Download music only for installed games"),
                   },
                   {
                     value: "uninstalled",
-                    label: "Download music only for uninstalled games",
+                    label: t("Download music only for uninstalled games"),
                   },
                 ] as Array<{ value: BulkAssignMode; label: string }>
               ).map((option) => (
@@ -6574,7 +6568,7 @@ const Content = () => {
                   width: "100%",
                 }}
               >
-                STOP
+                {t("STOP")}
               </button>
             </div>
             {(bulkAssign.running || bulkAssign.message) && (
@@ -6605,17 +6599,22 @@ const Content = () => {
                   />
                 </div>
                 <div style={{ marginTop: "0.35rem", fontSize: "0.82rem", opacity: 0.85 }}>
-                  {bulkAssign.completed}/{bulkAssign.total} completed
-                  {" • "}assigned {bulkAssign.assigned}
+                  {t("{completed}/{total} completed • assigned {assigned}", {
+                    completed: bulkAssign.completed,
+                    total: bulkAssign.total,
+                    assigned: bulkAssign.assigned,
+                  })}
                 </div>
                 <div style={{ marginTop: "0.15rem", fontSize: "0.82rem", opacity: 0.85 }}>
-                  skipped {bulkAssign.skipped}
-                  {" • "}failed {bulkAssign.failed}
+                  {t("skipped {skipped} • failed {failed}", {
+                    skipped: bulkAssign.skipped,
+                    failed: bulkAssign.failed,
+                  })}
                 </div>
                 {bulkAssign.currentGame && (
                   <div style={{ marginTop: "0.2rem", fontSize: "0.82rem", opacity: 0.85 }}>
-                    Current game: {bulkAssign.currentGame}
-                    {bulkAssign.stopRequested ? " (stopping...)" : ""}
+                    {t("Current game:")} {bulkAssign.currentGame}
+                    {bulkAssign.stopRequested ? " " + t("(stopping...)") : ""}
                   </div>
                 )}
                 {!!bulkAssign.message && (
@@ -6646,7 +6645,7 @@ const Content = () => {
                 paddingLeft: "0.65rem",
               }}
             >
-              {showMissingGames ? "Hide games without music" : "Show games without music"}
+              {showMissingGames ? t("Hide games without music") : t("Show games without music")}
             </button>
             {showMissingGames ? (
               <div
@@ -6663,11 +6662,14 @@ const Content = () => {
                 {missingGameNameStats.total > 0 ? (
                   <>
                     <div style={{ fontSize: "0.82rem", opacity: 0.9, marginBottom: "0.35rem" }}>
-                      {missingGameNameStats.resolved}/{missingGameNameStats.total} names resolved
-                      {" • "}pending {missingGameNameStats.pending}
-                      {" • "}unavailable {missingGameNameStats.failed}
+                      {t("{resolved}/{total} names resolved • pending {pending} • unavailable {unavailable}", {
+                        resolved: missingGameNameStats.resolved,
+                        total: missingGameNameStats.total,
+                        pending: missingGameNameStats.pending,
+                        unavailable: missingGameNameStats.failed,
+                      })}
                       {missingResolveInFlightCount > 0
-                        ? ` • checking ${missingResolveInFlightCount}`
+                        ? " " + t("• checking {count}", { count: missingResolveInFlightCount })
                         : ""}
                     </div>
                     <div
@@ -6691,7 +6693,7 @@ const Content = () => {
                     </div>
                     {missingGameNameStats.pending > 0 && missingGamesList.length === 0 ? (
                       <div style={{ opacity: 0.8, fontSize: "0.86rem", marginBottom: "0.25rem" }}>
-                        Resolving game names...
+                        {t("Resolving game names...")}
                       </div>
                     ) : null}
                     {missingGamesList.map((game) => (
@@ -6714,7 +6716,7 @@ const Content = () => {
                   </>
                 ) : (
                   <div style={{ opacity: 0.8, fontSize: "0.86rem" }}>
-                    No games are missing music.
+                    {t("No games are missing music.")}
                   </div>
                 )}
               </div>
@@ -6722,10 +6724,10 @@ const Content = () => {
           </div>
         </PanelSectionRow>
       </PanelSection>
-      <PanelSection title="Global / ambient track">
+      <PanelSection title={t("Global / ambient track")}>
         {!globalTrack ? (
           <PanelSectionRow>
-            <div>No global track selected.</div>
+            <div>{t("No global track selected.")}</div>
           </PanelSectionRow>
         ) : (
           <PanelSectionRow>
@@ -6757,8 +6759,8 @@ const Content = () => {
                   title={
                     playback.appId === GLOBAL_AMBIENT_APP_ID &&
                     playback.status === "playing"
-                      ? "Pause preview"
-                      : "Preview track"
+                      ? t("Pause preview")
+                      : t("Preview track")
                   }
                   onClick={handleGlobalPreviewToggle}
                 >
@@ -6779,7 +6781,7 @@ const Content = () => {
                     justifyContent: "center",
                     padding: 0,
                   }}
-                  title="Remove global ambient music"
+                  title={t("Remove global ambient music")}
                   onClick={handleRemoveGlobalTrack}
                 >
                   <FaTrash />
@@ -6788,7 +6790,7 @@ const Content = () => {
               <div style={{ marginTop: "0.5rem" }}>
                 <SliderField
                   value={Math.round(globalTrack.volume * 100)}
-                  label="Volume"
+                  label={t("Volume")}
                   min={0}
                   max={100}
                   step={5}
@@ -6800,7 +6802,7 @@ const Content = () => {
               <div style={{ marginTop: "0.35rem" }}>
                 <SliderField
                   value={Math.round(globalTrack.startOffset)}
-                  label="Start skip"
+                  label={t("Start skip")}
                   min={0}
                   max={30}
                   step={1}
@@ -6812,8 +6814,8 @@ const Content = () => {
               <div style={{ marginTop: "0.35rem" }}>
                 <ToggleField
                   checked={globalTrack.loop}
-                  label="Loop track"
-                  description="Play continuously when this track is active."
+                  label={t("Loop track")}
+                  description={t("Play continuously when this track is active.")}
                   onChange={handleGlobalLoopChange}
                 />
               </div>
@@ -6821,10 +6823,10 @@ const Content = () => {
           </PanelSectionRow>
         )}
       </PanelSection>
-      <PanelSection title="Store-only track">
+      <PanelSection title={t("Store-only track")}>
         {!storeTrack ? (
           <PanelSectionRow>
-            <div>No store-only track selected.</div>
+            <div>{t("No store-only track selected.")}</div>
           </PanelSectionRow>
         ) : (
           <PanelSectionRow>
@@ -6856,8 +6858,8 @@ const Content = () => {
                   title={
                     playback.appId === STORE_TRACK_APP_ID &&
                     playback.status === "playing"
-                      ? "Pause preview"
-                      : "Preview track"
+                      ? t("Pause preview")
+                      : t("Preview track")
                   }
                   onClick={handleStorePreviewToggle}
                 >
@@ -6878,7 +6880,7 @@ const Content = () => {
                     justifyContent: "center",
                     padding: 0,
                   }}
-                  title="Remove store-only music"
+                  title={t("Remove store-only music")}
                   onClick={handleRemoveStoreTrack}
                 >
                   <FaTrash />
@@ -6887,7 +6889,7 @@ const Content = () => {
               <div style={{ marginTop: "0.5rem" }}>
                 <SliderField
                   value={Math.round(storeTrack.volume * 100)}
-                  label="Volume"
+                  label={t("Volume")}
                   min={0}
                   max={100}
                   step={5}
@@ -6899,7 +6901,7 @@ const Content = () => {
               <div style={{ marginTop: "0.35rem" }}>
                 <SliderField
                   value={Math.round(storeTrack.startOffset)}
-                  label="Start skip"
+                  label={t("Start skip")}
                   min={0}
                   max={30}
                   step={1}
@@ -6911,8 +6913,8 @@ const Content = () => {
               <div style={{ marginTop: "0.35rem" }}>
                 <ToggleField
                   checked={storeTrack.loop}
-                  label="Loop track"
-                  description="Play continuously when this track is active."
+                  label={t("Loop track")}
+                  description={t("Play continuously when this track is active.")}
                   onChange={handleStoreLoopChange}
                 />
               </div>
@@ -6920,12 +6922,12 @@ const Content = () => {
           </PanelSectionRow>
         )}
       </PanelSection>
-      <PanelSection title="ThemeDeck master volume">
+      <PanelSection title={t("ThemeDeck master volume")}>
         <PanelSectionRow>
           <div style={{ width: "100%" }}>
             <SliderField
               value={masterVolume}
-              label="Master volume override"
+              label={t("Master volume override")}
               min={1}
               max={100}
               step={1}
@@ -6934,8 +6936,7 @@ const Content = () => {
               onChange={setMasterVolume}
             />
             <div style={{ opacity: 0.78, fontSize: "0.84rem", marginTop: "0.35rem" }}>
-              At 100%, ThemeDeck respects each game/global/store track volume. Below
-              100%, all ThemeDeck music plays at this volume instead.
+              {t("At 100%, ThemeDeck respects each game/global/store track volume. Below 100%, all ThemeDeck music plays at this volume instead.")}
             </div>
           </div>
         </PanelSectionRow>
@@ -6949,7 +6950,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
   const params = useParams<{ appid?: string }>();
   const appId = scope === "global" ? GLOBAL_AMBIENT_APP_ID : scope === "store" ? STORE_TRACK_APP_ID : Number(params?.appid);
   const assignmentKey = scope === "global" ? "__global__" : scope === "store" ? "__store__" : String(appId);
-  const selectionName = scope === "global" ? "Ambient music" : scope === "store" ? "Store music" : getDisplayName(appId);
+  const selectionName = scope === "global" ? t("Ambient music") : scope === "store" ? t("Store music") : getDisplayName(appId);
   const normalizeSelection = useCallback((data: RawTrackMap | null | undefined) => normalizeTracks(scope ? (data?.[assignmentKey] ? {[appId]: data[assignmentKey]} : {}) : data, !scope)[appId] ?? null, [appId, assignmentKey, scope]);
   const [musicPanel, setMusicPanel] = useState<"settings" | "files" | "storage" | null>(null);
   const [showYouTubeSetup, setShowYouTubeSetup] = useState(false);
@@ -7066,7 +7067,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
         if (!silent) {
           toaster.toast({
             title: "ThemeDeck",
-            body: "Failed to read yt-dlp status",
+            body: t("Failed to read yt-dlp status"),
           });
         }
       }
@@ -7101,10 +7102,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       }));
       toaster.toast({
         title: "ThemeDeck",
-        body: `Failed to save Firefox cookie setting: ${getErrorMessage(
-          error,
-          "Unknown settings error"
-        )}`,
+        body: t("Failed to save Firefox cookie setting: {error}", {error: getErrorMessage(error, t("Unknown settings error"))}),
       });
     } finally {
       setFirefoxCookiesBusy(false);
@@ -7165,14 +7163,14 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       await loadTrack();
       toaster.toast({
         title: "ThemeDeck",
-        body: `Added track for ${selectionName}. Existing songs kept.`,
+        body: t("Added track for {name}. Existing songs kept.", {name: selectionName}),
       });
     } catch (error) {
       console.error("[ThemeDeck] save from path failed", error);
       const message =
         error instanceof Error && error.message
           ? error.message
-          : "Unable to add that file";
+          : t("Unable to add that file");
       console.error("[ThemeDeck] save from path detailed error", {
         app: appId,
         message,
@@ -7181,7 +7179,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       });
       toaster.toast({
         title: "ThemeDeck",
-        body: `Unable to add file (${fullPath}): ${message}`,
+        body: t("Unable to add file ({path}): {error}", {path: fullPath, error: message}),
       });
     }
   };
@@ -7191,7 +7189,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
     if (!query) {
       toaster.toast({
         title: "ThemeDeck",
-        body: "Enter a search query first",
+        body: t("Enter a search query first"),
       });
       return;
     }
@@ -7206,11 +7204,11 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       );
     } catch (error) {
       console.error("[ThemeDeck] youtube search failed", error);
-      const message = getErrorMessage(error, "Unknown search error");
+      const message = getErrorMessage(error, t("Unknown search error"));
       setYoutubeError(message);
       toaster.toast({
         title: "ThemeDeck",
-        body: `YouTube search failed: ${message}`,
+        body: t("YouTube search failed: {error}", {error: message}),
       });
     } finally {
       setYoutubeLoading(false);
@@ -7254,7 +7252,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
         previewObjectUrlRef.current = previewUrl;
       }
       if (!previewUrl) {
-        throw new Error("No preview audio returned");
+        throw new Error(t("No preview audio returned"));
       }
       let preview = previewAudioRef.current;
       if (!preview) {
@@ -7274,12 +7272,12 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       await preview.play();
       setPreviewingVideoId(result.id);
     } catch (error) {
-      const message = getErrorMessage(error, "Preview failed");
-      setYoutubeError(`Preview failed: ${message}`);
+      const message = getErrorMessage(error, t("Preview failed"));
+      setYoutubeError(t("Preview failed: {error}", {error: message}));
       console.error("[ThemeDeck] youtube preview failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: `Preview failed: ${message}`,
+        body: t("Preview failed: {error}", {error: message}),
       });
       setPreviewingVideoId(null);
     } finally {
@@ -7298,15 +7296,15 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       window.dispatchEvent(new Event(TRACKS_UPDATED_EVENT));
       toaster.toast({
         title: "ThemeDeck",
-        body: `Added "${response.filename}" for ${selectionName}. Existing songs kept.`,
+        body: t("Added \"{file}\" for {name}. Existing songs kept.", {file: response.filename, name: selectionName}),
       });
     } catch (error) {
       console.error("[ThemeDeck] youtube download failed", error);
-      const message = getErrorMessage(error, "Unknown download error");
-      setYoutubeError(`Download failed: ${message}`);
+      const message = getErrorMessage(error, t("Unknown download error"));
+      setYoutubeError(t("Download failed: {error}", {error: message}));
       toaster.toast({
         title: "ThemeDeck",
-        body: `YouTube download failed: ${message}`,
+        body: t("YouTube download failed: {error}", {error: message}),
       });
     } finally {
       setDownloadingVideoId(null);
@@ -7346,7 +7344,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       setTrack(null);
       toaster.toast({
         title: "ThemeDeck",
-        body: `Unassigned music for ${selectionName}. File kept; use Manage storage to delete downloads.`,
+        body: t("Unassigned music for {name}. File kept; use Manage storage to delete downloads.", {name: selectionName}),
       });
     } catch (error) {
       console.error("[ThemeDeck] route remove failed", error);
@@ -7367,7 +7365,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       console.error("[ThemeDeck] route volume update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save volume",
+        body: t("Couldn't save volume"),
       });
     }
   };
@@ -7386,7 +7384,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       console.error("[ThemeDeck] route start offset update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save song start truncation",
+        body: t("Couldn't save song start truncation"),
       });
     }
   };
@@ -7404,7 +7402,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       console.error("[ThemeDeck] route loop update failed", error);
       toaster.toast({
         title: "ThemeDeck",
-        body: "Couldn't save loop setting",
+        body: t("Couldn't save loop setting"),
       });
     }
   };
@@ -7517,11 +7515,11 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
     );
   };
   const directoryShortcuts = [
-    { label: "Home", path: "/home/deck" },
-    { label: "Music", path: "/home/deck/Music" },
-    { label: "Downloads", path: "/home/deck/Downloads" },
-    { label: "SD card", path: "/run/media/mmcblk0p1" },
-    { label: "Root", path: "/" },
+    { label: t("Home"), path: "/home/deck" },
+    { label: t("Music"), path: "/home/deck/Music" },
+    { label: t("Downloads"), path: "/home/deck/Downloads" },
+    { label: t("SD card"), path: "/run/media/mmcblk0p1" },
+    { label: t("Root"), path: "/" },
   ];
 
   if (!appId) {
@@ -7529,7 +7527,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
       <ScrollPanel>
         <div style={{ padding: 24, paddingBottom: 120 }}>
           <PanelSection title="ThemeDeck">
-            <PanelSectionRow>Invalid game id.</PanelSectionRow>
+            <PanelSectionRow>{t("Invalid game id.")}</PanelSectionRow>
           </PanelSection>
         </div>
       </ScrollPanel>
@@ -7565,13 +7563,13 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
           .themedeck-music-picker input { font-size: 14px !important; }
         `}</style>
         <div style={{display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12}}>
-          <div style={{fontSize: 19, fontWeight: 700}}>Music for {selectionName}</div>
-          <ControllerButton onClick={navigateBack} onCancel={navigateBack}>Done</ControllerButton>
+          <div style={{fontSize: 19, fontWeight: 700}}>{t("Music for {name}", {name: selectionName})}</div>
+          <ControllerButton onClick={navigateBack} onCancel={navigateBack}>{t("Done")}</ControllerButton>
         </div>
-        <PanelSection title="Search YouTube • Add music">
+        <PanelSection title={t("Search YouTube • Add music")}>
           <PanelSectionRow><div style={{display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: 12}}>
-            <span style={{fontSize: 12, opacity: .75}}>{track ? "Download & Add keeps your existing songs." : "Find a soundtrack, preview it, then download."}</span>
-            <ControllerButton onClick={() => setShowYouTubeSetup(!showYouTubeSetup)} onCancel={navigateBack}>{showYouTubeSetup ? "Hide setup" : "YouTube setup"}</ControllerButton>
+            <span style={{fontSize: 12, opacity: .75}}>{track ? t("Download & Add keeps your existing songs.") : t("Find a soundtrack, preview it, then download.")}</span>
+            <ControllerButton onClick={() => setShowYouTubeSetup(!showYouTubeSetup)} onCancel={navigateBack}>{showYouTubeSetup ? t("Hide setup") : t("YouTube setup")}</ControllerButton>
           </div></PanelSectionRow>
           {showYouTubeSetup && <>          <PanelSectionRow>
             <div
@@ -7585,7 +7583,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
               <div style={{ fontWeight: 600 }}>
                 {ytDlpStatus.installed
                   ? `yt-dlp ${formatYtDlpVersion(ytDlpStatus.version) || ""}`.trim()
-                  : "yt-dlp not installed"}
+                  : t("yt-dlp not installed")}
               </div>
               {ytDlpStatus.path ? (
                 <div style={{ fontFamily: "monospace", fontSize: "0.8rem", opacity: 0.8 }}>
@@ -7594,15 +7592,14 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
               ) : null}
               <div style={{ fontSize: "0.82rem", opacity: 0.8 }}>
                 {ytDlpStatus.deno_installed
-                  ? `Deno ${ytDlpStatus.deno_version || "ready"}`
-                  : "Deno not configured"}
+                  ? `Deno ${ytDlpStatus.deno_version || t("ready")}`
+                  : t("Deno not configured")}
                 {` • Firefox cookies ${
                   ytDlpStatus.firefox_cookies_enabled ? "enabled" : "disabled"
                 }`}
               </div>
               <div style={{ opacity: 0.8, fontSize: "0.85rem" }}>
-                Search YouTube for game music, download audio locally, and assign it to
-                this game. Enable Firefox cookies below if YouTube asks you to sign in.
+                {t("Search YouTube for game music, download audio locally, and assign it to this game. Enable Firefox cookies below if YouTube asks you to sign in.")}
               </div>
               {!ytDlpStatus.ready ? (
 	                  <ControllerButton
@@ -7621,7 +7618,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
 	                    setYtDlpBusy(true);
 	                    toaster.toast({
 	                      title: "ThemeDeck",
-	                      body: "Installing/updating yt-dlp and Deno. This can take a minute.",
+	                      body: t("Installing/updating yt-dlp and Deno. This can take a minute."),
 	                    });
 	                    try {
 	                      const status = await updateYtDlp();
@@ -7636,21 +7633,19 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
 	                      });
 	                      toaster.toast({
 	                        title: "ThemeDeck",
-	                        body: `YouTube support ready (yt-dlp ${
-	                          formatYtDlpVersion(status.version) || "latest"
-	                        }, Deno ${status.deno_version || "ready"})`,
+	                        body: t("YouTube support ready (yt-dlp {version}, Deno {deno})", {
+          version: formatYtDlpVersion(status.version) || t("latest"),
+          deno: status.deno_version || t("ready"),
+        }),
 	                      });
 	                    } catch (error) {
 	                      logClient("error", "yt_dlp_install_failed", {
 	                        appId,
-	                        error: getErrorMessage(error, "Unknown update error"),
+	                        error: getErrorMessage(error, t("Unknown update error")),
 	                      });
 	                      toaster.toast({
 	                        title: "ThemeDeck",
-                        body: `Failed to install YouTube support: ${getErrorMessage(
-                          error,
-                          "Unknown update error"
-                        )}`,
+                        body: t("Failed to install YouTube support: {error}", {error: getErrorMessage(error, t("Unknown update error"))}),
                       });
                     } finally {
                       setYtDlpBusy(false);
@@ -7661,10 +7656,10 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                   style={{ width: "fit-content" }}
                 >
                   {ytDlpBusy
-                    ? "Installing..."
+                    ? t("Installing...")
                     : ytDlpStatus.installed
-                      ? "Set up YouTube support"
-                      : "Install YouTube support"}
+                      ? t("Set up YouTube support")
+                      : t("Install YouTube support")}
                 </ControllerButton>
               ) : null}
             </div>
@@ -7672,8 +7667,8 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
           <PanelSectionRow>
             <ToggleField
               checked={Boolean(ytDlpStatus.firefox_cookies_enabled)}
-              label="Use Firefox cookies for YouTube"
-              description="Firefox must be installed and signed into YouTube. Leave this disabled unless YouTube requires authentication."
+              label={t("Use Firefox cookies for YouTube")}
+              description={t("Firefox must be installed and signed into YouTube. Leave this disabled unless YouTube requires authentication.")}
               onChange={handleFirefoxCookiesChange}
             />
           </PanelSectionRow>
@@ -7702,7 +7697,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                 disabled={youtubeLoading || ytDlpBusy}
                 style={{ minWidth: 90 }}
               >
-                {youtubeLoading ? "Searching..." : "Search YouTube"}
+                {youtubeLoading ? t("Searching...") : t("Search YouTube")}
               </ControllerButton>
             </div>
           </PanelSectionRow>
@@ -7791,7 +7786,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                         >
                           {isSelected ? (
                             <span style={{ fontSize: "0.7rem", opacity: 0.92 }}>
-                              Selected
+                              {t("Selected")}
                             </span>
                           ) : null}
                           {isCurrentlyAssigned ? (
@@ -7810,7 +7805,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                                 whiteSpace: "nowrap",
                               }}
                             >
-                              Currently assigned
+                              {t("Currently assigned")}
                             </span>
                           ) : null}
                         </div>
@@ -7920,10 +7915,10 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                             }}
                           >
                             {previewLoadingVideoId === result.id
-                              ? "Loading..."
+                              ? t("Loading...")
                               : previewingVideoId === result.id
-                              ? "Stop Preview"
-                              : "Play Preview"}
+                              ? t("Stop Preview")
+                              : t("Play Preview")}
                           </ControllerButton>
                           <ControllerButton
                             data-themedeck-youtube-result-index={resultIndex}
@@ -7974,8 +7969,8 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                             }}
                           >
                             {downloadingVideoId === result.id
-                              ? "Downloading..."
-                              : track ? "Download & Add" : "Download"}
+                              ? t("Downloading...")
+                              : track ? t("Download & Add") : t("Download")}
                           </ControllerButton>
                         </div>
                       </div>
@@ -7983,7 +7978,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                   })}
                   {!youtubeResults.length && (
                     <div style={{ opacity: 0.7, whiteSpace: "nowrap" }}>
-                      No results yet. Search for a game soundtrack above.
+                      {t("No results yet. Search for a game soundtrack above.")}
                     </div>
                   )}
                 </div>
@@ -7994,28 +7989,28 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
 
         <AssignedPlaylist track={track} scope={assignmentKey} refresh={loadTrack} />
         <Focusable flow-children="row" style={{display: "flex", gap: 8, margin: "10px 0"}}>
-          <ControllerButton onClick={() => setMusicPanel(musicPanel === "settings" ? null : "settings")} onCancel={navigateBack}>{musicPanel === "settings" ? "Hide playlist settings" : "Playlist settings"}</ControllerButton>
-          <ControllerButton onClick={() => setMusicPanel(musicPanel === "files" ? null : "files")} onCancel={navigateBack}>{musicPanel === "files" ? "Hide local files" : "Browse local files"}</ControllerButton>
-          <ControllerButton onClick={() => setMusicPanel(musicPanel === "storage" ? null : "storage")} onCancel={navigateBack}>{musicPanel === "storage" ? "Hide song storage" : "Song storage"}</ControllerButton>
+          <ControllerButton onClick={() => setMusicPanel(musicPanel === "settings" ? null : "settings")} onCancel={navigateBack}>{musicPanel === "settings" ? t("Hide playlist settings") : t("Playlist settings")}</ControllerButton>
+          <ControllerButton onClick={() => setMusicPanel(musicPanel === "files" ? null : "files")} onCancel={navigateBack}>{musicPanel === "files" ? t("Hide local files") : t("Browse local files")}</ControllerButton>
+          <ControllerButton onClick={() => setMusicPanel(musicPanel === "storage" ? null : "storage")} onCancel={navigateBack}>{musicPanel === "storage" ? t("Hide song storage") : t("Song storage")}</ControllerButton>
         </Focusable>
         {musicPanel === "storage" && <SongStorage embedded Button={ControllerButton} onClose={() => setMusicPanel(null)} onChanged={() => { handleSongStorageChanged(); void loadTrack(); }} />}
         {musicPanel === "settings" && <div className="themedeck-compact-settings" style={{padding: 12, marginTop: 8, borderRadius: 6, background: "rgba(255,255,255,.04)"}}>
-          <div style={{fontSize: 14, fontWeight: 700, marginBottom: 8}}>Playlist settings</div>
+          <div style={{fontSize: 14, fontWeight: 700, marginBottom: 8}}>{t("Playlist settings")}</div>
           {loading ? <Spinner /> : track ? <>
             <Focusable flow-children="row" style={{display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8}}>
-              <ControllerButton onCancel={navigateBack} onClick={handleTrackPreviewToggle}>{playback.appId === appId && playback.status === "playing" ? "Pause" : "Play"}</ControllerButton>
-              <ControllerButton onCancel={navigateBack} onClick={handleRemove}>Unassign all songs</ControllerButton>
+              <ControllerButton onCancel={navigateBack} onClick={handleTrackPreviewToggle}>{playback.appId === appId && playback.status === "playing" ? t("Pause") : t("Play")}</ControllerButton>
+              <ControllerButton onCancel={navigateBack} onClick={handleRemove}>{t("Unassign all songs")}</ControllerButton>
               <DeleteAssignedSong assignment={assignmentKey} path={track.path} Button={ControllerButton} onDeleted={() => { handleSongStorageChanged(); void loadTrack(); }} />
             </Focusable>
             <Focusable style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 24px"}}>
-              <SliderField className="themedeck-compact-slider" value={Math.round(track.volume * 100)} label="Volume" min={0} max={100} step={5} valueSuffix="%" showValue onChange={handleTrackVolumeChange} />
-              <SliderField className="themedeck-compact-slider" value={Math.round(track.startOffset)} label="Start skip" min={0} max={30} step={1} valueSuffix="s" showValue onChange={handleTrackStartOffsetChange} />
-              <div style={{gridColumn: "1 / -1"}}><ToggleField checked={track.loop} label="Loop playlist" onChange={handleTrackLoopChange} /></div>
+              <SliderField className="themedeck-compact-slider" value={Math.round(track.volume * 100)} label={t("Volume")} min={0} max={100} step={5} valueSuffix="%" showValue onChange={handleTrackVolumeChange} />
+              <SliderField className="themedeck-compact-slider" value={Math.round(track.startOffset)} label={t("Start skip")} min={0} max={30} step={1} valueSuffix="s" showValue onChange={handleTrackStartOffsetChange} />
+              <div style={{gridColumn: "1 / -1"}}><ToggleField checked={track.loop} label={t("Loop playlist")} onChange={handleTrackLoopChange} /></div>
             </Focusable>
-          </> : <div style={{fontSize: 13}}>No music selected yet.</div>}
+          </> : <div style={{fontSize: 13}}>{t("No music selected yet.")}</div>}
         </div>}
         {musicPanel === "files" && <div style={{padding: 12, marginTop: 8, borderRadius: 6, background: "rgba(255,255,255,.04)"}}>
-          <div style={{fontSize: 14, fontWeight: 700, marginBottom: 8}}>Local audio files</div>
+          <div style={{fontSize: 14, fontWeight: 700, marginBottom: 8}}>{t("Local audio files")}</div>
             <div
               style={{
                 width: "100%",
@@ -8040,7 +8035,7 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                   onCancel={navigateBack}
                   onClick={goUp}
                 >
-                  Up
+                  {t("Up")}
                 </ControllerButton>
                 {directoryShortcuts.map((shortcut) => (
                   <ControllerButton
@@ -8111,11 +8106,11 @@ const ChangeTheme = ({scope}: {scope?: "global" | "store"}) => {
                       whiteSpace: "nowrap",
                     }}
                   >
-                    {track ? "Add" : "Assign"}: {file}
+                    {track ? t("Add: {file}", {file}) : t("Assign: {file}", {file})}
                   </ControllerButton>
                 ))}
                 {!browser.dirs.length && !audioFiles.length ? (
-                  <div style={{ opacity: 0.6 }}>No folders or audio files here.</div>
+                  <div style={{ opacity: 0.6 }}>{t("No folders or audio files here.")}</div>
                 ) : null}
               </div>
             )}

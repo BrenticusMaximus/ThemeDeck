@@ -66,5 +66,5 @@ assert.equal(p.resolve(),null);
 assert.ok(scheduled>0);
 const play = tree.statements.find(node=>ts.isVariableStatement(node)&&node.declarationList.declarations[0].name.getText(tree)==='playTrack').getText(tree);
 assert.equal((play.match(/shouldBlockRunningPlayback\(\)/g)||[]).length,3,'Recheck foreground after asynchronous audio preparation');
-assert.ok(source.indexOf('label="Allow music while games/apps') > source.indexOf('Stop music after pressing Play'));
+assert.ok(source.indexOf('Allow music while games/apps') > source.indexOf('Stop music after pressing Play'));
 console.log('Background music default, toggle, foreground/overlay, launch timing, game/global/store selection, and async guard checks passed');
