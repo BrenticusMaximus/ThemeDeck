@@ -55,10 +55,16 @@ import {
 } from "react-icons/fa";
 import { startDeckShelvesIntegration, updateShelfAssignments } from "./deck-shelves";
 import { spectrumHeights, smoothHeights } from "./visualizer";
-import { BUILD_ID, BUILD_LABEL } from "./build-info";
+import { BUILD_ID, BUILD_LABEL, BUILD_TIME } from "./build-info";
 import { getErrorMessage } from "./error-message";
-import { t } from "./i18n";
+import { formatDateTime, t } from "./i18n";
 import { SongStorage, DeleteAssignedSong } from "./song-storage";
+
+/** Build stamp shown in the panel, formatted for the current UI language. */
+const BUILD_TIME_LABEL =
+  BUILD_TIME && !Number.isNaN(new Date(BUILD_TIME).getTime())
+    ? formatDateTime(BUILD_TIME)
+    : BUILD_LABEL.replace(/^ThemeDeck Build\s*/, "");
 
 type BackendTrack = {
   additional_tracks?: BackendTrack[];
@@ -6112,7 +6118,7 @@ const Content = () => {
         <PanelSectionRow>
           <div style={{ width: "100%", paddingTop: "0.2rem" }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>
-              {t("Latest change:")} {BUILD_LABEL.replace(/^ThemeDeck Build\s*/, "")}
+              {t("Latest change:")} {BUILD_TIME_LABEL}
             </div>
             <div style={{ fontSize: "0.8rem", opacity: 0.75, marginTop: "0.15rem" }}>
               {t("Build ID:")} {BUILD_ID}
@@ -8173,7 +8179,7 @@ export default definePlugin(() => {
       <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.1 }}>
         <div className={staticClasses.Title}>ThemeDeck</div>
         <div style={{ fontSize: "0.68rem", opacity: 0.72, marginTop: "0.1rem" }}>
-          {BUILD_LABEL.replace(/^ThemeDeck Build\s*/, "")}
+          {BUILD_TIME_LABEL}
         </div>
       </div>
     ),

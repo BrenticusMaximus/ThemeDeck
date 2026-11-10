@@ -239,10 +239,13 @@ ThemeDeck follows the language selected in the Steam client. English is the sour
 Translations live in `src/locales/`, keyed by the English source string. Untranslated or newly added strings automatically fall back to English, so a missing entry never breaks the interface.
 
 ```ts
-import { t } from "./i18n";
+import { formatDateTime, t } from "./i18n";
 
 t("Auto play on game page");
 t("Skipped {game} (already assigned).", { game: gameName });
+formatDateTime("2026-10-24T18:30:00Z");
 ```
+
+`formatDateTime` renders timestamps through `Intl.DateTimeFormat` in the current Steam language, so dates follow local conventions instead of one fixed layout, and times are shown in the local timezone. When a timestamp also identifies a build, keep an unambiguous value next to the localized one, the way the settings tab pairs the formatted build time with `BUILD_ID`.
 
 To add a language, create `src/locales/<code>.ts`, register it in `src/i18n.ts`, and map its Steam locale names to the new language there. Keep `{placeholder}` names identical to the English source.

@@ -2,14 +2,10 @@ import { fr } from "./locales/fr";
 
 export type TranslationVars = Record<string, string | number>;
 
-const FRENCH_LOCALES = new Set([
-  "fr",
-  "fr-fr",
-  "fr-be",
-  "fr-ca",
-  "fr-ch",
-  "french",
-]);
+const isFrenchLocale = (locale: string): boolean => {
+  const value = locale.trim().toLowerCase().replace(/_/g, "-");
+  return value === "fr" || value === "french" || value.startsWith("fr-");
+};
 
 let cachedLanguage: "en" | "fr" | null = null;
 
@@ -35,10 +31,7 @@ const readSteamLocale = (): string => {
 /** Steam UI language of the current session, limited to the languages we ship. */
 export const getLanguage = (): "en" | "fr" => {
   if (cachedLanguage) return cachedLanguage;
-  const locale = readSteamLocale().trim().toLowerCase();
-  cachedLanguage = FRENCH_LOCALES.has(locale) || locale.startsWith("fr-")
-    ? "fr"
-    : "en";
+  cachedLanguage = isFrenchLocale(readSteamLocale()) ? "fr" : "en";
   return cachedLanguage;
 };
 
@@ -60,4 +53,28 @@ export const t = (english: string, vars?: TranslationVars): string => {
     );
   }
   return text;
+};
+
+/** BCP-47 locale used for `Intl` formatting, so dates follow the UI language. */
+export const getLocale = (): string =>
+  getLanguage() === "fr" ? "fr-FR" : "en-US";
+
+/**
+ * Format an ISO 8601 timestamp for display.
+ *
+ * The layout (day/month order, separators) follows the UI language and the
+ * instant is shown in the device timezone. Invalid input is returned unchanged
+ * so a raw build stamp never disappears from the interface.
+ */
+export const formatDateTime = (iso: string): string => {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  try {
+    return new Intl.DateTimeFormat(getLocale(), {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(date);
+  } catch (_ignored) {
+    return iso;
+  }
 };
