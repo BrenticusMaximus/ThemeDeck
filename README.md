@@ -231,3 +231,21 @@ Deletion is paused while ThemeDeck is preparing a preview or downloading audio. 
 ## Background app music (v3.1.7)
 
 Below **Stop music after pressing Play**, enable **Allow music while games/apps run in the background** to hear game-page, global/ambient, or store music while browsing the full Steam menu with an app still running. The setting is off by default and is saved between restarts. Returning to gameplay stops ThemeDeck audio; the running-app screen and side overlays do not start it. Existing launch timing, sleep, and Desktop Mode restrictions still apply.
+
+## Localization
+
+ThemeDeck follows the language selected in the Steam client. English is the source language and the fallback, and French is bundled.
+
+Translations live in `src/locales/`, keyed by the English source string. Untranslated or newly added strings automatically fall back to English, so a missing entry never breaks the interface.
+
+```ts
+import { formatDateTime, t } from "./i18n";
+
+t("Auto play on game page");
+t("Skipped {game} (already assigned).", { game: gameName });
+formatDateTime("2026-10-24T18:30:00Z");
+```
+
+`formatDateTime` renders timestamps through `Intl.DateTimeFormat` in the current Steam language, so dates follow local conventions instead of one fixed layout, and times are shown in the local timezone. When a timestamp also identifies a build, keep an unambiguous value next to the localized one, the way the settings tab pairs the formatted build time with `BUILD_ID`.
+
+To add a language, create `src/locales/<code>.ts`, register it in `src/i18n.ts`, and map its Steam locale names to the new language there. Keep `{placeholder}` names identical to the English source.
